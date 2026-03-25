@@ -138,11 +138,11 @@ private struct _SignInForm: View {
             }
 
             VStack(spacing: 14) {
-                _InputField(label: "Email", placeholder: "you@example.com", text: $email, isSecure: false)
+                _InputField(label: "Email", placeholder: "you@example.com", text: $email, isSecure: false, contentType: .emailAddress)
                     .focused($focusedField, equals: .email)
                     .onSubmit { focusedField = .password }
 
-                _InputField(label: "Password", placeholder: "••••••••", text: $password, isSecure: true)
+                _InputField(label: "Password", placeholder: "••••••••", text: $password, isSecure: true, contentType: .password)
                     .focused($focusedField, equals: .password)
                     .onSubmit { Task { await submit() } }
             }
@@ -152,7 +152,7 @@ private struct _SignInForm: View {
             }
 
             VStack(spacing: 12) {
-                _PrimaryButton(title: "Sign in", isLoading: auth.isLoading) {
+                _PrimaryButton(title: "Sign in", isLoading: auth.isLoading || !auth.isReady) {
                     Task { await submit() }
                 }
 
@@ -211,15 +211,15 @@ private struct _SignUpForm: View {
                 _SuccessBanner(message: "Check your email to confirm your account.")
             } else {
                 VStack(spacing: 14) {
-                    _InputField(label: "Email", placeholder: "you@example.com", text: $email, isSecure: false)
+                    _InputField(label: "Email", placeholder: "you@example.com", text: $email, isSecure: false, contentType: .emailAddress)
                         .focused($focusedField, equals: .email)
                         .onSubmit { focusedField = .password }
 
-                    _InputField(label: "Password", placeholder: "Min. 8 characters", text: $password, isSecure: true)
+                    _InputField(label: "Password", placeholder: "Min. 8 characters", text: $password, isSecure: true, contentType: .newPassword)
                         .focused($focusedField, equals: .password)
                         .onSubmit { focusedField = .confirm }
 
-                    _InputField(label: "Confirm password", placeholder: "••••••••", text: $confirmPassword, isSecure: true)
+                    _InputField(label: "Confirm password", placeholder: "••••••••", text: $confirmPassword, isSecure: true, contentType: .newPassword)
                         .focused($focusedField, equals: .confirm)
                         .onSubmit { Task { await submit() } }
                 }
@@ -228,7 +228,7 @@ private struct _SignUpForm: View {
                     _ErrorBanner(message: error)
                 }
 
-                _PrimaryButton(title: "Create account", isLoading: auth.isLoading) {
+                _PrimaryButton(title: "Create account", isLoading: auth.isLoading || !auth.isReady) {
                     Task { await submit() }
                 }
             }
@@ -254,7 +254,12 @@ private struct _SignUpForm: View {
         error = nil
         do {
             let needsVerification = try await auth.signUp(email: email, password: password)
-            if needsVerification { success = true }
+            if needsVerification {
+                success = true
+            } else {
+                // Email confirmations disabled — sign in immediately
+                _ = try await auth.signIn(email: email, password: password)
+            }
         } catch {
             self.error = error.localizedDescription
         }
@@ -296,7 +301,7 @@ private struct _ResetPasswordForm: View {
                     _ErrorBanner(message: error)
                 }
 
-                _PrimaryButton(title: "Send reset link", isLoading: auth.isLoading) {
+                _PrimaryButton(title: "Send reset link", isLoading: auth.isLoading || !auth.isReady) {
                     Task { await submit() }
                 }
             }
@@ -328,6 +333,7 @@ private struct _InputField: View {
     let placeholder: String
     @Binding var text: String
     let isSecure: Bool
+    var contentType: NSTextContentType? = nil
 
     @State private var isRevealed = false
 
@@ -350,6 +356,8 @@ private struct _InputField: View {
                 .padding(.vertical, 10)
                 .padding(.leading, 12)
                 .padding(.trailing, isSecure ? 40 : 12)
+                .textContentType(contentType)
+
 
                 if isSecure {
                     Button {
