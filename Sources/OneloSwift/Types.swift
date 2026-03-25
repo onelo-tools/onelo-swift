@@ -64,6 +64,7 @@ public enum OneloError: LocalizedError, Sendable {
     case invalidPublishableKey(String)
     case keychainError(String)
     case networkError(String)
+    case serverError(String)
 
     public var errorDescription: String? {
         switch self {
@@ -72,6 +73,7 @@ public enum OneloError: LocalizedError, Sendable {
         case .invalidPublishableKey(let msg): return "Invalid publishable key: \(msg)"
         case .keychainError(let msg): return "Keychain error: \(msg)"
         case .networkError(let msg): return "Network error: \(msg)"
+        case .serverError(let msg): return msg
         }
     }
 }

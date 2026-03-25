@@ -34,33 +34,83 @@ public final class OneloAuth: ObservableObject {
 
     // MARK: - Public API
 
+    /// Sign in — goes through Onelo backend to track last_seen_at and validate app access.
     public func signIn(email: String, password: String) async throws -> OneloSession {
-        let client = try requireClient()
         isLoading = true
         defer { isLoading = false }
 
-        let session = try await client.signIn(email: email, password: password)
-        let oneloSession = try mapSession(session)
-        try saveSession(oneloSession)
-        currentSession = oneloSession
-        return oneloSession
+        let body: [String: String] = [
+            "email": email,
+            "password": password,
+            "publishableKey": config.publishableKey,
+        ]
+        let json = try await backendPost(path: "/api/sdk/auth/signin", body: body)
+
+        guard
+            let sessionData = json["session"] as? [String: Any],
+            let accessToken = sessionData["access_token"] as? String,
+            let refreshToken = sessionData["refresh_token"] as? String,
+            let expiresIn = sessionData["expires_in"] as? Int,
+            let userData = json["user"] as? [String: Any],
+            let userId = userData["id"] as? String
+        else {
+            let msg = json["error"] as? String ?? "Sign in failed"
+            throw OneloError.serverError(msg)
+        }
+
+        let userEmail = userData["email"] as? String
+        let expiresAt = Date().addingTimeInterval(TimeInterval(expiresIn))
+        let user = OneloUser(id: userId, email: userEmail, role: .member, tenantId: nil)
+        let session = OneloSession(accessToken: accessToken, refreshToken: refreshToken, expiresAt: expiresAt, user: user)
+        try saveSession(session)
+        currentSession = session
+        return session
     }
 
+    /// Sign up — registers via Onelo backend so the user is tracked in app_users.
+    /// Returns `true` if email verification is required.
     public func signUp(email: String, password: String) async throws -> Bool {
-        let client = try requireClient()
         isLoading = true
         defer { isLoading = false }
 
-        let response = try await client.signUp(email: email, password: password)
-        return response.session == nil
+        let body: [String: String] = [
+            "email": email,
+            "password": password,
+            "publishableKey": config.publishableKey,
+        ]
+        let json = try await backendPost(path: "/api/sdk/auth/signup", body: body)
+
+        if let errMsg = json["error"] as? String {
+            throw OneloError.serverError(errMsg)
+        }
+
+        // If backend returned a session, store it and sign in immediately
+        if let sessionData = json["session"] as? [String: Any],
+           let accessToken = sessionData["access_token"] as? String,
+           let refreshToken = sessionData["refresh_token"] as? String,
+           let expiresIn = sessionData["expires_in"] as? Int,
+           let userData = json["user"] as? [String: Any],
+           let userId = userData["id"] as? String {
+            let userEmail = userData["email"] as? String
+            let expiresAt = Date().addingTimeInterval(TimeInterval(expiresIn))
+            let user = OneloUser(id: userId, email: userEmail, role: .member, tenantId: nil)
+            let session = OneloSession(accessToken: accessToken, refreshToken: refreshToken, expiresAt: expiresAt, user: user)
+            try saveSession(session)
+            currentSession = session
+            return false // already signed in
+        }
+
+        return true // needs email verification
     }
 
     public func signOut() async throws {
-        let client = try requireClient()
         isLoading = true
         defer { isLoading = false }
 
-        try await client.signOut()
+        // Best-effort revoke with Supabase (non-fatal if offline)
+        if let client {
+            try? await client.signOut()
+        }
         try keychain.clear()
         currentSession = nil
     }
@@ -75,15 +125,39 @@ public final class OneloAuth: ObservableObject {
         try await client.signInWithOTP(email: email, redirectTo: redirectTo)
     }
 
+    /// Refreshes the session via Onelo backend — validates ban status and app membership.
     public func refreshSession() async throws -> OneloSession? {
-        let client = try requireClient()
         guard let refreshToken = try keychain.get(forKey: KeychainKeys.refreshToken) else { return nil }
 
-        let session = try await client.refreshSession(refreshToken: refreshToken)
-        let oneloSession = try mapSession(session)
-        try saveSession(oneloSession)
-        currentSession = oneloSession
-        return oneloSession
+        let body: [String: String] = [
+            "refresh_token": refreshToken,
+            "publishableKey": config.publishableKey,
+        ]
+        let json = try await backendPost(path: "/api/sdk/auth/refresh", body: body)
+
+        if let errMsg = json["error"] as? String {
+            // Account deleted or banned — force sign out
+            try keychain.clear()
+            currentSession = nil
+            throw OneloError.serverError(errMsg)
+        }
+
+        guard
+            let sessionData = json["session"] as? [String: Any],
+            let accessToken = sessionData["access_token"] as? String,
+            let newRefreshToken = sessionData["refresh_token"] as? String,
+            let expiresIn = sessionData["expires_in"] as? Int
+        else {
+            throw OneloError.serverError("Refresh failed")
+        }
+
+        // Preserve existing user info
+        let existingUser = currentSession?.user ?? OneloUser(id: "", email: nil, role: .member, tenantId: nil)
+        let expiresAt = Date().addingTimeInterval(TimeInterval(expiresIn))
+        let session = OneloSession(accessToken: accessToken, refreshToken: newRefreshToken, expiresAt: expiresAt, user: existingUser)
+        try saveSession(session)
+        currentSession = session
+        return session
     }
 
     // MARK: - Private
@@ -165,32 +239,35 @@ public final class OneloAuth: ObservableObject {
         }
     }
 
-    private func mapSession(_ session: Session) throws -> OneloSession {
-        let meta = session.user.appMetadata
-        let roleRaw = meta["user_role"]?.stringValue ?? "member"
-        let role = UserRole(rawValue: roleRaw) ?? .member
-        let tenantId = meta["tenant_id"]?.stringValue
-
-        let oneloUser = OneloUser(
-            id: session.user.id.uuidString,
-            email: session.user.email,
-            role: role,
-            tenantId: tenantId
-        )
-        return OneloSession(
-            accessToken: session.accessToken,
-            refreshToken: session.refreshToken,
-            expiresAt: Date(timeIntervalSince1970: session.expiresAt),
-            user: oneloUser
-        )
-    }
-
     private func saveSession(_ session: OneloSession) throws {
         try keychain.set(session.accessToken, forKey: KeychainKeys.accessToken)
         try keychain.set(session.refreshToken, forKey: KeychainKeys.refreshToken)
         try keychain.set(String(session.expiresAt.timeIntervalSince1970), forKey: KeychainKeys.expiresAt)
         let userJson = try JSONEncoder().encode(session.user)
         try keychain.set(String(data: userJson, encoding: .utf8) ?? "", forKey: KeychainKeys.userJson)
+    }
+
+    /// POST JSON to the Onelo backend and return parsed response dictionary.
+    private func backendPost(path: String, body: [String: String]) async throws -> [String: Any] {
+        let url = config.apiUrl.appendingPathComponent(path)
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw OneloError.serverError("No response")
+        }
+
+        let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+
+        if http.statusCode >= 400 {
+            let msg = json["error"] as? String ?? "HTTP \(http.statusCode)"
+            throw OneloError.serverError(msg)
+        }
+
+        return json
     }
 }
 
