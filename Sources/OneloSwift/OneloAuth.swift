@@ -41,18 +41,18 @@ public final class OneloAuth: ObservableObject {
         isLoading = true
         defer { isLoading = false }
 
-        let verifier = generateCodeVerifier()
-        pkceVerifier = verifier
+        guard let verifier = pkceVerifier else {
+            throw OneloError.serverError("SDK not ready — call after isReady")
+        }
+        pkceVerifier = nil
 
-        var body: [String: String] = [
+        let body: [String: String] = [
             "email": email,
             "password": password,
             "publishableKey": config.publishableKey,
             "code_verifier": verifier,
         ]
-        _ = body // suppress unused warning
         let json = try await backendPost(path: "/api/sdk/auth/signin", body: body)
-        pkceVerifier = nil
 
         guard
             let sessionData = json["session"] as? [String: Any],
@@ -81,8 +81,10 @@ public final class OneloAuth: ObservableObject {
         isLoading = true
         defer { isLoading = false }
 
-        let verifier = generateCodeVerifier()
-        pkceVerifier = verifier
+        guard let verifier = pkceVerifier else {
+            throw OneloError.serverError("SDK not ready — call after isReady")
+        }
+        pkceVerifier = nil
 
         let body: [String: String] = [
             "email": email,
@@ -91,7 +93,6 @@ public final class OneloAuth: ObservableObject {
             "code_verifier": verifier,
         ]
         let json = try await backendPost(path: "/api/sdk/auth/signup", body: body)
-        pkceVerifier = nil
 
         if let errMsg = json["error"] as? String {
             throw OneloError.serverError(errMsg)
