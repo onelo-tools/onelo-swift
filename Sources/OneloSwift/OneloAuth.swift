@@ -200,10 +200,14 @@ public final class OneloAuth: ObservableObject {
             throw OneloError.invalidPublishableKey("Key must start with onelo_pk_")
         }
 
-        var components = URLComponents(url: config.apiUrl.appendingPathComponent("/sdk/config"), resolvingAgainstBaseURL: false)!
+        var components = URLComponents(url: config.apiUrl.appendingPathComponent("/api/sdk/config"), resolvingAgainstBaseURL: false)!
         components.queryItems = [URLQueryItem(name: "key", value: config.publishableKey)]
 
-        let (data, response) = try await URLSession.shared.data(from: components.url!)
+        var configRequest = URLRequest(url: components.url!)
+        if let secret = config.clientSecret {
+            configRequest.setValue(secret, forHTTPHeaderField: "X-Client-Secret")
+        }
+        let (data, response) = try await URLSession.shared.data(for: configRequest)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             throw OneloError.invalidPublishableKey("Server rejected the key")
         }
