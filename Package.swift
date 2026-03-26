@@ -4,8 +4,8 @@ import PackageDescription
 let package = Package(
     name: "OneloSwift",
     platforms: [
-        .iOS(.v16),
-        .macOS(.v13),
+        .iOS(.v17),
+        .macOS(.v14),
     ],
     products: [
         .library(name: "OneloSwift", targets: ["OneloSwift"]),

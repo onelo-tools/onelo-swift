@@ -33,18 +33,14 @@ public struct OneloSession: Sendable {
 public struct OneloConfig: Sendable {
     /// Publishable key from Onelo dashboard (onelo_pk_live_...)
     public let publishableKey: String
-    /// Client secret for desktop/mobile apps (required for non-web app types)
-    public let clientSecret: String?
     /// Override API base URL (default: https://api.onelo.com)
     public let apiUrl: URL
 
     public init(
         publishableKey: String,
-        clientSecret: String? = nil,
         apiUrl: URL = URL(string: "https://api.onelo.com")!
     ) {
         self.publishableKey = publishableKey
-        self.clientSecret = clientSecret
         self.apiUrl = apiUrl
     }
 }

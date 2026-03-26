@@ -1,4 +1,5 @@
 import Foundation
+import CommonCrypto
 import Supabase
 
 /// OneloAuth — Swift SDK for Onelo authentication.
@@ -16,6 +17,7 @@ public final class OneloAuth: ObservableObject {
     private var client: AuthClient?
     private let keychain: KeychainStorage
     private let config: OneloConfig
+    private var pkceVerifier: String?
 
     private enum KeychainKeys {
         static let accessToken = "access_token"
@@ -39,12 +41,18 @@ public final class OneloAuth: ObservableObject {
         isLoading = true
         defer { isLoading = false }
 
-        let body: [String: String] = [
+        let verifier = generateCodeVerifier()
+        pkceVerifier = verifier
+
+        var body: [String: String] = [
             "email": email,
             "password": password,
             "publishableKey": config.publishableKey,
+            "code_verifier": verifier,
         ]
+        _ = body // suppress unused warning
         let json = try await backendPost(path: "/api/sdk/auth/signin", body: body)
+        pkceVerifier = nil
 
         guard
             let sessionData = json["session"] as? [String: Any],
@@ -73,18 +81,22 @@ public final class OneloAuth: ObservableObject {
         isLoading = true
         defer { isLoading = false }
 
+        let verifier = generateCodeVerifier()
+        pkceVerifier = verifier
+
         let body: [String: String] = [
             "email": email,
             "password": password,
             "publishableKey": config.publishableKey,
+            "code_verifier": verifier,
         ]
         let json = try await backendPost(path: "/api/sdk/auth/signup", body: body)
+        pkceVerifier = nil
 
         if let errMsg = json["error"] as? String {
             throw OneloError.serverError(errMsg)
         }
 
-        // If backend returned a session, store it and sign in immediately
         if let sessionData = json["session"] as? [String: Any],
            let accessToken = sessionData["access_token"] as? String,
            let refreshToken = sessionData["refresh_token"] as? String,
@@ -97,17 +109,16 @@ public final class OneloAuth: ObservableObject {
             let session = OneloSession(accessToken: accessToken, refreshToken: refreshToken, expiresAt: expiresAt, user: user)
             try saveSession(session)
             currentSession = session
-            return false // already signed in
+            return false
         }
 
-        return true // needs email verification
+        return true
     }
 
     public func signOut() async throws {
         isLoading = true
         defer { isLoading = false }
 
-        // Best-effort revoke with Supabase (non-fatal if offline)
         if let client {
             try? await client.signOut()
         }
@@ -136,7 +147,6 @@ public final class OneloAuth: ObservableObject {
         let json = try await backendPost(path: "/api/sdk/auth/refresh", body: body)
 
         if let errMsg = json["error"] as? String {
-            // Account deleted or banned — force sign out
             try keychain.clear()
             currentSession = nil
             throw OneloError.serverError(errMsg)
@@ -151,7 +161,6 @@ public final class OneloAuth: ObservableObject {
             throw OneloError.serverError("Refresh failed")
         }
 
-        // Preserve existing user info
         let existingUser = currentSession?.user ?? OneloUser(id: "", email: nil, role: .member, tenantId: nil)
         let expiresAt = Date().addingTimeInterval(TimeInterval(expiresIn))
         let session = OneloSession(accessToken: accessToken, refreshToken: newRefreshToken, expiresAt: expiresAt, user: existingUser)
@@ -160,13 +169,33 @@ public final class OneloAuth: ObservableObject {
         return session
     }
 
+    // MARK: - PKCE
+
+    private func generateCodeVerifier() -> String {
+        var bytes = [UInt8](repeating: 0, count: 32)
+        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        return Data(bytes).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+
+    private func generateCodeChallenge(from verifier: String) -> String {
+        let data = Data(verifier.utf8)
+        var digest = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
+        data.withUnsafeBytes { _ = CC_SHA256($0.baseAddress, CC_LONG(data.count), &digest) }
+        return Data(digest).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+
     // MARK: - Private
 
     private func initialize() async {
         do {
             let resolved = try await resolveConfig()
 
-            // Cache credentials in Keychain for offline init next launch
             try? keychain.set(resolved.supabaseUrl, forKey: KeychainKeys.supabaseUrl)
             try? keychain.set(resolved.supabaseAnonKey, forKey: KeychainKeys.supabaseAnonKey)
 
@@ -180,7 +209,6 @@ public final class OneloAuth: ObservableObject {
             isReady = true
             await restoreSession()
         } catch {
-            // Try offline fallback from Keychain
             if let url = try? keychain.get(forKey: KeychainKeys.supabaseUrl),
                let key = try? keychain.get(forKey: KeychainKeys.supabaseAnonKey) {
                 let authURL = URL(string: url)!.appendingPathComponent("/auth/v1")
@@ -200,13 +228,17 @@ public final class OneloAuth: ObservableObject {
             throw OneloError.invalidPublishableKey("Key must start with onelo_pk_")
         }
 
-        var components = URLComponents(url: config.apiUrl.appendingPathComponent("/api/sdk/config"), resolvingAgainstBaseURL: false)!
-        components.queryItems = [URLQueryItem(name: "key", value: config.publishableKey)]
+        let verifier = generateCodeVerifier()
+        pkceVerifier = verifier
+        let challenge = generateCodeChallenge(from: verifier)
 
-        var configRequest = URLRequest(url: components.url!)
-        if let secret = config.clientSecret {
-            configRequest.setValue(secret, forHTTPHeaderField: "X-Client-Secret")
-        }
+        var components = URLComponents(url: config.apiUrl.appendingPathComponent("/api/sdk/config"), resolvingAgainstBaseURL: false)!
+        components.queryItems = [
+            URLQueryItem(name: "key", value: config.publishableKey),
+            URLQueryItem(name: "code_challenge", value: challenge),
+        ]
+
+        let configRequest = URLRequest(url: components.url!)
         let (data, response) = try await URLSession.shared.data(for: configRequest)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             throw OneloError.invalidPublishableKey("Server rejected the key")
@@ -251,7 +283,6 @@ public final class OneloAuth: ObservableObject {
         try keychain.set(String(data: userJson, encoding: .utf8) ?? "", forKey: KeychainKeys.userJson)
     }
 
-    /// POST JSON to the Onelo backend and return parsed response dictionary.
     private func backendPost(path: String, body: [String: String]) async throws -> [String: Any] {
         let url = config.apiUrl.appendingPathComponent(path)
         var request = URLRequest(url: url)
