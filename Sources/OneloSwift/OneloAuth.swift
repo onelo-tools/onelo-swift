@@ -13,6 +13,8 @@ public final class OneloAuth: ObservableObject {
     @Published public private(set) var currentSession: OneloSession?
     @Published public private(set) var isLoading: Bool = false
     @Published public private(set) var isReady: Bool = false
+    /// Set when the publishable key is revoked or the app is deleted.
+    @Published public private(set) var isRevoked: Bool = false
 
     private var client: AuthClient?
     private let keychain: KeychainStorage
@@ -209,7 +211,14 @@ public final class OneloAuth: ObservableObject {
             )
             isReady = true
             await restoreSession()
+        } catch OneloError.invalidPublishableKey {
+            // Key was revoked or app deleted — clear session and signal to the UI
+            try? keychain.clear()
+            currentSession = nil
+            isRevoked = true
         } catch {
+            // Network offline or transient error — fall back to cached config so
+            // the user can still use a valid existing session.
             if let url = try? keychain.get(forKey: KeychainKeys.supabaseUrl),
                let key = try? keychain.get(forKey: KeychainKeys.supabaseAnonKey) {
                 let authURL = URL(string: url)!.appendingPathComponent("/auth/v1")
