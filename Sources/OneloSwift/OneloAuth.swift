@@ -43,10 +43,17 @@ public final class OneloAuth: ObservableObject {
         isLoading = true
         defer { isLoading = false }
 
+        return try await _signInAttempt(email: email, password: password, isRetry: false)
+    }
+
+    private func _signInAttempt(email: String, password: String, isRetry: Bool) async throws -> OneloSession {
+        if pkceVerifier == nil {
+            guard !isRetry else { throw OneloError.serverError("SDK not ready — call after isReady") }
+            try await refreshPKCE()
+        }
         guard let verifier = pkceVerifier else {
             throw OneloError.serverError("SDK not ready — call after isReady")
         }
-        pkceVerifier = nil
 
         let body: [String: String] = [
             "email": email,
@@ -54,7 +61,15 @@ public final class OneloAuth: ObservableObject {
             "publishableKey": config.publishableKey,
             "code_verifier": verifier,
         ]
-        let json = try await backendPost(path: "/api/sdk/auth/signin", body: body)
+
+        let json: [String: Any]
+        do {
+            json = try await backendPost(path: "/api/sdk/auth/signin", body: body)
+        } catch OneloError.serverError(let msg) where msg.contains("PKCE") && !isRetry {
+            pkceVerifier = nil
+            try await refreshPKCE()
+            return try await _signInAttempt(email: email, password: password, isRetry: true)
+        }
 
         guard
             let sessionData = json["session"] as? [String: Any],
@@ -67,6 +82,7 @@ public final class OneloAuth: ObservableObject {
             let msg = json["error"] as? String ?? "Sign in failed"
             throw OneloError.serverError(msg)
         }
+        pkceVerifier = nil
 
         let userEmail = userData["email"] as? String
         let expiresAt = Date().addingTimeInterval(TimeInterval(expiresIn))
@@ -83,10 +99,17 @@ public final class OneloAuth: ObservableObject {
         isLoading = true
         defer { isLoading = false }
 
+        return try await _signUpAttempt(email: email, password: password, isRetry: false)
+    }
+
+    private func _signUpAttempt(email: String, password: String, isRetry: Bool) async throws -> Bool {
+        if pkceVerifier == nil {
+            guard !isRetry else { throw OneloError.serverError("SDK not ready — call after isReady") }
+            try await refreshPKCE()
+        }
         guard let verifier = pkceVerifier else {
             throw OneloError.serverError("SDK not ready — call after isReady")
         }
-        pkceVerifier = nil
 
         let body: [String: String] = [
             "email": email,
@@ -94,11 +117,20 @@ public final class OneloAuth: ObservableObject {
             "publishableKey": config.publishableKey,
             "code_verifier": verifier,
         ]
-        let json = try await backendPost(path: "/api/sdk/auth/signup", body: body)
+
+        let json: [String: Any]
+        do {
+            json = try await backendPost(path: "/api/sdk/auth/signup", body: body)
+        } catch OneloError.serverError(let msg) where msg.contains("PKCE") && !isRetry {
+            pkceVerifier = nil
+            try await refreshPKCE()
+            return try await _signUpAttempt(email: email, password: password, isRetry: true)
+        }
 
         if let errMsg = json["error"] as? String {
             throw OneloError.serverError(errMsg)
         }
+        pkceVerifier = nil
 
         if let sessionData = json["session"] as? [String: Any],
            let accessToken = sessionData["access_token"] as? String,
@@ -127,6 +159,8 @@ public final class OneloAuth: ObservableObject {
         }
         try keychain.clear()
         currentSession = nil
+        pkceVerifier = nil
+        Task { await self.initialize() }
     }
 
     public func resetPassword(email: String, redirectTo: URL? = nil) async throws {
@@ -170,6 +204,18 @@ public final class OneloAuth: ObservableObject {
         try saveSession(session)
         currentSession = session
         return session
+    }
+
+    private func refreshPKCE() async throws {
+        let resolved = try await resolveConfig()
+        let authURL = URL(string: resolved.supabaseUrl)!.appendingPathComponent("/auth/v1")
+        client = AuthClient(
+            url: authURL,
+            headers: ["apikey": resolved.supabaseAnonKey],
+            localStorage: AuthClient.Configuration.defaultLocalStorage
+        )
+        try? keychain.set(resolved.supabaseUrl, forKey: KeychainKeys.supabaseUrl)
+        try? keychain.set(resolved.supabaseAnonKey, forKey: KeychainKeys.supabaseAnonKey)
     }
 
     // MARK: - PKCE
@@ -308,7 +354,29 @@ public final class OneloAuth: ObservableObject {
         let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
 
         if http.statusCode >= 400 {
-            let msg = json["error"] as? String ?? "HTTP \(http.statusCode)"
+            let msg = json["error"] as? String ?? json["detail"] as? String ?? "HTTP \(http.statusCode)"
+            throw OneloError.serverError(msg)
+        }
+
+        return json
+    }
+
+    func backendPostAny(path: String, body: [String: Any]) async throws -> [String: Any] {
+        let url = config.apiUrl.appendingPathComponent(path)
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw OneloError.serverError("No response")
+        }
+
+        let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+
+        if http.statusCode >= 400 {
+            let msg = json["error"] as? String ?? json["detail"] as? String ?? "HTTP \(http.statusCode)"
             throw OneloError.serverError(msg)
         }
 
