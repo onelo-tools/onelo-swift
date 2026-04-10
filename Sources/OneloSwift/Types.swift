@@ -33,14 +33,14 @@ public struct OneloSession: Sendable {
 public struct OneloConfig: Sendable {
     /// Publishable key from Onelo dashboard (onelo_pk_live_...)
     public let publishableKey: String
-    /// Override API base URL (default: https://api.onelo.com)
+    /// Override API base URL (default: https://backend.onelo.tools)
     public let apiUrl: URL
     /// SDK version sent as X-SDK-Version header (set automatically)
     public static let sdkVersion = "0.2.0"
 
     public init(
         publishableKey: String,
-        apiUrl: URL = URL(string: "https://api.onelo.com")!
+        apiUrl: URL = URL(string: "https://backend.onelo.tools")!
     ) {
         self.publishableKey = publishableKey
         self.apiUrl = apiUrl
