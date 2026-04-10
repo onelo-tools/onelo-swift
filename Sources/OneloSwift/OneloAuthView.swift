@@ -175,8 +175,14 @@ private struct _SignInForm: View {
         error = nil
         do {
             _ = try await auth.signIn(email: email, password: password)
+        } catch OneloError.serverError(let msg) {
+            switch msg {
+            case "invalid_credentials": self.error = "Invalid email or password."
+            case "banned":              self.error = "Your account has been suspended."
+            default:                    self.error = msg
+            }
         } catch {
-            self.error = error.localizedDescription
+            self.error = "Something went wrong. Please try again."
         }
     }
 }
@@ -260,8 +266,14 @@ private struct _SignUpForm: View {
                 // Email confirmations disabled — sign in immediately
                 _ = try await auth.signIn(email: email, password: password)
             }
+        } catch OneloError.serverError(let msg) {
+            switch msg {
+            case "email_already_registered": self.error = "An account with this email already exists."
+            case "plan_limit_exceeded":      self.error = "This app has reached its user limit."
+            default:                         self.error = msg
+            }
         } catch {
-            self.error = error.localizedDescription
+            self.error = "Something went wrong. Please try again."
         }
     }
 }
