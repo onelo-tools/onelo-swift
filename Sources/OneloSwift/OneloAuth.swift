@@ -449,7 +449,12 @@ public final class OneloAuth: ObservableObject {
         let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
 
         if http.statusCode >= 400 {
-            let msg = json["error"] as? String ?? json["detail"] as? String ?? "HTTP \(http.statusCode)"
+            let detailStr = json["detail"] as? String
+            let detailDict = json["detail"] as? [String: Any]
+            let msg = json["error"] as? String
+                ?? detailStr
+                ?? detailDict?["error"] as? String
+                ?? "HTTP \(http.statusCode)"
             throw OneloError.serverError(msg)
         }
 
