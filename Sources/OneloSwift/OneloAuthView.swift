@@ -15,18 +15,22 @@ public struct OneloAuthView<Authenticated: View>: View {
     @ObservedObject public var auth: OneloAuth
     let authenticated: () -> Authenticated
     let headerIcon: Image?
+    let showIconBackground: Bool
 
     /// - Parameters:
     ///   - auth: The ``OneloAuth`` instance managing authentication state.
-    ///   - headerIcon: Optional image shown above the sign-in card. Pass `nil` to use the default icon.
+    ///   - headerIcon: Optional image shown above the sign-in card. Pass `nil` to use the default Onelo logo.
+    ///   - showIconBackground: Whether to show the rounded-rect background behind the header icon. Defaults to `true`.
     ///   - authenticated: View shown when the user is signed in.
     public init(
         auth: OneloAuth,
         headerIcon: Image? = nil,
+        showIconBackground: Bool = true,
         @ViewBuilder authenticated: @escaping () -> Authenticated
     ) {
         self.auth = auth
         self.headerIcon = headerIcon
+        self.showIconBackground = showIconBackground
         self.authenticated = authenticated
     }
 
@@ -35,7 +39,7 @@ public struct OneloAuthView<Authenticated: View>: View {
             if auth.currentSession != nil {
                 authenticated()
             } else {
-                _AuthFlowView(auth: auth, headerIcon: headerIcon)
+                _AuthFlowView(auth: auth, headerIcon: headerIcon, showIconBackground: showIconBackground)
             }
         }
     }
@@ -51,6 +55,7 @@ private enum AuthMode {
 private struct _AuthFlowView: View {
     @ObservedObject var auth: OneloAuth
     let headerIcon: Image?
+    let showIconBackground: Bool
     @State private var mode: AuthMode = .signIn
 
     var body: some View {
@@ -62,7 +67,7 @@ private struct _AuthFlowView: View {
 
                 // Card
                 VStack(spacing: 32) {
-                    _BrandHeader(icon: headerIcon)
+                    _BrandHeader(icon: headerIcon, showBackground: showIconBackground)
 
                     ZStack {
                         switch mode {
@@ -115,22 +120,21 @@ private struct _AuthFlowView: View {
 
 private struct _BrandHeader: View {
     let icon: Image?
+    let showBackground: Bool
 
     var body: some View {
         ZStack {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(Color.primary.opacity(0.06))
-                .frame(width: 44, height: 44)
-            if let icon {
-                icon
-                    .resizable()
-                    .scaledToFit()
-                    .padding(6)
-            } else {
-                Image(systemName: "circle.hexagongrid.fill")
-                    .font(.system(size: 22, weight: .medium))
-                    .foregroundStyle(.primary)
+            if showBackground {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(Color.primary.opacity(0.06))
+                    .frame(width: 44, height: 44)
             }
+            let displayIcon = icon ?? Image("onelo-logo", bundle: .module)
+            displayIcon
+                .resizable()
+                .scaledToFit()
+                .frame(width: 44, height: 44)
+                .padding(showBackground ? 6 : 0)
         }
     }
 }
