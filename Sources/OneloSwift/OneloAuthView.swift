@@ -79,6 +79,10 @@ private struct _AuthFlowView: View {
                         }
                     }
                     .animation(.spring(response: 0.35, dampingFraction: 0.85), value: mode)
+
+                    if auth.showBranding {
+                        _PoweredByView()
+                    }
                 }
                 .padding(40)
                 .frame(width: 400)
@@ -477,5 +481,24 @@ private struct _LinkButtonStyle: ButtonStyle {
             .font(.system(size: 13))
             .foregroundStyle(configuration.isPressed ? Color.primary.opacity(0.5) : Color.secondary)
             .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
+    }
+}
+
+// MARK: - Powered by Onelo
+
+private struct _PoweredByView: View {
+    var body: some View {
+        Link(destination: URL(string: "https://onelo.tools")!) {
+            HStack(spacing: 5) {
+                Image(systemName: "circle.hexagongrid.fill")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+                Text("Powered by Onelo")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .buttonStyle(.plain)
+        .padding(.top, 4)
     }
 }

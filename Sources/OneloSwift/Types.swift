@@ -36,7 +36,7 @@ public struct OneloConfig: Sendable {
     /// Override API base URL (default: https://backend.onelo.tools)
     public let apiUrl: URL
     /// SDK version sent as X-SDK-Version header (set automatically)
-    public static let sdkVersion = "0.2.0"
+    public static let sdkVersion = "0.2.1"
 
     public init(
         publishableKey: String,
@@ -52,11 +52,13 @@ struct ResolvedConfig: Decodable {
     let supabaseUrl: String
     let supabaseAnonKey: String
     let tenantId: String
+    let showBranding: Bool?
 
     enum CodingKeys: String, CodingKey {
         case supabaseUrl = "supabase_url"
         case supabaseAnonKey = "supabase_anon_key"
         case tenantId = "tenant_id"
+        case showBranding = "show_branding"
     }
 }
 
