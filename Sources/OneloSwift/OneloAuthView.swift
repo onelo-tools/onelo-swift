@@ -96,6 +96,24 @@ private struct _AuthFlowView: View {
                     }
                     .animation(.spring(response: 0.35, dampingFraction: 0.85), value: mode)
 
+                    // OAuth providers
+                    if !auth.oauthProviders.isEmpty {
+                        _OAuthDivider()
+                        VStack(spacing: 10) {
+                            ForEach(auth.oauthProviders, id: \.self) { provider in
+                                _OAuthButton(provider: provider) {
+                                    Task {
+                                        do {
+                                            _ = try await auth.signInWithOAuth(provider: provider)
+                                        } catch {
+                                            // errors shown by ASWebAuthenticationSession itself
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     if auth.showBranding {
                         _PoweredByView()
                     }
@@ -532,5 +550,77 @@ private struct _PoweredByView: View {
         }
         .buttonStyle(.plain)
         .padding(.top, 4)
+    }
+}
+
+// MARK: - OAuth
+
+private struct _OAuthDivider: View {
+    var body: some View {
+        HStack(spacing: 12) {
+            Rectangle()
+                .fill(Color.primary.opacity(0.08))
+                .frame(height: 1)
+            Text("or")
+                .font(.system(size: 12))
+                .foregroundStyle(.tertiary)
+            Rectangle()
+                .fill(Color.primary.opacity(0.08))
+                .frame(height: 1)
+        }
+    }
+}
+
+private struct _OAuthButton: View {
+    let provider: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                _OAuthProviderIcon(provider: provider)
+                    .frame(width: 16, height: 16)
+                Text("Continue with \(provider.capitalized)")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.primary)
+            }
+            .frame(maxWidth: .infinity)
+            .frame(height: 36)
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(Color.primary.opacity(0.05))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .strokeBorder(Color.primary.opacity(0.1), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private struct _OAuthProviderIcon: View {
+    let provider: String
+
+    var body: some View {
+        switch provider {
+        case "google":
+            // Simple "G" text icon
+            Text("G")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.primary)
+        case "github":
+            Image(systemName: "chevron.left.forwardslash.chevron.right")
+                .font(.system(size: 11))
+                .foregroundStyle(.primary)
+        case "apple":
+            Image(systemName: "apple.logo")
+                .font(.system(size: 13))
+                .foregroundStyle(.primary)
+        default:
+            Image(systemName: "person.crop.circle")
+                .font(.system(size: 13))
+                .foregroundStyle(.primary)
+        }
     }
 }

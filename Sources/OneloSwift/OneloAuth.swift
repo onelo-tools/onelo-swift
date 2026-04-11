@@ -1,6 +1,7 @@
 import Foundation
 import CommonCrypto
 import Supabase
+import AuthenticationServices
 
 /// OneloAuth — Swift SDK for Onelo authentication.
 ///
@@ -18,11 +19,13 @@ public final class OneloAuth: ObservableObject {
     /// Set when the user account has been deleted or suspended by an admin.
     @Published public private(set) var isUserRevoked: Bool = false
     @Published public private(set) var showBranding: Bool = true
+    @Published public private(set) var oauthProviders: [String] = []
 
     private var client: AuthClient?
     private let keychain: KeychainStorage
     internal let config: OneloConfig
     private var pkceVerifier: String?
+    private let _webAuthContext: _WebAuthContext
 
     private enum KeychainKeys {
         static let accessToken = "access_token"
@@ -36,6 +39,7 @@ public final class OneloAuth: ObservableObject {
     public init(config: OneloConfig) {
         self.config = config
         self.keychain = KeychainStorage()
+        self._webAuthContext = _WebAuthContext()
         Task { await self.initialize() }
     }
 
@@ -303,6 +307,7 @@ public final class OneloAuth: ObservableObject {
         do {
             let resolved = try await resolveConfig()
             showBranding = resolved.showBranding ?? true
+            oauthProviders = resolved.oauthProviders
 
             try? keychain.set(resolved.supabaseUrl, forKey: KeychainKeys.supabaseUrl)
             try? keychain.set(resolved.supabaseAnonKey, forKey: KeychainKeys.supabaseAnonKey)
@@ -463,6 +468,78 @@ public final class OneloAuth: ObservableObject {
         return json
     }
 
+    /// Sign in using a third-party OAuth provider (Google, GitHub, Apple).
+    /// Opens ASWebAuthenticationSession. The redirect URL scheme must be registered
+    /// in the app's Info.plist as: onelo-{publishableKey}
+    public func signInWithOAuth(provider: String) async throws -> OneloSession {
+        isLoading = true
+        defer { isLoading = false }
+
+        // 1. Generate PKCE
+        let verifier = generateCodeVerifier()
+        let challenge = generateCodeChallenge(from: verifier)
+
+        // 2. Build callback URL scheme: onelo-{publishableKey}
+        let scheme = "onelo-\(config.publishableKey)"
+        let redirectUri = "\(scheme)://oauth/callback"
+
+        // 3. Call init endpoint
+        var components = URLComponents(url: config.apiUrl.appendingPathComponent("/api/sdk/auth/oauth/\(provider)/init"), resolvingAgainstBaseURL: false)!
+        components.queryItems = [
+            URLQueryItem(name: "key", value: config.publishableKey),
+            URLQueryItem(name: "redirect_uri", value: redirectUri),
+            URLQueryItem(name: "code_challenge", value: challenge),
+            URLQueryItem(name: "code_challenge_method", value: "S256"),
+        ]
+
+        let (initData, initResponse) = try await URLSession.shared.data(for: URLRequest(url: components.url!))
+        guard let initHttp = initResponse as? HTTPURLResponse, initHttp.statusCode == 200 else {
+            let json = (try? JSONSerialization.jsonObject(with: initData)) as? [String: Any] ?? [:]
+            let msg = json["detail"] as? String ?? json["error"] as? String ?? "Failed to init OAuth"
+            throw OneloError.serverError(msg)
+        }
+        let initJson = (try? JSONSerialization.jsonObject(with: initData)) as? [String: Any] ?? [:]
+        guard let authUrlStr = initJson["url"] as? String, let authUrl = URL(string: authUrlStr) else {
+            throw OneloError.serverError("No auth URL returned")
+        }
+
+        // 4. Open ASWebAuthenticationSession
+        let callbackUrl: URL = try await withCheckedThrowingContinuation { continuation in
+            let oauthSession = ASWebAuthenticationSession(url: authUrl, callbackURLScheme: scheme) { callbackURL, error in
+                if let error = error {
+                    continuation.resume(throwing: OneloError.serverError(error.localizedDescription))
+                } else if let url = callbackURL {
+                    continuation.resume(returning: url)
+                } else {
+                    continuation.resume(throwing: OneloError.serverError("OAuth cancelled"))
+                }
+            }
+            oauthSession.presentationContextProvider = _webAuthContext
+            oauthSession.prefersEphemeralWebBrowserSession = false
+            oauthSession.start()
+        }
+
+        // 5. Parse token + refresh_token from callback URL
+        guard let urlComponents = URLComponents(url: callbackUrl, resolvingAgainstBaseURL: false),
+              let tokenItem = urlComponents.queryItems?.first(where: { $0.name == "token" }),
+              let refreshItem = urlComponents.queryItems?.first(where: { $0.name == "refresh_token" }),
+              let accessToken = tokenItem.value,
+              let refreshToken = refreshItem.value
+        else {
+            let errorItem = URLComponents(url: callbackUrl, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "error" })
+            throw OneloError.serverError(errorItem?.value ?? "Invalid callback URL")
+        }
+
+        // 6. Build and store session
+        let expiresAt = Date().addingTimeInterval(900) // 15 min default
+        let emailItem = urlComponents.queryItems?.first(where: { $0.name == "email" })
+        let user = OneloUser(id: provider, email: emailItem?.value, role: .member, tenantId: nil)
+        let session = OneloSession(accessToken: accessToken, refreshToken: refreshToken, expiresAt: expiresAt, user: user)
+        try saveSession(session)
+        currentSession = session
+        return session
+    }
+
     func backendPostAny(path: String, body: [String: Any]) async throws -> [String: Any] {
         let url = config.apiUrl.appendingPathComponent(path)
         var request = URLRequest(url: url)
@@ -490,5 +567,13 @@ private extension AnyJSON {
     var stringValue: String? {
         if case .string(let s) = self { return s }
         return nil
+    }
+}
+
+// MARK: - OAuth presentation context (macOS)
+
+private final class _WebAuthContext: NSObject, ASWebAuthenticationPresentationContextProviding {
+    func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
+        NSApplication.shared.keyWindow ?? NSWindow()
     }
 }
