@@ -14,9 +14,19 @@ import SwiftUI
 public struct OneloAuthView<Authenticated: View>: View {
     @ObservedObject public var auth: OneloAuth
     let authenticated: () -> Authenticated
+    let headerIcon: Image?
 
-    public init(auth: OneloAuth, @ViewBuilder authenticated: @escaping () -> Authenticated) {
+    /// - Parameters:
+    ///   - auth: The ``OneloAuth`` instance managing authentication state.
+    ///   - headerIcon: Optional image shown above the sign-in card. Pass `nil` to use the default icon.
+    ///   - authenticated: View shown when the user is signed in.
+    public init(
+        auth: OneloAuth,
+        headerIcon: Image? = nil,
+        @ViewBuilder authenticated: @escaping () -> Authenticated
+    ) {
         self.auth = auth
+        self.headerIcon = headerIcon
         self.authenticated = authenticated
     }
 
@@ -25,7 +35,7 @@ public struct OneloAuthView<Authenticated: View>: View {
             if auth.currentSession != nil {
                 authenticated()
             } else {
-                _AuthFlowView(auth: auth)
+                _AuthFlowView(auth: auth, headerIcon: headerIcon)
             }
         }
     }
@@ -40,6 +50,7 @@ private enum AuthMode {
 @MainActor
 private struct _AuthFlowView: View {
     @ObservedObject var auth: OneloAuth
+    let headerIcon: Image?
     @State private var mode: AuthMode = .signIn
 
     var body: some View {
@@ -51,7 +62,7 @@ private struct _AuthFlowView: View {
 
                 // Card
                 VStack(spacing: 32) {
-                    _BrandHeader()
+                    _BrandHeader(icon: headerIcon)
 
                     ZStack {
                         switch mode {
@@ -103,12 +114,19 @@ private struct _AuthFlowView: View {
 // MARK: - Brand header
 
 private struct _BrandHeader: View {
+    let icon: Image?
+
     var body: some View {
-        VStack(spacing: 8) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .fill(Color.primary.opacity(0.06))
-                    .frame(width: 44, height: 44)
+        ZStack {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color.primary.opacity(0.06))
+                .frame(width: 44, height: 44)
+            if let icon {
+                icon
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 26, height: 26)
+            } else {
                 Image(systemName: "circle.hexagongrid.fill")
                     .font(.system(size: 22, weight: .medium))
                     .foregroundStyle(.primary)

@@ -36,7 +36,7 @@ public struct OneloConfig: Sendable {
     /// Override API base URL (default: https://backend.onelo.tools)
     public let apiUrl: URL
     /// SDK version sent as X-SDK-Version header (set automatically)
-    public static let sdkVersion = "0.2.2"
+    public static let sdkVersion = "0.3.0"
 
     public init(
         publishableKey: String,
