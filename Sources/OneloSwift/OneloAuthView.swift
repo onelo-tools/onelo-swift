@@ -125,7 +125,7 @@ private struct _BrandHeader: View {
                 icon
                     .resizable()
                     .scaledToFit()
-                    .frame(width: 26, height: 26)
+                    .padding(6)
             } else {
                 Image(systemName: "circle.hexagongrid.fill")
                     .font(.system(size: 22, weight: .medium))
