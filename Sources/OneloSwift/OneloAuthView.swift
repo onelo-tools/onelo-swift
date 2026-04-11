@@ -488,10 +488,13 @@ private struct _LinkButtonStyle: ButtonStyle {
 
 private struct _OneloBadgeIcon: View {
     var body: some View {
-        Image("onelo-logo", bundle: .module)
-            .resizable()
-            .scaledToFit()
-            .frame(width: 16, height: 16)
+        if let url = Bundle.module.url(forResource: "onelo-logo", withExtension: "webp"),
+           let nsImage = NSImage(contentsOf: url) {
+            Image(nsImage: nsImage)
+                .resizable()
+                .scaledToFit()
+                .frame(width: 16, height: 16)
+        }
     }
 }
 
