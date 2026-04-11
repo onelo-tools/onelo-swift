@@ -489,18 +489,16 @@ private struct _LinkButtonStyle: ButtonStyle {
 private struct _OneloBadgeIcon: View {
     var body: some View {
         ZStack {
-            RoundedRectangle(cornerRadius: 3)
-                .fill(Color(white: 0.15))
-                .frame(width: 14, height: 14)
-            RoundedRectangle(cornerRadius: 1.5)
-                .fill(.white)
-                .frame(width: 7, height: 7)
+            RoundedRectangle(cornerRadius: 2.5)
+                .fill(.secondary)
+                .frame(width: 12, height: 12)
                 .rotationEffect(.degrees(45))
             Circle()
                 .fill(Color(red: 0.976, green: 0.451, blue: 0.086))
-                .frame(width: 4, height: 4)
-                .offset(x: 3, y: -3)
+                .frame(width: 5, height: 5)
+                .offset(x: 3.5, y: -3.5)
         }
+        .frame(width: 18, height: 18)
     }
 }
 
