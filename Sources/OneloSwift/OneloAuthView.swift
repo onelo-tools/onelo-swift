@@ -486,16 +486,32 @@ private struct _LinkButtonStyle: ButtonStyle {
 
 // MARK: - Powered by Onelo
 
+private struct _OneloBadgeIcon: View {
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 3)
+                .fill(Color(white: 0.15))
+                .frame(width: 14, height: 14)
+            RoundedRectangle(cornerRadius: 1.5)
+                .fill(.white)
+                .frame(width: 7, height: 7)
+                .rotationEffect(.degrees(45))
+            Circle()
+                .fill(Color(red: 0.976, green: 0.451, blue: 0.086))
+                .frame(width: 4, height: 4)
+                .offset(x: 3, y: -3)
+        }
+    }
+}
+
 private struct _PoweredByView: View {
     var body: some View {
         Link(destination: URL(string: "https://onelo.tools")!) {
             HStack(spacing: 5) {
-                Image(systemName: "circle.hexagongrid.fill")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.tertiary)
+                _OneloBadgeIcon()
                 Text("Powered by Onelo")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.tertiary)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
             }
         }
         .buttonStyle(.plain)
