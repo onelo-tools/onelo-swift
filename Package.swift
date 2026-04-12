@@ -21,8 +21,7 @@ let package = Package(
             name: "OneloSwift",
             dependencies: [
                 .product(name: "Supabase", package: "supabase-swift"),
-            ],
-            resources: [.process("Resources")]
+            ]
         ),
         .testTarget(
             name: "OneloSwiftTests",

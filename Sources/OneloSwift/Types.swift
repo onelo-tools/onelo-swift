@@ -1,5 +1,9 @@
 import Foundation
 
+public enum OneloSDK {
+    public static let sdkVersion = "2.1.0"
+}
+
 public enum UserRole: String, Codable, Sendable {
     case platformOwner = "platform_owner"
     case creator = "creator"
@@ -33,14 +37,12 @@ public struct OneloSession: Sendable {
 public struct OneloConfig: Sendable {
     /// Publishable key from Onelo dashboard (onelo_pk_live_...)
     public let publishableKey: String
-    /// Override API base URL (default: https://backend.onelo.tools)
+    /// Override API base URL (default: https://api.onelo.com)
     public let apiUrl: URL
-    /// SDK version sent as X-SDK-Version header (set automatically)
-    public static let sdkVersion = "0.4.0"
 
     public init(
         publishableKey: String,
-        apiUrl: URL = URL(string: "https://backend.onelo.tools")!
+        apiUrl: URL = URL(string: "https://api.onelo.com")!
     ) {
         self.publishableKey = publishableKey
         self.apiUrl = apiUrl
@@ -52,24 +54,11 @@ struct ResolvedConfig: Decodable {
     let supabaseUrl: String
     let supabaseAnonKey: String
     let tenantId: String
-    let showBranding: Bool?
-    let oauthProviders: [String]
 
     enum CodingKeys: String, CodingKey {
         case supabaseUrl = "supabase_url"
         case supabaseAnonKey = "supabase_anon_key"
         case tenantId = "tenant_id"
-        case showBranding = "show_branding"
-        case oauthProviders = "oauth_providers"
-    }
-
-    init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        supabaseUrl = try container.decode(String.self, forKey: .supabaseUrl)
-        supabaseAnonKey = try container.decode(String.self, forKey: .supabaseAnonKey)
-        tenantId = try container.decode(String.self, forKey: .tenantId)
-        showBranding = try container.decodeIfPresent(Bool.self, forKey: .showBranding)
-        oauthProviders = (try? container.decodeIfPresent([String].self, forKey: .oauthProviders)) ?? []
     }
 }
 

@@ -1,7 +1,6 @@
 import Foundation
 import CommonCrypto
 import Supabase
-import AuthenticationServices
 
 /// OneloAuth — Swift SDK for Onelo authentication.
 ///
@@ -18,14 +17,11 @@ public final class OneloAuth: ObservableObject {
     @Published public private(set) var isRevoked: Bool = false
     /// Set when the user account has been deleted or suspended by an admin.
     @Published public private(set) var isUserRevoked: Bool = false
-    @Published public private(set) var showBranding: Bool = true
-    @Published public private(set) var oauthProviders: [String] = []
 
     private var client: AuthClient?
     private let keychain: KeychainStorage
-    internal let config: OneloConfig
+    let config: OneloConfig
     private var pkceVerifier: String?
-    private let _webAuthContext: _WebAuthContext
 
     private enum KeychainKeys {
         static let accessToken = "access_token"
@@ -39,7 +35,6 @@ public final class OneloAuth: ObservableObject {
     public init(config: OneloConfig) {
         self.config = config
         self.keychain = KeychainStorage()
-        self._webAuthContext = _WebAuthContext()
         Task { await self.initialize() }
     }
 
@@ -49,6 +44,7 @@ public final class OneloAuth: ObservableObject {
     public func signIn(email: String, password: String) async throws -> OneloSession {
         isLoading = true
         defer { isLoading = false }
+
         return try await _signInAttempt(email: email, password: password, isRetry: false)
     }
 
@@ -77,10 +73,11 @@ public final class OneloAuth: ObservableObject {
             return try await _signInAttempt(email: email, password: password, isRetry: true)
         }
 
-        // New flat response: { access_token, refresh_token, token_type, expires_in, user }
         guard
-            let accessToken = json["access_token"] as? String,
-            let refreshToken = json["refresh_token"] as? String,
+            let sessionData = json["session"] as? [String: Any],
+            let accessToken = sessionData["access_token"] as? String,
+            let refreshToken = sessionData["refresh_token"] as? String,
+            let expiresIn = sessionData["expires_in"] as? Int,
             let userData = json["user"] as? [String: Any],
             let userId = userData["id"] as? String
         else {
@@ -89,7 +86,6 @@ public final class OneloAuth: ObservableObject {
         }
         pkceVerifier = nil
 
-        let expiresIn = json["expires_in"] as? Int ?? 900
         let userEmail = userData["email"] as? String
         let expiresAt = Date().addingTimeInterval(TimeInterval(expiresIn))
         let user = OneloUser(id: userId, email: userEmail, role: .member, tenantId: nil)
@@ -100,11 +96,11 @@ public final class OneloAuth: ObservableObject {
     }
 
     /// Sign up — registers via Onelo backend so the user is tracked in app_users.
-    /// Returns `true` if the caller should show "check your email" (email verification required).
-    /// Returns `false` if sign-up created a session directly (email+password, no verification).
+    /// Returns `true` if email verification is required.
     public func signUp(email: String, password: String) async throws -> Bool {
         isLoading = true
         defer { isLoading = false }
+
         return try await _signUpAttempt(email: email, password: password, isRetry: false)
     }
 
@@ -138,62 +134,40 @@ public final class OneloAuth: ObservableObject {
         }
         pkceVerifier = nil
 
-        // New flat response: { access_token, refresh_token, token_type, expires_in, user }
-        if let accessToken = json["access_token"] as? String,
-           let refreshToken = json["refresh_token"] as? String,
+        if let sessionData = json["session"] as? [String: Any],
+           let accessToken = sessionData["access_token"] as? String,
+           let refreshToken = sessionData["refresh_token"] as? String,
+           let expiresIn = sessionData["expires_in"] as? Int,
            let userData = json["user"] as? [String: Any],
            let userId = userData["id"] as? String {
-            let expiresIn = json["expires_in"] as? Int ?? 900
             let userEmail = userData["email"] as? String
             let expiresAt = Date().addingTimeInterval(TimeInterval(expiresIn))
             let user = OneloUser(id: userId, email: userEmail, role: .member, tenantId: nil)
             let session = OneloSession(accessToken: accessToken, refreshToken: refreshToken, expiresAt: expiresAt, user: user)
             try saveSession(session)
             currentSession = session
-            return false // session created, no email verification needed
+            return false
         }
 
-        return true // email verification required
+        return true
     }
 
     public func signOut() async throws {
         isLoading = true
         defer { isLoading = false }
 
-        // Send signout to backend (best-effort)
-        if let accessToken = currentSession?.accessToken {
-            let url = config.apiUrl.appendingPathComponent("/api/sdk/auth/signout")
-            var request = URLRequest(url: url)
-            request.httpMethod = "POST"
-            request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-            request.setValue(config.publishableKey, forHTTPHeaderField: "X-Publishable-Key")
-            _ = try? await URLSession.shared.data(for: request)
-        } else if let client {
-            // OAuth path
+        if let client {
             try? await client.signOut()
         }
-
         try keychain.clear()
         currentSession = nil
         pkceVerifier = nil
         Task { await self.initialize() }
     }
 
-    /// Request a password reset email.
-    public func resetPassword(email: String) async throws {
-        _ = try await backendPost(path: "/api/sdk/auth/reset-password/request", body: [
-            "publishableKey": config.publishableKey,
-            "email": email,
-        ])
-    }
-
-    /// Confirm a password reset with the token from the email.
-    public func confirmPasswordReset(token: String, newPassword: String) async throws {
-        _ = try await backendPost(path: "/api/sdk/auth/reset-password/confirm", body: [
-            "publishableKey": config.publishableKey,
-            "token": token,
-            "new_password": newPassword,
-        ])
+    public func resetPassword(email: String, redirectTo: URL? = nil) async throws {
+        let client = try requireClient()
+        try await client.resetPasswordForEmail(email, redirectTo: redirectTo)
     }
 
     public func signInWithMagicLink(email: String, redirectTo: URL? = nil) async throws {
@@ -215,11 +189,19 @@ public final class OneloAuth: ObservableObject {
         ])
 
         let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw OneloError.serverError("No response")
+        }
+
         let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
 
-        if let http = response as? HTTPURLResponse, http.statusCode == 403 {
+        if http.statusCode == 403 {
+            // Account deleted or suspended — treat as a hard revocation
             let detail = json["detail"] as? String ?? ""
-            if detail.hasPrefix("account_") {
+            let isRevocation = detail.contains("account_deleted")
+                || detail.contains("account_suspended")
+                || detail.contains("account_payment_failed")
+            if isRevocation {
                 try? keychain.clear()
                 currentSession = nil
                 isUserRevoked = true
@@ -227,9 +209,9 @@ public final class OneloAuth: ObservableObject {
             }
         }
 
-        if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
-            let msg = json["detail"] as? String ?? json["error"] as? String ?? "HTTP \(http.statusCode)"
-            try? keychain.clear()
+        if http.statusCode >= 400 {
+            let msg = json["error"] as? String ?? json["detail"] as? String ?? "HTTP \(http.statusCode)"
+            try keychain.clear()
             currentSession = nil
             throw OneloError.serverError(msg)
         }
@@ -240,32 +222,21 @@ public final class OneloAuth: ObservableObject {
             throw OneloError.serverError(errMsg)
         }
 
+        guard
+            let sessionData = json["session"] as? [String: Any],
+            let accessToken = sessionData["access_token"] as? String,
+            let newRefreshToken = sessionData["refresh_token"] as? String,
+            let expiresIn = sessionData["expires_in"] as? Int
+        else {
+            throw OneloError.serverError("Refresh failed")
+        }
+
         let existingUser = currentSession?.user ?? OneloUser(id: "", email: nil, role: .member, tenantId: nil)
-
-        // SDK email+password path: flat response { access_token, refresh_token, expires_in }
-        if let accessToken = json["access_token"] as? String,
-           let newRefreshToken = json["refresh_token"] as? String {
-            let expiresIn = json["expires_in"] as? Int ?? 900
-            let expiresAt = Date().addingTimeInterval(TimeInterval(expiresIn))
-            let session = OneloSession(accessToken: accessToken, refreshToken: newRefreshToken, expiresAt: expiresAt, user: existingUser)
-            try saveSession(session)
-            currentSession = session
-            return session
-        }
-
-        // OAuth / Supabase path: nested { session: { access_token, refresh_token, expires_in } }
-        if let sessionData = json["session"] as? [String: Any],
-           let accessToken = sessionData["access_token"] as? String,
-           let newRefreshToken = sessionData["refresh_token"] as? String,
-           let expiresIn = sessionData["expires_in"] as? Int {
-            let expiresAt = Date().addingTimeInterval(TimeInterval(expiresIn))
-            let session = OneloSession(accessToken: accessToken, refreshToken: newRefreshToken, expiresAt: expiresAt, user: existingUser)
-            try saveSession(session)
-            currentSession = session
-            return session
-        }
-
-        throw OneloError.serverError("Refresh failed")
+        let expiresAt = Date().addingTimeInterval(TimeInterval(expiresIn))
+        let session = OneloSession(accessToken: accessToken, refreshToken: newRefreshToken, expiresAt: expiresAt, user: existingUser)
+        try saveSession(session)
+        currentSession = session
+        return session
     }
 
     private func refreshPKCE() async throws {
@@ -306,8 +277,6 @@ public final class OneloAuth: ObservableObject {
     private func initialize() async {
         do {
             let resolved = try await resolveConfig()
-            showBranding = resolved.showBranding ?? true
-            oauthProviders = resolved.oauthProviders
 
             try? keychain.set(resolved.supabaseUrl, forKey: KeychainKeys.supabaseUrl)
             try? keychain.set(resolved.supabaseAnonKey, forKey: KeychainKeys.supabaseAnonKey)
@@ -322,11 +291,13 @@ public final class OneloAuth: ObservableObject {
             isReady = true
             await restoreSession()
         } catch OneloError.invalidPublishableKey {
+            // Key was revoked or app deleted — clear session and signal to the UI
             try? keychain.clear()
             currentSession = nil
             isRevoked = true
         } catch {
-            // Network offline — fall back to cached config
+            // Network offline or transient error — fall back to cached config so
+            // the user can still use a valid existing session.
             if let url = try? keychain.get(forKey: KeychainKeys.supabaseUrl),
                let key = try? keychain.get(forKey: KeychainKeys.supabaseAnonKey) {
                 let authURL = URL(string: url)!.appendingPathComponent("/auth/v1")
@@ -389,16 +360,17 @@ public final class OneloAuth: ObservableObject {
         if session.isExpiringSoon {
             _ = try? await refreshSession()
         } else {
-            let valid = await verifySession(accessToken: accessToken)
-            if valid {
+            // Verify session is still valid against the backend before exposing it to the app.
+            // This catches users that were deleted or suspended while offline.
+            let revoked = await verifySession(accessToken: accessToken)
+            if !revoked {
                 currentSession = session
             }
         }
     }
 
-    /// Calls /verify to check if the user account is still active.
-    /// Returns true if valid, false if revoked/suspended (and sets isUserRevoked).
-    /// Returns true on network errors (fail-open) to avoid false logouts.
+    /// Calls the backend /verify endpoint to check whether the account has been revoked.
+    /// Returns `true` if the session was revoked (and has been cleared), `false` if it is valid.
     @discardableResult
     private func verifySession(accessToken: String) async -> Bool {
         let url = config.apiUrl.appendingPathComponent("/api/sdk/auth/verify")
@@ -409,28 +381,37 @@ public final class OneloAuth: ObservableObject {
 
         guard let (data, response) = try? await URLSession.shared.data(for: request),
               let http = response as? HTTPURLResponse else {
-            return true // network error — fail open
+            // Network error — fail open, let the app proceed with the cached session
+            return false
         }
 
-        if http.statusCode == 200 { return true }
+        let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+
+        if http.statusCode == 200 {
+            return false
+        }
 
         if http.statusCode == 403 {
-            let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
             let detail = json["detail"] as? String ?? ""
-            if detail.hasPrefix("account_") {
+            let isRevocation = detail.contains("revoked")
+                || detail.contains("deleted")
+                || detail.contains("suspended")
+            if isRevocation {
                 try? keychain.clear()
                 currentSession = nil
                 isUserRevoked = true
-                return false
+                return true
             }
         }
 
         if http.statusCode == 401 {
+            // Token expired — trigger normal refresh flow
             _ = try? await refreshSession()
             return false
         }
 
-        return true
+        // Unexpected error — fail open
+        return false
     }
 
     private func saveSession(_ session: OneloSession) throws {
@@ -456,88 +437,11 @@ public final class OneloAuth: ObservableObject {
         let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
 
         if http.statusCode >= 400 {
-            let detailStr = json["detail"] as? String
-            let detailDict = json["detail"] as? [String: Any]
-            let msg = json["error"] as? String
-                ?? detailStr
-                ?? detailDict?["error"] as? String
-                ?? "HTTP \(http.statusCode)"
+            let msg = json["error"] as? String ?? json["detail"] as? String ?? "HTTP \(http.statusCode)"
             throw OneloError.serverError(msg)
         }
 
         return json
-    }
-
-    /// Sign in using a third-party OAuth provider (Google, GitHub, Apple).
-    /// Opens ASWebAuthenticationSession. The redirect URL scheme must be registered
-    /// in the app's Info.plist as: onelo-{publishableKey}
-    public func signInWithOAuth(provider: String) async throws -> OneloSession {
-        isLoading = true
-        defer { isLoading = false }
-
-        // 1. Generate PKCE
-        let verifier = generateCodeVerifier()
-        let challenge = generateCodeChallenge(from: verifier)
-
-        // 2. Build callback URL scheme: onelo-{publishableKey}
-        let scheme = "onelo-\(config.publishableKey)"
-        let redirectUri = "\(scheme)://oauth/callback"
-
-        // 3. Call init endpoint
-        var components = URLComponents(url: config.apiUrl.appendingPathComponent("/api/sdk/auth/oauth/\(provider)/init"), resolvingAgainstBaseURL: false)!
-        components.queryItems = [
-            URLQueryItem(name: "key", value: config.publishableKey),
-            URLQueryItem(name: "redirect_uri", value: redirectUri),
-            URLQueryItem(name: "code_challenge", value: challenge),
-            URLQueryItem(name: "code_challenge_method", value: "S256"),
-        ]
-
-        let (initData, initResponse) = try await URLSession.shared.data(for: URLRequest(url: components.url!))
-        guard let initHttp = initResponse as? HTTPURLResponse, initHttp.statusCode == 200 else {
-            let json = (try? JSONSerialization.jsonObject(with: initData)) as? [String: Any] ?? [:]
-            let msg = json["detail"] as? String ?? json["error"] as? String ?? "Failed to init OAuth"
-            throw OneloError.serverError(msg)
-        }
-        let initJson = (try? JSONSerialization.jsonObject(with: initData)) as? [String: Any] ?? [:]
-        guard let authUrlStr = initJson["url"] as? String, let authUrl = URL(string: authUrlStr) else {
-            throw OneloError.serverError("No auth URL returned")
-        }
-
-        // 4. Open ASWebAuthenticationSession
-        let callbackUrl: URL = try await withCheckedThrowingContinuation { continuation in
-            let oauthSession = ASWebAuthenticationSession(url: authUrl, callbackURLScheme: scheme) { callbackURL, error in
-                if let error = error {
-                    continuation.resume(throwing: OneloError.serverError(error.localizedDescription))
-                } else if let url = callbackURL {
-                    continuation.resume(returning: url)
-                } else {
-                    continuation.resume(throwing: OneloError.serverError("OAuth cancelled"))
-                }
-            }
-            oauthSession.presentationContextProvider = _webAuthContext
-            oauthSession.prefersEphemeralWebBrowserSession = false
-            oauthSession.start()
-        }
-
-        // 5. Parse token + refresh_token from callback URL
-        guard let urlComponents = URLComponents(url: callbackUrl, resolvingAgainstBaseURL: false),
-              let tokenItem = urlComponents.queryItems?.first(where: { $0.name == "token" }),
-              let refreshItem = urlComponents.queryItems?.first(where: { $0.name == "refresh_token" }),
-              let accessToken = tokenItem.value,
-              let refreshToken = refreshItem.value
-        else {
-            let errorItem = URLComponents(url: callbackUrl, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "error" })
-            throw OneloError.serverError(errorItem?.value ?? "Invalid callback URL")
-        }
-
-        // 6. Build and store session
-        let expiresAt = Date().addingTimeInterval(900) // 15 min default
-        let emailItem = urlComponents.queryItems?.first(where: { $0.name == "email" })
-        let user = OneloUser(id: provider, email: emailItem?.value, role: .member, tenantId: nil)
-        let session = OneloSession(accessToken: accessToken, refreshToken: refreshToken, expiresAt: expiresAt, user: user)
-        try saveSession(session)
-        currentSession = session
-        return session
     }
 
     func backendPostAny(path: String, body: [String: Any]) async throws -> [String: Any] {
@@ -567,13 +471,5 @@ private extension AnyJSON {
     var stringValue: String? {
         if case .string(let s) = self { return s }
         return nil
-    }
-}
-
-// MARK: - OAuth presentation context (macOS)
-
-private final class _WebAuthContext: NSObject, ASWebAuthenticationPresentationContextProviding {
-    func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
-        NSApplication.shared.keyWindow ?? NSWindow()
     }
 }
