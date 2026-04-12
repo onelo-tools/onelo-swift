@@ -1,5 +1,9 @@
 import SwiftUI
+#if canImport(UIKit)
+import UIKit
+#else
 import AppKit
+#endif
 
 /// Visual configuration for OneloAuthView.
 /// Pass a customised instance to match your app's design system.
@@ -36,8 +40,20 @@ public struct OneloAuthConfig {
 
     public init(
         accentColor: Color = .blue,
-        backgroundColor: Color = Color(NSColor.windowBackgroundColor),
-        surfaceColor: Color = Color(NSColor.controlBackgroundColor),
+        backgroundColor: Color = {
+            #if canImport(UIKit)
+            return Color(uiColor: .systemBackground)
+            #else
+            return Color(nsColor: .windowBackgroundColor)
+            #endif
+        }(),
+        surfaceColor: Color = {
+            #if canImport(UIKit)
+            return Color(uiColor: .secondarySystemBackground)
+            #else
+            return Color(nsColor: .controlBackgroundColor)
+            #endif
+        }(),
         textColor: Color = .primary,
         subtitleColor: Color = .secondary,
         appLogo: Image? = nil,
