@@ -20,7 +20,7 @@ public final class OneloAuth: ObservableObject {
 
     private var client: AuthClient?
     private let keychain: KeychainStorage
-    private let config: OneloConfig
+    let config: OneloConfig
     private var pkceVerifier: String?
 
     private enum KeychainKeys {
