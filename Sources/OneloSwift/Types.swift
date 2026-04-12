@@ -1,5 +1,9 @@
 import Foundation
 
+public enum OneloSDK {
+    public static let sdkVersion = "2.1.0"
+}
+
 public enum UserRole: String, Codable, Sendable {
     case platformOwner = "platform_owner"
     case creator = "creator"
@@ -33,12 +37,12 @@ public struct OneloSession: Sendable {
 public struct OneloConfig: Sendable {
     /// Publishable key from Onelo dashboard (onelo_pk_live_...)
     public let publishableKey: String
-    /// Override API base URL (default: https://api.onelo.com)
+    /// Override API base URL (default: https://api.onelo.tools)
     public let apiUrl: URL
 
     public init(
         publishableKey: String,
-        apiUrl: URL = URL(string: "https://api.onelo.com")!
+        apiUrl: URL = URL(string: "https://api.onelo.tools")!
     ) {
         self.publishableKey = publishableKey
         self.apiUrl = apiUrl
