@@ -42,7 +42,7 @@ public struct OneloAuthView: View {
                                 .foregroundStyle(config.textColor)
                         }
                     }
-                    .padding(.bottom, 24)
+                    .padding(.bottom, 32)
 
                     // Active screen
                     Group {
@@ -53,7 +53,7 @@ public struct OneloAuthView: View {
                         }
                     }
 
-                    Spacer(minLength: 24)
+                    Spacer(minLength: 32)
 
                     // Hardcoded Onelo branding — cannot be removed
                     OneloFooter(subtitleColor: config.subtitleColor)
@@ -71,44 +71,61 @@ private struct SignInScreen: View {
     let config: OneloAuthConfig
 
     var body: some View {
-        VStack(spacing: config.itemSpacing) {
+        VStack(spacing: 0) {
+            // Title
             Text("Sign in")
                 .font(.title2.bold())
                 .foregroundStyle(config.textColor)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.bottom, config.itemSpacing + 4)
 
-            AuthTextField("Email", text: $vm.email, config: config)
+            // Fields group
+            VStack(spacing: config.itemSpacing) {
+                AuthTextField("Email", text: $vm.email, config: config)
 #if os(iOS)
-                .keyboardType(.emailAddress)
-                .textContentType(.emailAddress)
-                .textInputAutocapitalization(.never)
+                    .keyboardType(.emailAddress)
+                    .textContentType(.emailAddress)
+                    .textInputAutocapitalization(.never)
 #endif
 
-            AuthSecureField("Password", text: $vm.password, config: config)
+                AuthSecureField("Password", text: $vm.password, config: config)
 #if os(iOS)
-                .textContentType(.password)
+                    .textContentType(.password)
 #endif
+            }
 
+            // Error
             if let err = vm.errorMessage {
                 Text(err)
                     .font(.caption)
                     .foregroundStyle(.red)
                     .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.top, 8)
             }
 
+            // Primary action
             AuthButton("Sign In", config: config, isLoading: vm.isLoading) {
                 Task { await vm.submitSignIn() }
             }
+            .padding(.top, config.itemSpacing + 8)
 
-            Button("Forgot password?") { vm.showForgotPassword() }
+            // Secondary actions
+            VStack(spacing: 8) {
+                Button("Forgot password?") { vm.showForgotPassword() }
+                    .buttonStyle(.plain)
+                    .font(.subheadline)
+                    .foregroundStyle(config.accentColor)
+
+                HStack(spacing: 4) {
+                    Text("Don't have an account?")
+                        .foregroundStyle(config.subtitleColor)
+                    Button("Sign up") { vm.showSignUp() }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(config.accentColor)
+                }
                 .font(.subheadline)
-                .foregroundStyle(config.accentColor)
-
-            HStack(spacing: 4) {
-                Text("Don't have an account?").foregroundStyle(config.subtitleColor)
-                Button("Sign up") { vm.showSignUp() }.foregroundStyle(config.accentColor)
             }
-            .font(.subheadline)
+            .padding(.top, config.itemSpacing + 4)
         }
     }
 }
@@ -120,53 +137,66 @@ private struct SignUpScreen: View {
     let config: OneloAuthConfig
 
     var body: some View {
-        VStack(spacing: config.itemSpacing) {
+        VStack(spacing: 0) {
+            // Title
             Text("Create account")
                 .font(.title2.bold())
                 .foregroundStyle(config.textColor)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.bottom, config.itemSpacing + 4)
 
-            AuthTextField("Email", text: $vm.email, config: config)
+            // Fields group
+            VStack(spacing: config.itemSpacing) {
+                AuthTextField("Email", text: $vm.email, config: config)
 #if os(iOS)
-                .keyboardType(.emailAddress)
-                .textContentType(.emailAddress)
-                .textInputAutocapitalization(.never)
+                    .keyboardType(.emailAddress)
+                    .textContentType(.emailAddress)
+                    .textInputAutocapitalization(.never)
 #endif
 
-            AuthSecureField("Password", text: $vm.password, config: config)
+                AuthSecureField("Password", text: $vm.password, config: config)
 #if os(iOS)
-                .textContentType(.newPassword)
+                    .textContentType(.newPassword)
 #endif
 
-            AuthSecureField("Confirm password", text: $vm.confirmPassword, config: config)
+                AuthSecureField("Confirm password", text: $vm.confirmPassword, config: config)
 #if os(iOS)
-                .textContentType(.newPassword)
+                    .textContentType(.newPassword)
 #endif
+            }
 
+            // Error / success
             if let err = vm.errorMessage {
                 Text(err)
                     .font(.caption)
                     .foregroundStyle(.red)
                     .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.top, 8)
             }
-
-            // Show "check your email" when verification is required
             if vm.signUpVerificationSent {
                 Text("Check your email to verify your account.")
                     .font(.subheadline)
                     .foregroundStyle(.green)
                     .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.top, 8)
             }
 
+            // Primary action
             AuthButton("Create Account", config: config, isLoading: vm.isLoading) {
                 Task { await vm.submitSignUp() }
             }
+            .padding(.top, config.itemSpacing + 8)
 
+            // Secondary action
             HStack(spacing: 4) {
-                Text("Already have an account?").foregroundStyle(config.subtitleColor)
-                Button("Sign in") { vm.showSignIn() }.foregroundStyle(config.accentColor)
+                Text("Already have an account?")
+                    .foregroundStyle(config.subtitleColor)
+                Button("Sign in") { vm.showSignIn() }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(config.accentColor)
             }
             .font(.subheadline)
+            .padding(.top, config.itemSpacing + 4)
         }
     }
 }
@@ -178,16 +208,20 @@ private struct ForgotPasswordScreen: View {
     let config: OneloAuthConfig
 
     var body: some View {
-        VStack(spacing: config.itemSpacing) {
-            Text("Reset password")
-                .font(.title2.bold())
-                .foregroundStyle(config.textColor)
-                .frame(maxWidth: .infinity, alignment: .leading)
+        VStack(spacing: 0) {
+            // Title
+            VStack(spacing: 6) {
+                Text("Reset password")
+                    .font(.title2.bold())
+                    .foregroundStyle(config.textColor)
+                    .frame(maxWidth: .infinity, alignment: .leading)
 
-            Text("Enter your email and we'll send you a reset link.")
-                .font(.subheadline)
-                .foregroundStyle(config.subtitleColor)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                Text("Enter your email and we'll send you a reset link.")
+                    .font(.subheadline)
+                    .foregroundStyle(config.subtitleColor)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(.bottom, config.itemSpacing + 4)
 
             if vm.forgotPasswordSent {
                 Text("Check your email for the reset link.")
@@ -207,16 +241,20 @@ private struct ForgotPasswordScreen: View {
                         .font(.caption)
                         .foregroundStyle(.red)
                         .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.top, 8)
                 }
 
                 AuthButton("Send Reset Link", config: config, isLoading: vm.isLoading) {
                     Task { await vm.submitForgotPassword() }
                 }
+                .padding(.top, config.itemSpacing + 8)
             }
 
             Button("Back to sign in") { vm.showSignIn() }
+                .buttonStyle(.plain)
                 .font(.subheadline)
                 .foregroundStyle(config.accentColor)
+                .padding(.top, config.itemSpacing + 4)
         }
     }
 }
@@ -240,6 +278,10 @@ private struct AuthTextField: View {
             .frame(height: config.inputHeight)
             .background(config.surfaceColor)
             .clipShape(RoundedRectangle(cornerRadius: config.cornerRadius))
+            .overlay(
+                RoundedRectangle(cornerRadius: config.cornerRadius)
+                    .strokeBorder(Color.primary.opacity(0.1), lineWidth: 1)
+            )
             .foregroundStyle(config.textColor)
     }
 }
@@ -261,6 +303,10 @@ private struct AuthSecureField: View {
             .frame(height: config.inputHeight)
             .background(config.surfaceColor)
             .clipShape(RoundedRectangle(cornerRadius: config.cornerRadius))
+            .overlay(
+                RoundedRectangle(cornerRadius: config.cornerRadius)
+                    .strokeBorder(Color.primary.opacity(0.1), lineWidth: 1)
+            )
             .foregroundStyle(config.textColor)
     }
 }
@@ -293,6 +339,7 @@ private struct AuthButton: View {
             .foregroundStyle(.white)
             .clipShape(RoundedRectangle(cornerRadius: config.cornerRadius))
         }
+        .buttonStyle(.plain)
         .disabled(isLoading)
     }
 }
@@ -308,5 +355,6 @@ private struct OneloFooter: View {
                 .foregroundStyle(subtitleColor.opacity(0.8))
         }
         .font(.caption2)
+        .buttonStyle(.plain)
     }
 }
