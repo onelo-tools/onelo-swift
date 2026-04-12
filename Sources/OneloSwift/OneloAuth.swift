@@ -186,14 +186,7 @@ public final class OneloAuth: ObservableObject {
         request.httpBody = try JSONSerialization.data(withJSONObject: [
             "refresh_token": refreshToken,
             "publishableKey": config.publishableKey,
-<<<<<<< HEAD
-        ]
-
-        let url = config.apiUrl.appendingPathComponent("/api/sdk/auth/refresh")
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        ])
 
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse else {
@@ -209,16 +202,6 @@ public final class OneloAuth: ObservableObject {
                 || detail.contains("account_suspended")
                 || detail.contains("account_payment_failed")
             if isRevocation {
-=======
-        ])
-
-        let (data, response) = try await URLSession.shared.data(for: request)
-        let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
-
-        if let http = response as? HTTPURLResponse, http.statusCode == 403 {
-            let detail = json["detail"] as? String ?? ""
-            if detail.hasPrefix("account_") {
->>>>>>> staging
                 try? keychain.clear()
                 currentSession = nil
                 isUserRevoked = true
@@ -226,15 +209,9 @@ public final class OneloAuth: ObservableObject {
             }
         }
 
-<<<<<<< HEAD
         if http.statusCode >= 400 {
             let msg = json["error"] as? String ?? json["detail"] as? String ?? "HTTP \(http.statusCode)"
             try keychain.clear()
-=======
-        if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
-            let msg = json["detail"] as? String ?? json["error"] as? String ?? "HTTP \(http.statusCode)"
-            try? keychain.clear()
->>>>>>> staging
             currentSession = nil
             throw OneloError.serverError(msg)
         }
@@ -383,28 +360,17 @@ public final class OneloAuth: ObservableObject {
         if session.isExpiringSoon {
             _ = try? await refreshSession()
         } else {
-<<<<<<< HEAD
             // Verify session is still valid against the backend before exposing it to the app.
             // This catches users that were deleted or suspended while offline.
             let revoked = await verifySession(accessToken: accessToken)
             if !revoked {
-=======
-            let valid = await verifySession(accessToken: accessToken)
-            if valid {
->>>>>>> staging
                 currentSession = session
             }
         }
     }
 
-<<<<<<< HEAD
     /// Calls the backend /verify endpoint to check whether the account has been revoked.
     /// Returns `true` if the session was revoked (and has been cleared), `false` if it is valid.
-=======
-    /// Calls /verify to check if the user account is still active.
-    /// Returns false (and sets isUserRevoked) if the account was deleted or suspended.
-    /// Returns true on network errors (fail-open) to avoid false logouts.
->>>>>>> staging
     @discardableResult
     private func verifySession(accessToken: String) async -> Bool {
         let url = config.apiUrl.appendingPathComponent("/api/sdk/auth/verify")
@@ -415,7 +381,6 @@ public final class OneloAuth: ObservableObject {
 
         guard let (data, response) = try? await URLSession.shared.data(for: request),
               let http = response as? HTTPURLResponse else {
-<<<<<<< HEAD
             // Network error — fail open, let the app proceed with the cached session
             return false
         }
@@ -436,39 +401,17 @@ public final class OneloAuth: ObservableObject {
                 currentSession = nil
                 isUserRevoked = true
                 return true
-=======
-            return true // network error — fail open
-        }
-
-        if http.statusCode == 200 { return true }
-
-        if http.statusCode == 403 {
-            let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
-            let detail = json["detail"] as? String ?? ""
-            if detail.hasPrefix("account_") {
-                try? keychain.clear()
-                currentSession = nil
-                isUserRevoked = true
-                return false
->>>>>>> staging
             }
         }
 
         if http.statusCode == 401 {
-<<<<<<< HEAD
             // Token expired — trigger normal refresh flow
-=======
->>>>>>> staging
             _ = try? await refreshSession()
             return false
         }
 
-<<<<<<< HEAD
         // Unexpected error — fail open
         return false
-=======
-        return true
->>>>>>> staging
     }
 
     private func saveSession(_ session: OneloSession) throws {
