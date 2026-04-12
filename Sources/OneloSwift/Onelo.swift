@@ -18,6 +18,7 @@ public final class Onelo {
     public let paywall: OneloPaywall
     public let forms: OneloForms
     public let waitlist: OneloWaitlist
+    public let auth: OneloAuthModule
 
     public init(
         publishableKey: String,
@@ -29,6 +30,8 @@ public final class Onelo {
         self.paywall = OneloPaywall(client: client)
         self.forms = OneloForms(client: client)
         self.waitlist = OneloWaitlist(client: client)
+        let oneloAuth = OneloAuth(config: OneloConfig(publishableKey: publishableKey))
+        self.auth = OneloAuthModule(auth: oneloAuth)
     }
 
     /// Set user context. Call once after login.
