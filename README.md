@@ -65,6 +65,36 @@ let auth = OneloAuth(config: OneloConfig(...))
 await auth.signIn()
 ```
 
+## Auth UI
+
+Drop in a ready-made login screen with full visual customization:
+
+```swift
+import OneloSwift
+import SwiftUI
+
+// SwiftUI embed
+OneloAuthView(
+    auth: onelo.auth.authObject,
+    config: OneloAuthConfig(
+        accentColor: .purple,
+        appName: "My App",
+        appLogo: Image("AppLogo")
+    )
+) { session in
+    print("Signed in:", session.user.email ?? "")
+}
+
+// UIKit / programmatic
+onelo.auth.show(from: self) { session in
+    print("Signed in:", session.user.email ?? "")
+}
+```
+
+`OneloAuthConfig` lets you customize colors, corner radius, button height, and more. See `OneloAuthConfig.swift` for all options.
+
+All screens include hardcoded "Powered by Onelo" branding.
+
 ## Feature Status Values
 
 | Status | Meaning |
