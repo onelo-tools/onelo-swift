@@ -39,7 +39,7 @@ public struct OneloAuthView: View {
                         if !config.appName.isEmpty {
                             Text(config.appName)
                                 .font(.headline)
-                                .foregroundColor(config.textColor)
+                                .foregroundStyle(config.textColor)
                         }
                     }
                     .padding(.bottom, 24)
@@ -74,14 +74,14 @@ private struct SignInScreen: View {
         VStack(spacing: config.itemSpacing) {
             Text("Sign in")
                 .font(.title2.bold())
-                .foregroundColor(config.textColor)
+                .foregroundStyle(config.textColor)
                 .frame(maxWidth: .infinity, alignment: .leading)
 
             AuthTextField("Email", text: $vm.email, config: config)
 #if os(iOS)
                 .keyboardType(.emailAddress)
                 .textContentType(.emailAddress)
-                .autocapitalization(.none)
+                .textInputAutocapitalization(.never)
 #endif
 
             AuthSecureField("Password", text: $vm.password, config: config)
@@ -92,7 +92,7 @@ private struct SignInScreen: View {
             if let err = vm.errorMessage {
                 Text(err)
                     .font(.caption)
-                    .foregroundColor(.red)
+                    .foregroundStyle(.red)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
 
@@ -102,11 +102,11 @@ private struct SignInScreen: View {
 
             Button("Forgot password?") { vm.showForgotPassword() }
                 .font(.subheadline)
-                .foregroundColor(config.accentColor)
+                .foregroundStyle(config.accentColor)
 
             HStack(spacing: 4) {
-                Text("Don't have an account?").foregroundColor(config.subtitleColor)
-                Button("Sign up") { vm.showSignUp() }.foregroundColor(config.accentColor)
+                Text("Don't have an account?").foregroundStyle(config.subtitleColor)
+                Button("Sign up") { vm.showSignUp() }.foregroundStyle(config.accentColor)
             }
             .font(.subheadline)
         }
@@ -123,14 +123,14 @@ private struct SignUpScreen: View {
         VStack(spacing: config.itemSpacing) {
             Text("Create account")
                 .font(.title2.bold())
-                .foregroundColor(config.textColor)
+                .foregroundStyle(config.textColor)
                 .frame(maxWidth: .infinity, alignment: .leading)
 
             AuthTextField("Email", text: $vm.email, config: config)
 #if os(iOS)
                 .keyboardType(.emailAddress)
                 .textContentType(.emailAddress)
-                .autocapitalization(.none)
+                .textInputAutocapitalization(.never)
 #endif
 
             AuthSecureField("Password", text: $vm.password, config: config)
@@ -146,15 +146,15 @@ private struct SignUpScreen: View {
             if let err = vm.errorMessage {
                 Text(err)
                     .font(.caption)
-                    .foregroundColor(.red)
+                    .foregroundStyle(.red)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
 
             // Show "check your email" when verification is required
-            if vm.forgotPasswordSent {
+            if vm.signUpVerificationSent {
                 Text("Check your email to verify your account.")
                     .font(.subheadline)
-                    .foregroundColor(.green)
+                    .foregroundStyle(.green)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
 
@@ -163,8 +163,8 @@ private struct SignUpScreen: View {
             }
 
             HStack(spacing: 4) {
-                Text("Already have an account?").foregroundColor(config.subtitleColor)
-                Button("Sign in") { vm.showSignIn() }.foregroundColor(config.accentColor)
+                Text("Already have an account?").foregroundStyle(config.subtitleColor)
+                Button("Sign in") { vm.showSignIn() }.foregroundStyle(config.accentColor)
             }
             .font(.subheadline)
         }
@@ -181,31 +181,31 @@ private struct ForgotPasswordScreen: View {
         VStack(spacing: config.itemSpacing) {
             Text("Reset password")
                 .font(.title2.bold())
-                .foregroundColor(config.textColor)
+                .foregroundStyle(config.textColor)
                 .frame(maxWidth: .infinity, alignment: .leading)
 
             Text("Enter your email and we'll send you a reset link.")
                 .font(.subheadline)
-                .foregroundColor(config.subtitleColor)
+                .foregroundStyle(config.subtitleColor)
                 .frame(maxWidth: .infinity, alignment: .leading)
 
             if vm.forgotPasswordSent {
                 Text("Check your email for the reset link.")
                     .font(.subheadline)
-                    .foregroundColor(.green)
+                    .foregroundStyle(.green)
                     .frame(maxWidth: .infinity, alignment: .leading)
             } else {
                 AuthTextField("Email", text: $vm.email, config: config)
 #if os(iOS)
                     .keyboardType(.emailAddress)
                     .textContentType(.emailAddress)
-                    .autocapitalization(.none)
+                    .textInputAutocapitalization(.never)
 #endif
 
                 if let err = vm.errorMessage {
                     Text(err)
                         .font(.caption)
-                        .foregroundColor(.red)
+                        .foregroundStyle(.red)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
 
@@ -216,7 +216,7 @@ private struct ForgotPasswordScreen: View {
 
             Button("Back to sign in") { vm.showSignIn() }
                 .font(.subheadline)
-                .foregroundColor(config.accentColor)
+                .foregroundStyle(config.accentColor)
         }
     }
 }
@@ -239,8 +239,8 @@ private struct AuthTextField: View {
             .padding(.horizontal, 12)
             .frame(height: config.inputHeight)
             .background(config.surfaceColor)
-            .cornerRadius(config.cornerRadius)
-            .foregroundColor(config.textColor)
+            .clipShape(RoundedRectangle(cornerRadius: config.cornerRadius))
+            .foregroundStyle(config.textColor)
     }
 }
 
@@ -260,8 +260,8 @@ private struct AuthSecureField: View {
             .padding(.horizontal, 12)
             .frame(height: config.inputHeight)
             .background(config.surfaceColor)
-            .cornerRadius(config.cornerRadius)
-            .foregroundColor(config.textColor)
+            .clipShape(RoundedRectangle(cornerRadius: config.cornerRadius))
+            .foregroundStyle(config.textColor)
     }
 }
 
@@ -290,8 +290,8 @@ private struct AuthButton: View {
             .frame(maxWidth: .infinity)
             .frame(height: config.buttonHeight)
             .background(config.accentColor)
-            .foregroundColor(.white)
-            .cornerRadius(config.cornerRadius)
+            .foregroundStyle(.white)
+            .clipShape(RoundedRectangle(cornerRadius: config.cornerRadius))
         }
         .disabled(isLoading)
     }
@@ -303,9 +303,9 @@ private struct OneloFooter: View {
     var body: some View {
         Link(destination: URL(string: "https://onelo.tools")!) {
             Text("Powered by ")
-                .foregroundColor(subtitleColor.opacity(0.6))
+                .foregroundStyle(subtitleColor.opacity(0.6))
             + Text("Onelo")
-                .foregroundColor(subtitleColor.opacity(0.8))
+                .foregroundStyle(subtitleColor.opacity(0.8))
         }
         .font(.caption2)
     }

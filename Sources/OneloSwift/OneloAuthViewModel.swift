@@ -34,6 +34,7 @@ public final class OneloAuthViewModel: ObservableObject {
     @Published public var isLoading: Bool = false
     @Published public var errorMessage: String? = nil
     @Published public var forgotPasswordSent: Bool = false
+    @Published public var signUpVerificationSent: Bool = false
 
     private let auth: any OneloAuthProtocol
     public var onSuccess: ((OneloSession) -> Void)?
@@ -83,7 +84,7 @@ public final class OneloAuthViewModel: ObservableObject {
             let needsVerification = try await auth.signUp(email: email, password: password)
             if needsVerification {
                 // Email confirmation required — show success state, don't sign in yet
-                forgotPasswordSent = true  // reuse this flag to show "check your email"
+                signUpVerificationSent = true
             } else {
                 let session = try await auth.signIn(email: email, password: password)
                 onSuccess?(session)
@@ -114,5 +115,6 @@ public final class OneloAuthViewModel: ObservableObject {
     private func clearErrors() {
         errorMessage = nil
         forgotPasswordSent = false
+        signUpVerificationSent = false
     }
 }
