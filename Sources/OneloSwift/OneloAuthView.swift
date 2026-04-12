@@ -1,469 +1,312 @@
+// Sources/OneloSwift/OneloAuthView.swift
 import SwiftUI
 
-// MARK: - Public entry point
-
-/// Drop-in authentication UI for Onelo.
+/// Drop-in SwiftUI authentication view.
 ///
-/// Usage:
 /// ```swift
-/// OneloAuthView(auth: auth) {
-///     ContentView()
+/// OneloAuthView(auth: onelo.auth.authObject, config: .default) { session in
+///     // user signed in
 /// }
 /// ```
-@MainActor
-public struct OneloAuthView<Authenticated: View>: View {
-    @ObservedObject public var auth: OneloAuth
-    let authenticated: () -> Authenticated
+public struct OneloAuthView: View {
+    @StateObject private var vm: OneloAuthViewModel
+    private let config: OneloAuthConfig
 
-    public init(auth: OneloAuth, @ViewBuilder authenticated: @escaping () -> Authenticated) {
-        self.auth = auth
-        self.authenticated = authenticated
+    public init(
+        auth: any OneloAuthProtocol,
+        config: OneloAuthConfig = .default,
+        onSuccess: @escaping (OneloSession) -> Void
+    ) {
+        _vm = StateObject(wrappedValue: OneloAuthViewModel(auth: auth, onSuccess: onSuccess))
+        self.config = config
     }
 
     public var body: some View {
-        Group {
-            if auth.currentSession != nil {
-                authenticated()
-            } else {
-                _AuthFlowView(auth: auth)
-            }
-        }
-    }
-}
-
-// MARK: - Flow controller
-
-private enum AuthMode {
-    case signIn, signUp, resetPassword
-}
-
-@MainActor
-private struct _AuthFlowView: View {
-    @ObservedObject var auth: OneloAuth
-    @State private var mode: AuthMode = .signIn
-
-    var body: some View {
         ZStack {
-            Color(NSColor.windowBackgroundColor).ignoresSafeArea()
+            config.backgroundColor.ignoresSafeArea()
 
-            VStack(spacing: 0) {
-                Spacer()
-
-                // Card
-                VStack(spacing: 32) {
-                    _BrandHeader()
-
-                    ZStack {
-                        switch mode {
-                        case .signIn:
-                            _SignInForm(auth: auth, mode: $mode)
-                                .transition(AnyTransition.asymmetric(
-                                    insertion: AnyTransition.opacity.combined(with: AnyTransition.move(edge: .leading)),
-                                    removal: AnyTransition.opacity.combined(with: AnyTransition.move(edge: .leading))
-                                ))
-                                .id("signIn")
-                        case .signUp:
-                            _SignUpForm(auth: auth, mode: $mode)
-                                .transition(AnyTransition.asymmetric(
-                                    insertion: AnyTransition.opacity.combined(with: AnyTransition.move(edge: .trailing)),
-                                    removal: AnyTransition.opacity.combined(with: AnyTransition.move(edge: .trailing))
-                                ))
-                                .id("signUp")
-                        case .resetPassword:
-                            _ResetPasswordForm(auth: auth, mode: $mode)
-                                .transition(AnyTransition.asymmetric(
-                                    insertion: AnyTransition.opacity.combined(with: AnyTransition.move(edge: .trailing)),
-                                    removal: AnyTransition.opacity.combined(with: AnyTransition.move(edge: .trailing))
-                                ))
-                                .id("resetPassword")
+            ScrollView {
+                VStack(spacing: 0) {
+                    // Logo / app name
+                    VStack(spacing: 8) {
+                        if let logo = config.appLogo {
+                            logo
+                                .resizable()
+                                .scaledToFit()
+                                .frame(width: 56, height: 56)
+                                .clipShape(RoundedRectangle(cornerRadius: config.cornerRadius))
+                        }
+                        if !config.appName.isEmpty {
+                            Text(config.appName)
+                                .font(.headline)
+                                .foregroundColor(config.textColor)
                         }
                     }
-                    .animation(.spring(response: 0.35, dampingFraction: 0.85), value: mode)
+                    .padding(.bottom, 24)
+
+                    // Active screen
+                    Group {
+                        switch vm.screen {
+                        case .signIn:         SignInScreen(vm: vm, config: config)
+                        case .signUp:         SignUpScreen(vm: vm, config: config)
+                        case .forgotPassword: ForgotPasswordScreen(vm: vm, config: config)
+                        }
+                    }
+
+                    Spacer(minLength: 24)
+
+                    // Hardcoded Onelo branding — cannot be removed
+                    OneloFooter(subtitleColor: config.subtitleColor)
                 }
-                .padding(40)
-                .frame(width: 400)
-                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .strokeBorder(Color.primary.opacity(0.07), lineWidth: 1)
-                )
-                .shadow(color: .black.opacity(0.08), radius: 40, x: 0, y: 8)
-
-                Spacer()
-            }
-        }
-        .frame(minWidth: 560, minHeight: 480)
-    }
-}
-
-// MARK: - Brand header
-
-private struct _BrandHeader: View {
-    var body: some View {
-        VStack(spacing: 8) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .fill(Color.primary.opacity(0.06))
-                    .frame(width: 44, height: 44)
-                Image(systemName: "circle.hexagongrid.fill")
-                    .font(.system(size: 22, weight: .medium))
-                    .foregroundStyle(.primary)
+                .padding(config.contentPadding)
             }
         }
     }
 }
 
-// MARK: - Sign In
+// MARK: - Sign In Screen
 
-@MainActor
-private struct _SignInForm: View {
-    @ObservedObject var auth: OneloAuth
-    @Binding var mode: AuthMode
-
-    @State private var email = ""
-    @State private var password = ""
-    @State private var error: String?
-    @FocusState private var focusedField: Field?
-
-    private enum Field { case email, password }
+private struct SignInScreen: View {
+    @ObservedObject var vm: OneloAuthViewModel
+    let config: OneloAuthConfig
 
     var body: some View {
-        VStack(spacing: 24) {
-            VStack(spacing: 4) {
-                Text("Welcome back")
-                    .font(.system(size: 22, weight: .semibold, design: .default))
-                Text("Sign in to your account")
-                    .font(.system(size: 14))
-                    .foregroundStyle(.secondary)
+        VStack(spacing: config.itemSpacing) {
+            Text("Sign in")
+                .font(.title2.bold())
+                .foregroundColor(config.textColor)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            AuthTextField("Email", text: $vm.email, config: config)
+#if os(iOS)
+                .keyboardType(.emailAddress)
+                .textContentType(.emailAddress)
+                .autocapitalization(.none)
+#endif
+
+            AuthSecureField("Password", text: $vm.password, config: config)
+#if os(iOS)
+                .textContentType(.password)
+#endif
+
+            if let err = vm.errorMessage {
+                Text(err)
+                    .font(.caption)
+                    .foregroundColor(.red)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            VStack(spacing: 14) {
-                _InputField(label: "Email", placeholder: "you@example.com", text: $email, isSecure: false, contentType: .emailAddress)
-                    .focused($focusedField, equals: .email)
-                    .onSubmit { focusedField = .password }
-
-                _InputField(label: "Password", placeholder: "••••••••", text: $password, isSecure: true, contentType: .password)
-                    .focused($focusedField, equals: .password)
-                    .onSubmit { Task { await submit() } }
+            AuthButton("Sign In", config: config, isLoading: vm.isLoading) {
+                Task { await vm.submitSignIn() }
             }
 
-            if let error {
-                _ErrorBanner(message: error)
+            Button("Forgot password?") { vm.showForgotPassword() }
+                .font(.subheadline)
+                .foregroundColor(config.accentColor)
+
+            HStack(spacing: 4) {
+                Text("Don't have an account?").foregroundColor(config.subtitleColor)
+                Button("Sign up") { vm.showSignUp() }.foregroundColor(config.accentColor)
             }
-
-            VStack(spacing: 12) {
-                _PrimaryButton(title: "Sign in", isLoading: auth.isLoading || !auth.isReady) {
-                    Task { await submit() }
-                }
-
-                HStack {
-                    Button("Forgot password?") { withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) { mode = .resetPassword } }
-                        .buttonStyle(_LinkButtonStyle())
-                    Spacer()
-                    Button("Create account") { withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) { mode = .signUp } }
-                        .buttonStyle(_LinkButtonStyle())
-                }
-            }
-        }
-    }
-
-    private func submit() async {
-        guard !email.isEmpty, !password.isEmpty else {
-            error = "Please fill in all fields."
-            return
-        }
-        error = nil
-        do {
-            _ = try await auth.signIn(email: email, password: password)
-        } catch {
-            self.error = error.localizedDescription
+            .font(.subheadline)
         }
     }
 }
 
-// MARK: - Sign Up
+// MARK: - Sign Up Screen
 
-@MainActor
-private struct _SignUpForm: View {
-    @ObservedObject var auth: OneloAuth
-    @Binding var mode: AuthMode
-
-    @State private var email = ""
-    @State private var password = ""
-    @State private var confirmPassword = ""
-    @State private var error: String?
-    @State private var success = false
-    @FocusState private var focusedField: Field?
-
-    private enum Field { case email, password, confirm }
+private struct SignUpScreen: View {
+    @ObservedObject var vm: OneloAuthViewModel
+    let config: OneloAuthConfig
 
     var body: some View {
-        VStack(spacing: 24) {
-            VStack(spacing: 4) {
-                Text("Create account")
-                    .font(.system(size: 22, weight: .semibold))
-                Text("Get started for free")
-                    .font(.system(size: 14))
-                    .foregroundStyle(.secondary)
+        VStack(spacing: config.itemSpacing) {
+            Text("Create account")
+                .font(.title2.bold())
+                .foregroundColor(config.textColor)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            AuthTextField("Email", text: $vm.email, config: config)
+#if os(iOS)
+                .keyboardType(.emailAddress)
+                .textContentType(.emailAddress)
+                .autocapitalization(.none)
+#endif
+
+            AuthSecureField("Password", text: $vm.password, config: config)
+#if os(iOS)
+                .textContentType(.newPassword)
+#endif
+
+            AuthSecureField("Confirm password", text: $vm.confirmPassword, config: config)
+#if os(iOS)
+                .textContentType(.newPassword)
+#endif
+
+            if let err = vm.errorMessage {
+                Text(err)
+                    .font(.caption)
+                    .foregroundColor(.red)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            if success {
-                _SuccessBanner(message: "Check your email to confirm your account.")
+            // Show "check your email" when verification is required
+            if vm.forgotPasswordSent {
+                Text("Check your email to verify your account.")
+                    .font(.subheadline)
+                    .foregroundColor(.green)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            AuthButton("Create Account", config: config, isLoading: vm.isLoading) {
+                Task { await vm.submitSignUp() }
+            }
+
+            HStack(spacing: 4) {
+                Text("Already have an account?").foregroundColor(config.subtitleColor)
+                Button("Sign in") { vm.showSignIn() }.foregroundColor(config.accentColor)
+            }
+            .font(.subheadline)
+        }
+    }
+}
+
+// MARK: - Forgot Password Screen
+
+private struct ForgotPasswordScreen: View {
+    @ObservedObject var vm: OneloAuthViewModel
+    let config: OneloAuthConfig
+
+    var body: some View {
+        VStack(spacing: config.itemSpacing) {
+            Text("Reset password")
+                .font(.title2.bold())
+                .foregroundColor(config.textColor)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            Text("Enter your email and we'll send you a reset link.")
+                .font(.subheadline)
+                .foregroundColor(config.subtitleColor)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            if vm.forgotPasswordSent {
+                Text("Check your email for the reset link.")
+                    .font(.subheadline)
+                    .foregroundColor(.green)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             } else {
-                VStack(spacing: 14) {
-                    _InputField(label: "Email", placeholder: "you@example.com", text: $email, isSecure: false, contentType: .emailAddress)
-                        .focused($focusedField, equals: .email)
-                        .onSubmit { focusedField = .password }
+                AuthTextField("Email", text: $vm.email, config: config)
+#if os(iOS)
+                    .keyboardType(.emailAddress)
+                    .textContentType(.emailAddress)
+                    .autocapitalization(.none)
+#endif
 
-                    _InputField(label: "Password", placeholder: "Min. 8 characters", text: $password, isSecure: true, contentType: .newPassword)
-                        .focused($focusedField, equals: .password)
-                        .onSubmit { focusedField = .confirm }
-
-                    _InputField(label: "Confirm password", placeholder: "••••••••", text: $confirmPassword, isSecure: true, contentType: .newPassword)
-                        .focused($focusedField, equals: .confirm)
-                        .onSubmit { Task { await submit() } }
+                if let err = vm.errorMessage {
+                    Text(err)
+                        .font(.caption)
+                        .foregroundColor(.red)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
 
-                if let error {
-                    _ErrorBanner(message: error)
-                }
-
-                _PrimaryButton(title: "Create account", isLoading: auth.isLoading || !auth.isReady) {
-                    Task { await submit() }
+                AuthButton("Send Reset Link", config: config, isLoading: vm.isLoading) {
+                    Task { await vm.submitForgotPassword() }
                 }
             }
 
-            Button("Already have an account? Sign in") { withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) { mode = .signIn } }
-                .buttonStyle(_LinkButtonStyle())
-        }
-    }
-
-    private func submit() async {
-        guard !email.isEmpty, !password.isEmpty else {
-            error = "Please fill in all fields."
-            return
-        }
-        guard password == confirmPassword else {
-            error = "Passwords don't match."
-            return
-        }
-        guard password.count >= 8 else {
-            error = "Password must be at least 8 characters."
-            return
-        }
-        error = nil
-        do {
-            let needsVerification = try await auth.signUp(email: email, password: password)
-            if needsVerification {
-                success = true
-            } else {
-                // Email confirmations disabled — sign in immediately
-                _ = try await auth.signIn(email: email, password: password)
-            }
-        } catch {
-            self.error = error.localizedDescription
+            Button("Back to sign in") { vm.showSignIn() }
+                .font(.subheadline)
+                .foregroundColor(config.accentColor)
         }
     }
 }
 
-// MARK: - Reset Password
+// MARK: - Reusable components
 
-@MainActor
-private struct _ResetPasswordForm: View {
-    @ObservedObject var auth: OneloAuth
-    @Binding var mode: AuthMode
-
-    @State private var email = ""
-    @State private var error: String?
-    @State private var success = false
-    @FocusState private var emailFocused: Bool
-
-    var body: some View {
-        VStack(spacing: 24) {
-            VStack(spacing: 4) {
-                Text("Reset password")
-                    .font(.system(size: 22, weight: .semibold))
-                Text("We'll send you a reset link")
-                    .font(.system(size: 14))
-                    .foregroundStyle(.secondary)
-            }
-
-            if success {
-                _SuccessBanner(message: "Check your email for a reset link.")
-            } else {
-                VStack(spacing: 14) {
-                    _InputField(label: "Email", placeholder: "you@example.com", text: $email, isSecure: false)
-                        .focused($emailFocused)
-                        .onSubmit { Task { await submit() } }
-                }
-
-                if let error {
-                    _ErrorBanner(message: error)
-                }
-
-                _PrimaryButton(title: "Send reset link", isLoading: auth.isLoading || !auth.isReady) {
-                    Task { await submit() }
-                }
-            }
-
-            Button("Back to sign in") { withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) { mode = .signIn } }
-                .buttonStyle(_LinkButtonStyle())
-        }
-    }
-
-    private func submit() async {
-        guard !email.isEmpty else {
-            error = "Please enter your email."
-            return
-        }
-        error = nil
-        do {
-            try await auth.resetPassword(email: email)
-            success = true
-        } catch {
-            self.error = error.localizedDescription
-        }
-    }
-}
-
-// MARK: - Shared components
-
-private struct _InputField: View {
-    let label: String
+private struct AuthTextField: View {
     let placeholder: String
     @Binding var text: String
-    let isSecure: Bool
-    var contentType: NSTextContentType? = nil
+    let config: OneloAuthConfig
 
-    @State private var isRevealed = false
+    init(_ placeholder: String, text: Binding<String>, config: OneloAuthConfig) {
+        self.placeholder = placeholder
+        self._text = text
+        self.config = config
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(label)
-                .font(.system(size: 13, weight: .medium))
-                .foregroundStyle(.primary)
-
-            ZStack(alignment: .trailing) {
-                Group {
-                    if isSecure && !isRevealed {
-                        SecureField(placeholder, text: $text)
-                    } else {
-                        TextField(placeholder, text: $text)
-                    }
-                }
-                .textFieldStyle(.plain)
-                .font(.system(size: 14))
-                .padding(.vertical, 10)
-                .padding(.leading, 12)
-                .padding(.trailing, isSecure ? 40 : 12)
-                .textContentType(contentType)
-
-
-                if isSecure {
-                    Button {
-                        isRevealed.toggle()
-                    } label: {
-                        Image(systemName: isRevealed ? "eye.slash" : "eye")
-                            .font(.system(size: 13))
-                            .foregroundStyle(.tertiary)
-                    }
-                    .buttonStyle(.plain)
-                    .padding(.trailing, 12)
-                }
-            }
-            .background(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(Color.primary.opacity(0.04))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .strokeBorder(Color.primary.opacity(0.1), lineWidth: 1)
-            )
-        }
+        TextField(placeholder, text: $text)
+            .padding(.horizontal, 12)
+            .frame(height: config.inputHeight)
+            .background(config.surfaceColor)
+            .cornerRadius(config.cornerRadius)
+            .foregroundColor(config.textColor)
     }
 }
 
-private struct _PrimaryButton: View {
-    let title: String
+private struct AuthSecureField: View {
+    let placeholder: String
+    @Binding var text: String
+    let config: OneloAuthConfig
+
+    init(_ placeholder: String, text: Binding<String>, config: OneloAuthConfig) {
+        self.placeholder = placeholder
+        self._text = text
+        self.config = config
+    }
+
+    var body: some View {
+        SecureField(placeholder, text: $text)
+            .padding(.horizontal, 12)
+            .frame(height: config.inputHeight)
+            .background(config.surfaceColor)
+            .cornerRadius(config.cornerRadius)
+            .foregroundColor(config.textColor)
+    }
+}
+
+private struct AuthButton: View {
+    let label: String
+    let config: OneloAuthConfig
     let isLoading: Bool
     let action: () -> Void
 
+    init(_ label: String, config: OneloAuthConfig, isLoading: Bool, action: @escaping () -> Void) {
+        self.label = label
+        self.config = config
+        self.isLoading = isLoading
+        self.action = action
+    }
+
     var body: some View {
         Button(action: action) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(Color.primary)
-
+            Group {
                 if isLoading {
-                    ProgressView()
-                        .progressViewStyle(.circular)
-                        .controlSize(.small)
-                        .tint(Color(NSColor.windowBackgroundColor))
+                    ProgressView().tint(.white)
                 } else {
-                    Text(title)
-                        .font(.system(size: 14, weight: .medium))
-                        .foregroundStyle(Color(NSColor.windowBackgroundColor))
+                    Text(label).fontWeight(.semibold)
                 }
             }
-            .frame(height: 40)
+            .frame(maxWidth: .infinity)
+            .frame(height: config.buttonHeight)
+            .background(config.accentColor)
+            .foregroundColor(.white)
+            .cornerRadius(config.cornerRadius)
         }
-        .buttonStyle(.plain)
         .disabled(isLoading)
-        .animation(.easeInOut(duration: 0.15), value: isLoading)
     }
 }
 
-private struct _ErrorBanner: View {
-    let message: String
+private struct OneloFooter: View {
+    let subtitleColor: Color
 
     var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "exclamationmark.circle.fill")
-                .font(.system(size: 13))
-                .foregroundStyle(.red)
-            Text(message)
-                .font(.system(size: 13))
-                .foregroundStyle(.red)
-                .fixedSize(horizontal: false, vertical: true)
-            Spacer()
+        Link(destination: URL(string: "https://onelo.tools")!) {
+            Text("Powered by ")
+                .foregroundColor(subtitleColor.opacity(0.6))
+            + Text("Onelo")
+                .foregroundColor(subtitleColor.opacity(0.8))
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
-        .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(Color.red.opacity(0.07))
-        )
-    }
-}
-
-private struct _SuccessBanner: View {
-    let message: String
-
-    var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "checkmark.circle.fill")
-                .font(.system(size: 13))
-                .foregroundStyle(.green)
-            Text(message)
-                .font(.system(size: 13))
-                .foregroundStyle(.primary)
-                .fixedSize(horizontal: false, vertical: true)
-            Spacer()
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
-        .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(Color.green.opacity(0.08))
-        )
-    }
-}
-
-private struct _LinkButtonStyle: ButtonStyle {
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .font(.system(size: 13))
-            .foregroundStyle(configuration.isPressed ? Color.primary.opacity(0.5) : Color.secondary)
-            .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
+        .font(.caption2)
     }
 }
