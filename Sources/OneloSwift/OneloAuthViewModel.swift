@@ -3,7 +3,6 @@ import SwiftUI
 
 // MARK: - Protocol (enables mocking in tests)
 
-@MainActor
 public protocol OneloAuthProtocol: AnyObject {
     func signIn(email: String, password: String) async throws -> OneloSession
     func signUp(email: String, password: String) async throws -> Bool
@@ -37,7 +36,7 @@ public final class OneloAuthViewModel: ObservableObject {
     @Published public var forgotPasswordSent: Bool = false
 
     private let auth: any OneloAuthProtocol
-    var onSuccess: ((OneloSession) -> Void)?
+    public var onSuccess: ((OneloSession) -> Void)?
 
     public init(auth: any OneloAuthProtocol, onSuccess: ((OneloSession) -> Void)? = nil) {
         self.auth = auth
@@ -54,6 +53,10 @@ public final class OneloAuthViewModel: ObservableObject {
 
     public func submitSignIn() async {
         clearErrors()
+        guard !email.isEmpty, !password.isEmpty else {
+            errorMessage = "Please enter your email and password."
+            return
+        }
         isLoading = true
         defer { isLoading = false }
         do {
@@ -70,13 +73,21 @@ public final class OneloAuthViewModel: ObservableObject {
             errorMessage = "Passwords do not match."
             return
         }
+        guard password.count >= 8 else {
+            errorMessage = "Password must be at least 8 characters."
+            return
+        }
         isLoading = true
         defer { isLoading = false }
         do {
-            _ = try await auth.signUp(email: email, password: password)
-            // After sign up, sign in immediately
-            let session = try await auth.signIn(email: email, password: password)
-            onSuccess?(session)
+            let needsVerification = try await auth.signUp(email: email, password: password)
+            if needsVerification {
+                // Email confirmation required — show success state, don't sign in yet
+                forgotPasswordSent = true  // reuse this flag to show "check your email"
+            } else {
+                let session = try await auth.signIn(email: email, password: password)
+                onSuccess?(session)
+            }
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -84,6 +95,10 @@ public final class OneloAuthViewModel: ObservableObject {
 
     public func submitForgotPassword() async {
         clearErrors()
+        guard !email.isEmpty else {
+            errorMessage = "Please enter your email address."
+            return
+        }
         isLoading = true
         defer { isLoading = false }
         do {

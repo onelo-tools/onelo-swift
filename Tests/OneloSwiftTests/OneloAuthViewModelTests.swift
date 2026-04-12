@@ -64,12 +64,50 @@ final class OneloAuthViewModelTests: XCTestCase {
         XCTAssertTrue(vm.forgotPasswordSent)
     }
 
-    func test_isLoading_true_during_signIn() async {
+    func test_isLoading_false_after_signIn_completes() async {
         let vm = OneloAuthViewModel(auth: MockOneloAuth())
         vm.email = "test@example.com"
         vm.password = "password"
         await vm.submitSignIn()
         XCTAssertFalse(vm.isLoading)
+    }
+
+    func test_onSuccess_called_on_sign_in() async {
+        var received: OneloSession?
+        let vm = OneloAuthViewModel(auth: MockOneloAuth(), onSuccess: { received = $0 })
+        vm.email = "a@b.com"
+        vm.password = "password"
+        await vm.submitSignIn()
+        XCTAssertNotNil(received)
+        XCTAssertEqual(received?.user.email, "a@b.com")
+    }
+
+    func test_signUp_failure_sets_error() async {
+        let auth = MockOneloAuth()
+        auth.shouldFailSignUp = true
+        let vm = OneloAuthViewModel(auth: auth)
+        vm.email = "test@example.com"
+        vm.password = "password123"
+        vm.confirmPassword = "password123"
+        await vm.submitSignUp()
+        XCTAssertNotNil(vm.errorMessage)
+    }
+
+    func test_signIn_empty_email_sets_error() async {
+        let vm = OneloAuthViewModel(auth: MockOneloAuth())
+        vm.email = ""
+        vm.password = "password"
+        await vm.submitSignIn()
+        XCTAssertNotNil(vm.errorMessage)
+    }
+
+    func test_signUp_short_password_sets_error() async {
+        let vm = OneloAuthViewModel(auth: MockOneloAuth())
+        vm.email = "test@example.com"
+        vm.password = "short"
+        vm.confirmPassword = "short"
+        await vm.submitSignUp()
+        XCTAssertNotNil(vm.errorMessage)
     }
 }
 
@@ -92,7 +130,7 @@ final class MockOneloAuth: OneloAuthProtocol {
 
     func signUp(email: String, password: String) async throws -> Bool {
         if shouldFailSignUp { throw OneloError.serverError("Email taken") }
-        return true
+        return false  // no email verification in tests
     }
 
     func resetPassword(email: String, redirectTo: URL?) async throws {}
