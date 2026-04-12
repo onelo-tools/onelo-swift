@@ -11,6 +11,7 @@ public final class OneloAuthModule {
     ///   OneloAuthView(auth: onelo.auth.authObject, ...)
     public let authObject: OneloAuth
 
+    // Internal: instantiated by Onelo only.
     init(auth: OneloAuth) {
         self.authObject = auth
     }
@@ -24,8 +25,14 @@ public final class OneloAuthModule {
         config: OneloAuthConfig = .default,
         completion: @escaping (OneloSession) -> Void
     ) {
-        let view = OneloAuthView(auth: authObject, config: config, onSuccess: completion)
-        let host = UIHostingController(rootView: view)
+        var host: UIHostingController<OneloAuthView>?
+        let view = OneloAuthView(auth: authObject, config: config) { [weak host] session in
+            host?.dismiss(animated: true) {
+                completion(session)
+            }
+        }
+        host = UIHostingController(rootView: view)
+        guard let host else { return }
         host.modalPresentationStyle = .formSheet
         viewController.present(host, animated: true)
     }
@@ -36,8 +43,13 @@ public final class OneloAuthModule {
         config: OneloAuthConfig = .default,
         completion: @escaping (OneloSession) -> Void
     ) {
-        let view = OneloAuthView(auth: authObject, config: config, onSuccess: completion)
-        let host = NSHostingController(rootView: view)
+        var host: NSHostingController<OneloAuthView>?
+        let view = OneloAuthView(auth: authObject, config: config) { [weak host] session in
+            if let host { host.dismiss(host) }
+            completion(session)
+        }
+        host = NSHostingController(rootView: view)
+        guard let host else { return }
         viewController.presentAsSheet(host)
     }
     #endif
