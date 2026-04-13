@@ -51,47 +51,51 @@ public struct OneloAuthView: View {
     }
 
     public var body: some View {
-        ZStack {
-            effectiveConfig.backgroundColor.ignoresSafeArea()
+        Group {
+            if !allowCustomBranding {
+                // Free tier: full-screen branded hosted flow
+                HostedSignInButton(auth: auth, config: effectiveConfig, onSuccess: vm.onSuccess)
+            } else {
+                // Paid tier: inline customisable form
+                ZStack {
+                    effectiveConfig.backgroundColor.ignoresSafeArea()
 
-            ScrollView {
-                VStack(spacing: 0) {
-                    // Logo / app name
-                    VStack(spacing: 8) {
-                        if let logo = effectiveConfig.appLogo {
-                            logo
-                                .resizable()
-                                .scaledToFit()
-                                .frame(width: 56, height: 56)
-                                .clipShape(RoundedRectangle(cornerRadius: effectiveConfig.cornerRadius))
-                        }
-                        if !effectiveConfig.appName.isEmpty {
-                            Text(effectiveConfig.appName)
-                                .font(.headline)
-                                .foregroundStyle(effectiveConfig.textColor)
-                        }
-                    }
-                    .padding(.bottom, 32)
+                    ScrollView {
+                        VStack(spacing: 0) {
+                            VStack(spacing: 8) {
+                                if let logo = effectiveConfig.appLogo {
+                                    logo
+                                        .resizable()
+                                        .scaledToFit()
+                                        .frame(width: 56, height: 56)
+                                        .clipShape(RoundedRectangle(cornerRadius: effectiveConfig.cornerRadius))
+                                }
+                                if !effectiveConfig.appName.isEmpty {
+                                    Text(effectiveConfig.appName)
+                                        .font(.headline)
+                                        .foregroundStyle(effectiveConfig.textColor)
+                                }
+                            }
+                            .padding(.bottom, 32)
 
-                    // Free tier: hosted flow button; paid tier: inline form
-                    if !allowCustomBranding {
-                        HostedSignInButton(auth: auth, config: effectiveConfig, onSuccess: vm.onSuccess)
-                    } else {
-                        Group {
-                            switch vm.screen {
-                            case .signIn:         SignInScreen(vm: vm, config: effectiveConfig)
-                            case .signUp:         SignUpScreen(vm: vm, config: effectiveConfig)
-                            case .forgotPassword: ForgotPasswordScreen(vm: vm, config: effectiveConfig)
+                            Group {
+                                switch vm.screen {
+                                case .signIn:         SignInScreen(vm: vm, config: effectiveConfig)
+                                case .signUp:         SignUpScreen(vm: vm, config: effectiveConfig)
+                                case .forgotPassword: ForgotPasswordScreen(vm: vm, config: effectiveConfig)
+                                }
+                            }
+
+                            Spacer(minLength: 32)
+
+                            HStack {
+                                OneloFooter()
+                                Spacer()
                             }
                         }
+                        .padding(effectiveConfig.contentPadding)
                     }
-
-                    Spacer(minLength: 32)
-
-                    // Hardcoded Onelo branding — cannot be removed
-                    OneloFooter(subtitleColor: effectiveConfig.subtitleColor)
                 }
-                .padding(effectiveConfig.contentPadding)
             }
         }
         .task {
@@ -383,17 +387,45 @@ private struct AuthButton: View {
     }
 }
 
-private struct OneloFooter: View {
-    let subtitleColor: Color
+// MARK: - Onelo Logo (SwiftUI, no asset required)
+
+private struct OneloLogo: View {
+    var size: CGFloat = 56
 
     var body: some View {
-        Link(destination: URL(string: "https://onelo.tools")!) {
-            Text("Powered by ")
-                .foregroundStyle(subtitleColor.opacity(0.6))
-            + Text("Onelo")
-                .foregroundStyle(subtitleColor.opacity(0.8))
+        ZStack {
+            RoundedRectangle(cornerRadius: size * 0.28)
+                .fill(
+                    LinearGradient(
+                        colors: [Color(red: 0.38, green: 0.40, blue: 0.95),
+                                 Color(red: 0.55, green: 0.36, blue: 0.96)],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+                .frame(width: size, height: size)
+
+            Text("O")
+                .font(.system(size: size * 0.52, weight: .bold, design: .rounded))
+                .foregroundStyle(.white)
         }
-        .font(.caption2)
+    }
+}
+
+// MARK: - Onelo Footer (with logo, left-aligned)
+
+private struct OneloFooter: View {
+    var body: some View {
+        Link(destination: URL(string: "https://onelo.tools")!) {
+            HStack(spacing: 5) {
+                OneloLogo(size: 16)
+                Text("Powered by ")
+                    .foregroundStyle(Color.primary.opacity(0.35))
+                + Text("Onelo")
+                    .foregroundStyle(Color.primary.opacity(0.55))
+            }
+            .font(.caption2)
+        }
         .buttonStyle(.plain)
     }
 }
@@ -409,31 +441,79 @@ private struct HostedSignInButton: View {
     @State private var errorMessage: String?
 
     var body: some View {
-        VStack(spacing: 12) {
-            if isLoading {
-                ProgressView()
-                    .tint(config.accentColor)
-                    .frame(height: config.buttonHeight)
-            } else {
-                Button {
-                    Task { await signIn() }
-                } label: {
-                    Text("Sign In")
-                        .fontWeight(.semibold)
-                        .frame(maxWidth: .infinity)
-                        .frame(height: config.buttonHeight)
-                        .background(config.accentColor)
-                        .foregroundStyle(config.buttonForegroundColor)
-                        .clipShape(RoundedRectangle(cornerRadius: config.cornerRadius))
-                }
-                .buttonStyle(.plain)
-            }
+        GeometryReader { geo in
+            ZStack {
+                // Background
+                config.backgroundColor.ignoresSafeArea()
 
-            if let err = errorMessage {
-                Text(err)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-                    .multilineTextAlignment(.center)
+                VStack(spacing: 0) {
+                    Spacer()
+
+                    // Onelo branding block
+                    VStack(spacing: 16) {
+                        OneloLogo(size: 72)
+
+                        VStack(spacing: 4) {
+                            Text("Sign in with Onelo")
+                                .font(.title2.bold())
+                                .foregroundStyle(config.textColor)
+
+                            Text("Secure authentication powered by Onelo")
+                                .font(.subheadline)
+                                .foregroundStyle(config.subtitleColor)
+                                .multilineTextAlignment(.center)
+                        }
+                    }
+                    .padding(.bottom, 40)
+
+                    // Sign In button
+                    VStack(spacing: 12) {
+                        if isLoading {
+                            ProgressView()
+                                .tint(Color(red: 0.38, green: 0.40, blue: 0.95))
+                                .frame(height: config.buttonHeight)
+                        } else {
+                            Button {
+                                Task { await signIn() }
+                            } label: {
+                                Text("Sign In")
+                                    .fontWeight(.semibold)
+                                    .frame(maxWidth: .infinity)
+                                    .frame(height: config.buttonHeight)
+                                    .background(
+                                        LinearGradient(
+                                            colors: [Color(red: 0.38, green: 0.40, blue: 0.95),
+                                                     Color(red: 0.55, green: 0.36, blue: 0.96)],
+                                            startPoint: .leading,
+                                            endPoint: .trailing
+                                        )
+                                    )
+                                    .foregroundStyle(.white)
+                                    .clipShape(RoundedRectangle(cornerRadius: config.cornerRadius))
+                            }
+                            .buttonStyle(.plain)
+                        }
+
+                        if let err = errorMessage {
+                            Text(err)
+                                .font(.caption)
+                                .foregroundStyle(.red)
+                                .multilineTextAlignment(.center)
+                        }
+                    }
+                    .padding(.horizontal, config.contentPadding.leading)
+
+                    Spacer()
+
+                    // Footer — left aligned
+                    HStack {
+                        OneloFooter()
+                        Spacer()
+                    }
+                    .padding(.horizontal, config.contentPadding.leading)
+                    .padding(.bottom, 24)
+                }
+                .frame(width: geo.size.width)
             }
         }
     }
