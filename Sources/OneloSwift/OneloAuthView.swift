@@ -387,28 +387,36 @@ private struct AuthButton: View {
     }
 }
 
-// MARK: - Onelo Logo (SwiftUI, no asset required)
+// MARK: - Onelo Logo (SVG-faithful SwiftUI replica)
+// Logo: black background, white rotated square (diamond), orange dot top-right
+// Colors from public/logo.svg: bg #111111, diamond white, dot #f97316
+
+private let oneloOrange = Color(red: 0.976, green: 0.451, blue: 0.086) // #f97316
 
 private struct OneloLogo: View {
     var size: CGFloat = 56
 
     var body: some View {
         ZStack {
-            RoundedRectangle(cornerRadius: size * 0.28)
-                .fill(
-                    LinearGradient(
-                        colors: [Color(red: 0.38, green: 0.40, blue: 0.95),
-                                 Color(red: 0.55, green: 0.36, blue: 0.96)],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                )
+            // Background
+            RoundedRectangle(cornerRadius: size * 0.22)
+                .fill(Color(red: 0.067, green: 0.067, blue: 0.067)) // #111111
                 .frame(width: size, height: size)
 
-            Text("O")
-                .font(.system(size: size * 0.52, weight: .bold, design: .rounded))
-                .foregroundStyle(.white)
+            // White diamond (rotated square)
+            Rectangle()
+                .fill(Color.white)
+                .frame(width: size * 0.52, height: size * 0.52)
+                .cornerRadius(size * 0.06)
+                .rotationEffect(.degrees(45))
+
+            // Orange dot — top-right quadrant
+            Circle()
+                .fill(oneloOrange)
+                .frame(width: size * 0.24, height: size * 0.24)
+                .offset(x: size * 0.22, y: -size * 0.22)
         }
+        .frame(width: size, height: size)
     }
 }
 
@@ -470,7 +478,7 @@ private struct HostedSignInButton: View {
                     VStack(spacing: 12) {
                         if isLoading {
                             ProgressView()
-                                .tint(Color(red: 0.38, green: 0.40, blue: 0.95))
+                                .tint(oneloOrange)
                                 .frame(height: config.buttonHeight)
                         } else {
                             Button {
@@ -480,14 +488,7 @@ private struct HostedSignInButton: View {
                                     .fontWeight(.semibold)
                                     .frame(maxWidth: .infinity)
                                     .frame(height: config.buttonHeight)
-                                    .background(
-                                        LinearGradient(
-                                            colors: [Color(red: 0.38, green: 0.40, blue: 0.95),
-                                                     Color(red: 0.55, green: 0.36, blue: 0.96)],
-                                            startPoint: .leading,
-                                            endPoint: .trailing
-                                        )
-                                    )
+                                    .background(oneloOrange)
                                     .foregroundStyle(.white)
                                     .clipShape(RoundedRectangle(cornerRadius: config.cornerRadius))
                             }
