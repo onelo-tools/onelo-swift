@@ -405,7 +405,7 @@ private struct OneloLogo: View {
             Image("onelo-logo-white", bundle: .module)
                 .resizable()
                 .scaledToFit()
-                .frame(width: size * 0.75, height: size * 0.75)
+                .frame(width: size * 0.72, height: size * 0.72)
         }
         .frame(width: size, height: size)
     }
