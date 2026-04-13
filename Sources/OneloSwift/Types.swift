@@ -1,7 +1,7 @@
 import Foundation
 
 public enum OneloSDK {
-    public static let sdkVersion = "2.1.0"
+    public static let sdkVersion = "2.2.0"
 }
 
 public enum UserRole: String, Codable, Sendable {
@@ -54,11 +54,22 @@ struct ResolvedConfig: Decodable {
     let supabaseUrl: String
     let supabaseAnonKey: String
     let tenantId: String
+    let allowCustomBranding: Bool
 
     enum CodingKeys: String, CodingKey {
         case supabaseUrl = "supabase_url"
         case supabaseAnonKey = "supabase_anon_key"
         case tenantId = "tenant_id"
+        case allowCustomBranding = "allow_custom_branding"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        supabaseUrl = try c.decode(String.self, forKey: .supabaseUrl)
+        supabaseAnonKey = try c.decode(String.self, forKey: .supabaseAnonKey)
+        tenantId = try c.decode(String.self, forKey: .tenantId)
+        // Default false — safe fallback if backend doesn't send the field yet
+        allowCustomBranding = (try? c.decode(Bool.self, forKey: .allowCustomBranding)) ?? false
     }
 }
 

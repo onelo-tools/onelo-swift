@@ -19,6 +19,12 @@ public struct OneloAuthConfig {
     public var textColor: Color
     /// Secondary text color (subtitles, placeholders, footer).
     public var subtitleColor: Color
+    /// Foreground color of text inside primary action buttons.
+    public var buttonForegroundColor: Color
+    /// Border color of input fields.
+    public var inputBorderColor: Color
+    /// Border width of input fields. Set to 0 to remove border.
+    public var inputBorderWidth: CGFloat
 
     // MARK: - Branding
     /// Optional logo shown at the top of the view.
@@ -38,8 +44,13 @@ public struct OneloAuthConfig {
     /// Vertical spacing between form elements.
     public var itemSpacing: CGFloat
 
+    // MARK: - Presets
+
+    /// Onelo brand indigo (#6366f1)
+    private static let oneloIndigo = Color(red: 99/255, green: 102/255, blue: 241/255)
+
     public init(
-        accentColor: Color = .blue,
+        accentColor: Color = Color(red: 99/255, green: 102/255, blue: 241/255),
         backgroundColor: Color = {
             #if canImport(UIKit)
             return Color(uiColor: .systemBackground)
@@ -56,6 +67,9 @@ public struct OneloAuthConfig {
         }(),
         textColor: Color = .primary,
         subtitleColor: Color = .secondary,
+        buttonForegroundColor: Color = .white,
+        inputBorderColor: Color = Color.primary.opacity(0.1),
+        inputBorderWidth: CGFloat = 1,
         appLogo: Image? = nil,
         appName: String = "",
         cornerRadius: CGFloat = 10,
@@ -69,6 +83,9 @@ public struct OneloAuthConfig {
         self.surfaceColor = surfaceColor
         self.textColor = textColor
         self.subtitleColor = subtitleColor
+        self.buttonForegroundColor = buttonForegroundColor
+        self.inputBorderColor = inputBorderColor
+        self.inputBorderWidth = inputBorderWidth
         self.appLogo = appLogo
         self.appName = appName
         self.cornerRadius = cornerRadius
@@ -78,6 +95,15 @@ public struct OneloAuthConfig {
         self.itemSpacing = itemSpacing
     }
 
-    /// Default config — blue accent, system colors, no logo.
+    /// Default config — Onelo brand indigo accent, system colors, no logo.
     public static let `default` = OneloAuthConfig()
+
+    /// Locked Onelo brand config used automatically on free plan.
+    /// Identical to `.default` — exists so the intent is explicit in code.
+    public static let oneloBranded = OneloAuthConfig(
+        accentColor: Self.oneloIndigo,
+        buttonForegroundColor: .white,
+        inputBorderColor: Color.primary.opacity(0.1),
+        inputBorderWidth: 1
+    )
 }

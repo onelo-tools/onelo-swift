@@ -10,7 +10,17 @@ import SwiftUI
 /// ```
 public struct OneloAuthView: View {
     @StateObject private var vm: OneloAuthViewModel
-    private let config: OneloAuthConfig
+    private let requestedConfig: OneloAuthConfig
+    private let auth: any OneloAuthProtocol
+    @State private var allowCustomBranding: Bool = false
+
+    /// Returns the config to render. On free plan, enforces Onelo brand.
+    private var effectiveConfig: OneloAuthConfig {
+        if !allowCustomBranding {
+            return .oneloBranded
+        }
+        return requestedConfig
+    }
 
     public init(
         auth: any OneloAuthProtocol,
@@ -18,28 +28,29 @@ public struct OneloAuthView: View {
         onSuccess: @escaping (OneloSession) -> Void
     ) {
         _vm = StateObject(wrappedValue: OneloAuthViewModel(auth: auth, onSuccess: onSuccess))
-        self.config = config
+        self.requestedConfig = config
+        self.auth = auth
     }
 
     public var body: some View {
         ZStack {
-            config.backgroundColor.ignoresSafeArea()
+            effectiveConfig.backgroundColor.ignoresSafeArea()
 
             ScrollView {
                 VStack(spacing: 0) {
                     // Logo / app name
                     VStack(spacing: 8) {
-                        if let logo = config.appLogo {
+                        if let logo = effectiveConfig.appLogo {
                             logo
                                 .resizable()
                                 .scaledToFit()
                                 .frame(width: 56, height: 56)
-                                .clipShape(RoundedRectangle(cornerRadius: config.cornerRadius))
+                                .clipShape(RoundedRectangle(cornerRadius: effectiveConfig.cornerRadius))
                         }
-                        if !config.appName.isEmpty {
-                            Text(config.appName)
+                        if !effectiveConfig.appName.isEmpty {
+                            Text(effectiveConfig.appName)
                                 .font(.headline)
-                                .foregroundStyle(config.textColor)
+                                .foregroundStyle(effectiveConfig.textColor)
                         }
                     }
                     .padding(.bottom, 32)
@@ -47,18 +58,24 @@ public struct OneloAuthView: View {
                     // Active screen
                     Group {
                         switch vm.screen {
-                        case .signIn:         SignInScreen(vm: vm, config: config)
-                        case .signUp:         SignUpScreen(vm: vm, config: config)
-                        case .forgotPassword: ForgotPasswordScreen(vm: vm, config: config)
+                        case .signIn:         SignInScreen(vm: vm, config: effectiveConfig)
+                        case .signUp:         SignUpScreen(vm: vm, config: effectiveConfig)
+                        case .forgotPassword: ForgotPasswordScreen(vm: vm, config: effectiveConfig)
                         }
                     }
 
                     Spacer(minLength: 32)
 
                     // Hardcoded Onelo branding — cannot be removed
-                    OneloFooter(subtitleColor: config.subtitleColor)
+                    OneloFooter(subtitleColor: effectiveConfig.subtitleColor)
                 }
-                .padding(config.contentPadding)
+                .padding(effectiveConfig.contentPadding)
+            }
+        }
+        .task {
+            guard let oneloAuth = auth as? OneloAuth else { return }
+            for await value in oneloAuth.$allowCustomBranding.values {
+                allowCustomBranding = value
             }
         }
     }
@@ -280,7 +297,7 @@ private struct AuthTextField: View {
             .clipShape(RoundedRectangle(cornerRadius: config.cornerRadius))
             .overlay(
                 RoundedRectangle(cornerRadius: config.cornerRadius)
-                    .strokeBorder(Color.primary.opacity(0.1), lineWidth: 1)
+                    .strokeBorder(config.inputBorderColor, lineWidth: config.inputBorderWidth)
             )
             .foregroundStyle(config.textColor)
     }
@@ -305,7 +322,7 @@ private struct AuthSecureField: View {
             .clipShape(RoundedRectangle(cornerRadius: config.cornerRadius))
             .overlay(
                 RoundedRectangle(cornerRadius: config.cornerRadius)
-                    .strokeBorder(Color.primary.opacity(0.1), lineWidth: 1)
+                    .strokeBorder(config.inputBorderColor, lineWidth: config.inputBorderWidth)
             )
             .foregroundStyle(config.textColor)
     }
@@ -328,7 +345,7 @@ private struct AuthButton: View {
         Button(action: action) {
             Group {
                 if isLoading {
-                    ProgressView().tint(.white)
+                    ProgressView().tint(config.buttonForegroundColor)
                 } else {
                     Text(label).fontWeight(.semibold)
                 }
@@ -336,7 +353,7 @@ private struct AuthButton: View {
             .frame(maxWidth: .infinity)
             .frame(height: config.buttonHeight)
             .background(config.accentColor)
-            .foregroundStyle(.white)
+            .foregroundStyle(config.buttonForegroundColor)
             .clipShape(RoundedRectangle(cornerRadius: config.cornerRadius))
         }
         .buttonStyle(.plain)

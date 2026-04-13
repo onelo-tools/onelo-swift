@@ -17,6 +17,9 @@ public final class OneloAuth: ObservableObject {
     @Published public private(set) var isRevoked: Bool = false
     /// Set when the user account has been deleted or suspended by an admin.
     @Published public private(set) var isUserRevoked: Bool = false
+    /// True if the tenant's plan allows developer customization of the auth UI.
+    /// Populated after `isReady` becomes true.
+    @Published public private(set) var allowCustomBranding: Bool = false
 
     private var client: AuthClient?
     private let keychain: KeychainStorage
@@ -277,6 +280,7 @@ public final class OneloAuth: ObservableObject {
     private func initialize() async {
         do {
             let resolved = try await resolveConfig()
+            allowCustomBranding = resolved.allowCustomBranding
 
             try? keychain.set(resolved.supabaseUrl, forKey: KeychainKeys.supabaseUrl)
             try? keychain.set(resolved.supabaseAnonKey, forKey: KeychainKeys.supabaseAnonKey)
