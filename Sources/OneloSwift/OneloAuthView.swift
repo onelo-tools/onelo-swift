@@ -447,6 +447,8 @@ private struct HostedSignInButton: View {
 
     @State private var isLoading = false
     @State private var errorMessage: String?
+    @State private var appName: String = "App"
+    @State private var appLogoUrl: URL? = nil
 
     var body: some View {
         GeometryReader { geo in
@@ -457,12 +459,27 @@ private struct HostedSignInButton: View {
                 VStack(spacing: 0) {
                     Spacer()
 
-                    // Onelo branding block
+                    // App / Onelo branding block
                     VStack(spacing: 16) {
-                        OneloLogo(size: 72)
+                        // Show app logo if available, otherwise Onelo logo
+                        if let logoUrl = appLogoUrl {
+                            AsyncImage(url: logoUrl) { phase in
+                                if let image = phase.image {
+                                    image
+                                        .resizable()
+                                        .scaledToFill()
+                                        .frame(width: 72, height: 72)
+                                        .clipShape(RoundedRectangle(cornerRadius: 16))
+                                } else {
+                                    OneloLogo(size: 72)
+                                }
+                            }
+                        } else {
+                            OneloLogo(size: 72)
+                        }
 
                         VStack(spacing: 4) {
-                            Text("Sign in with Onelo")
+                            Text("Sign in to \(appName)")
                                 .font(.title2.bold())
                                 .foregroundStyle(config.textColor)
 
@@ -517,6 +534,18 @@ private struct HostedSignInButton: View {
                 .frame(width: geo.size.width)
             }
         }
+        .task {
+            guard let oneloAuth = auth as? OneloAuth else { return }
+            for await name in oneloAuth.$hostedAppName.values {
+                appName = name
+            }
+        }
+        .task {
+            guard let oneloAuth = auth as? OneloAuth else { return }
+            for await logoUrl in oneloAuth.$hostedAppLogoUrl.values {
+                appLogoUrl = logoUrl
+            }
+        }
     }
 
     @MainActor
@@ -529,12 +558,28 @@ private struct HostedSignInButton: View {
             #if os(iOS) || os(macOS)
             let context = WindowContextProvider()
             let session = try await oneloAuth.presentHostedSignIn(from: context)
+            // Sync updated app metadata after sign-in completes
+            appName = oneloAuth.hostedAppName
+            appLogoUrl = oneloAuth.hostedAppLogoUrl
             onSuccess?(session)
             #endif
         } catch OneloError.cancelled {
             // User dismissed — no error shown
         } catch {
             errorMessage = error.localizedDescription
+        }
+    }
+}
+
+// MARK: - HostedSignInButton app metadata sync extension
+// appName / appLogoUrl are populated after presentHostedSignIn() calls /initiate.
+// We observe OneloAuth.$hostedAppName and $hostedAppLogoUrl to update the UI
+// if the button is shown before the first sign-in attempt completes.
+private extension HostedSignInButton {
+    func observeAppMetadata() async {
+        guard let oneloAuth = auth as? OneloAuth else { return }
+        for await name in oneloAuth.$hostedAppName.values {
+            appName = name
         }
     }
 }

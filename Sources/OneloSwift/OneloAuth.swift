@@ -21,6 +21,10 @@ public final class OneloAuth: ObservableObject {
     /// True if the tenant's plan allows developer customization of the auth UI.
     /// Populated after `isReady` becomes true.
     @Published public private(set) var allowCustomBranding: Bool = false
+    /// App name returned by /initiate — shown in HostedSignInButton before Safari opens.
+    @Published public private(set) var hostedAppName: String = "App"
+    /// App logo URL returned by /initiate — shown in HostedSignInButton if set, otherwise Onelo logo.
+    @Published public private(set) var hostedAppLogoUrl: URL? = nil
 
     private var client: AuthClient?
     private let keychain: KeychainStorage
@@ -73,6 +77,10 @@ public final class OneloAuth: ObservableObject {
         else {
             throw OneloError.serverError("Invalid initiate response")
         }
+
+        // Store app metadata for UI
+        if let name = initJson["app_name"] as? String { hostedAppName = name }
+        if let logoStr = initJson["app_logo_url"] as? String { hostedAppLogoUrl = URL(string: logoStr) }
 
         // 2. Open hosted page via ASWebAuthenticationSession
         let callbackUrl: URL = try await withCheckedThrowingContinuation { continuation in
@@ -382,6 +390,8 @@ public final class OneloAuth: ObservableObject {
         do {
             let resolved = try await resolveConfig()
             allowCustomBranding = resolved.allowCustomBranding
+            if let name = resolved.appName, !name.isEmpty { hostedAppName = name }
+            if let logoStr = resolved.appLogoUrl { hostedAppLogoUrl = URL(string: logoStr) }
 
             try? keychain.set(resolved.supabaseUrl, forKey: KeychainKeys.supabaseUrl)
             try? keychain.set(resolved.supabaseAnonKey, forKey: KeychainKeys.supabaseAnonKey)
