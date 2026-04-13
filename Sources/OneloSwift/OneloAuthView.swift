@@ -387,34 +387,25 @@ private struct AuthButton: View {
     }
 }
 
-// MARK: - Onelo Logo (SVG-faithful SwiftUI replica)
-// Logo: black background, white rotated square (diamond), orange dot top-right
-// Colors from public/logo.svg: bg #111111, diamond white, dot #f97316
+// MARK: - Onelo brand color
 
 private let oneloOrange = Color(red: 0.976, green: 0.451, blue: 0.086) // #f97316
+
+// MARK: - Onelo Logo
 
 private struct OneloLogo: View {
     var size: CGFloat = 56
 
     var body: some View {
         ZStack {
-            // Background
             RoundedRectangle(cornerRadius: size * 0.22)
                 .fill(Color(red: 0.067, green: 0.067, blue: 0.067)) // #111111
                 .frame(width: size, height: size)
 
-            // White diamond (rotated square)
-            Rectangle()
-                .fill(Color.white)
-                .frame(width: size * 0.52, height: size * 0.52)
-                .cornerRadius(size * 0.06)
-                .rotationEffect(.degrees(45))
-
-            // Orange dot — top-right quadrant
-            Circle()
-                .fill(oneloOrange)
-                .frame(width: size * 0.24, height: size * 0.24)
-                .offset(x: size * 0.22, y: -size * 0.22)
+            Image("onelo-logo-white", bundle: .module)
+                .resizable()
+                .scaledToFit()
+                .frame(width: size * 0.75, height: size * 0.75)
         }
         .frame(width: size, height: size)
     }
@@ -479,9 +470,11 @@ private struct HostedSignInButton: View {
                         }
 
                         VStack(spacing: 4) {
-                            Text("Sign in to \(appName)")
-                                .font(.title2.bold())
+                            (Text("Sign in to ")
                                 .foregroundStyle(config.textColor)
+                            + Text(appName)
+                                .foregroundStyle(oneloOrange))
+                            .font(.title2.bold())
 
                             Text("Secure authentication powered by Onelo")
                                 .font(.subheadline)
