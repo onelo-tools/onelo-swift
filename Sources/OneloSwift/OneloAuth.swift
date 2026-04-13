@@ -177,11 +177,6 @@ public final class OneloAuth: ObservableObject {
             return try await _signInAttempt(email: email, password: password, isRetry: true)
         }
 
-        // Surface hosted-flow-required as a typed error
-        if let errStr = json["error"] as? String, errStr == "hosted_flow_required" {
-            throw OneloError.requiresHostedFlow
-        }
-
         guard
             let sessionData = json["session"] as? [String: Any],
             let accessToken = sessionData["access_token"] as? String,
@@ -547,7 +542,19 @@ public final class OneloAuth: ObservableObject {
         let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
 
         if http.statusCode >= 400 {
-            let msg = json["error"] as? String ?? json["detail"] as? String ?? "HTTP \(http.statusCode)"
+            // Detect hosted_flow_required from both Next.js {"error":"hosted_flow_required"}
+            // and Python {"detail":{"error":"hosted_flow_required"}} response shapes.
+            let errorCode = json["error"] as? String
+                ?? (json["detail"] as? [String: Any])?["error"] as? String
+            if errorCode == "hosted_flow_required" {
+                let hint = json["hint"] as? String
+                    ?? (json["detail"] as? [String: Any])?["hint"] as? String
+                    ?? "Use OneloAuthView or presentHostedSignIn() — direct signIn/signUp is not available on the free plan."
+                print("[Onelo] ⚠️ hosted_flow_required: \(hint)")
+                print("[Onelo] 💡 Fix: switch to OneloAuthView in your UI, or upgrade your Onelo plan to enable a custom auth UI.")
+                throw OneloError.requiresHostedFlow
+            }
+            let msg = errorCode ?? json["detail"] as? String ?? "HTTP \(http.statusCode)"
             throw OneloError.serverError(msg)
         }
 
@@ -569,7 +576,17 @@ public final class OneloAuth: ObservableObject {
         let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
 
         if http.statusCode >= 400 {
-            let msg = json["error"] as? String ?? json["detail"] as? String ?? "HTTP \(http.statusCode)"
+            let errorCode = json["error"] as? String
+                ?? (json["detail"] as? [String: Any])?["error"] as? String
+            if errorCode == "hosted_flow_required" {
+                let hint = json["hint"] as? String
+                    ?? (json["detail"] as? [String: Any])?["hint"] as? String
+                    ?? "Use OneloAuthView or presentHostedSignIn() — direct signIn/signUp is not available on the free plan."
+                print("[Onelo] ⚠️ hosted_flow_required: \(hint)")
+                print("[Onelo] 💡 Fix: switch to OneloAuthView in your UI, or upgrade your Onelo plan to enable a custom auth UI.")
+                throw OneloError.requiresHostedFlow
+            }
+            let msg = errorCode ?? json["detail"] as? String ?? "HTTP \(http.statusCode)"
             throw OneloError.serverError(msg)
         }
 
