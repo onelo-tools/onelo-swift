@@ -11,6 +11,12 @@ private final class WindowContextProvider: NSObject, ASWebAuthenticationPresenta
             .first { $0.isKeyWindow } ?? ASPresentationAnchor()
     }
 }
+#elseif os(macOS)
+private final class WindowContextProvider: NSObject, ASWebAuthenticationPresentationContextProviding {
+    func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
+        NSApplication.shared.keyWindow ?? NSApplication.shared.windows.first ?? ASPresentationAnchor()
+    }
+}
 #endif
 
 /// Drop-in SwiftUI authentication view.
@@ -439,7 +445,7 @@ private struct HostedSignInButton: View {
         errorMessage = nil
         defer { isLoading = false }
         do {
-            #if os(iOS)
+            #if os(iOS) || os(macOS)
             let context = WindowContextProvider()
             let session = try await oneloAuth.presentHostedSignIn(from: context)
             onSuccess?(session)
