@@ -1,5 +1,17 @@
 // Sources/OneloSwift/OneloAuthView.swift
 import SwiftUI
+import AuthenticationServices
+
+#if os(iOS)
+private final class WindowContextProvider: NSObject, ASWebAuthenticationPresentationContextProviding {
+    func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
+        UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .flatMap { $0.windows }
+            .first { $0.isKeyWindow } ?? ASPresentationAnchor()
+    }
+}
+#endif
 
 /// Drop-in SwiftUI authentication view.
 ///
@@ -55,12 +67,16 @@ public struct OneloAuthView: View {
                     }
                     .padding(.bottom, 32)
 
-                    // Active screen
-                    Group {
-                        switch vm.screen {
-                        case .signIn:         SignInScreen(vm: vm, config: effectiveConfig)
-                        case .signUp:         SignUpScreen(vm: vm, config: effectiveConfig)
-                        case .forgotPassword: ForgotPasswordScreen(vm: vm, config: effectiveConfig)
+                    // Free tier: hosted flow button; paid tier: inline form
+                    if !allowCustomBranding {
+                        HostedSignInButton(auth: auth, config: effectiveConfig, onSuccess: vm.onSuccess)
+                    } else {
+                        Group {
+                            switch vm.screen {
+                            case .signIn:         SignInScreen(vm: vm, config: effectiveConfig)
+                            case .signUp:         SignUpScreen(vm: vm, config: effectiveConfig)
+                            case .forgotPassword: ForgotPasswordScreen(vm: vm, config: effectiveConfig)
+                            }
                         }
                     }
 
@@ -373,5 +389,65 @@ private struct OneloFooter: View {
         }
         .font(.caption2)
         .buttonStyle(.plain)
+    }
+}
+
+// MARK: - Hosted Sign In Button (free tier)
+
+private struct HostedSignInButton: View {
+    let auth: any OneloAuthProtocol
+    let config: OneloAuthConfig
+    let onSuccess: ((OneloSession) -> Void)?
+
+    @State private var isLoading = false
+    @State private var errorMessage: String?
+
+    var body: some View {
+        VStack(spacing: 12) {
+            if isLoading {
+                ProgressView()
+                    .tint(config.accentColor)
+                    .frame(height: config.buttonHeight)
+            } else {
+                Button {
+                    Task { await signIn() }
+                } label: {
+                    Text("Sign In")
+                        .fontWeight(.semibold)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: config.buttonHeight)
+                        .background(config.accentColor)
+                        .foregroundStyle(config.buttonForegroundColor)
+                        .clipShape(RoundedRectangle(cornerRadius: config.cornerRadius))
+                }
+                .buttonStyle(.plain)
+            }
+
+            if let err = errorMessage {
+                Text(err)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .multilineTextAlignment(.center)
+            }
+        }
+    }
+
+    @MainActor
+    private func signIn() async {
+        guard let oneloAuth = auth as? OneloAuth else { return }
+        isLoading = true
+        errorMessage = nil
+        defer { isLoading = false }
+        do {
+            #if os(iOS)
+            let context = WindowContextProvider()
+            let session = try await oneloAuth.presentHostedSignIn(from: context)
+            onSuccess?(session)
+            #endif
+        } catch OneloError.cancelled {
+            // User dismissed — no error shown
+        } catch {
+            errorMessage = error.localizedDescription
+        }
     }
 }

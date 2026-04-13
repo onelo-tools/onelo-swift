@@ -1,6 +1,7 @@
 import Foundation
 import CommonCrypto
 import Supabase
+import AuthenticationServices
 
 /// OneloAuth — Swift SDK for Onelo authentication.
 ///
@@ -43,6 +44,106 @@ public final class OneloAuth: ObservableObject {
 
     // MARK: - Public API
 
+    @available(iOS 12.0, macOS 10.15, *)
+    public func presentHostedSignIn(
+        from context: ASWebAuthenticationPresentationContextProviding
+    ) async throws -> OneloSession {
+        let scheme = config.callbackScheme
+        guard !scheme.isEmpty else {
+            throw OneloError.serverError("callbackScheme must be set in OneloConfig to use presentHostedSignIn()")
+        }
+
+        isLoading = true
+        defer { isLoading = false }
+
+        // 1. Get one-time token + hosted URL
+        var components = URLComponents(url: config.apiUrl.appendingPathComponent("/api/sdk/auth/initiate"), resolvingAgainstBaseURL: false)!
+        components.queryItems = [
+            URLQueryItem(name: "key", value: config.publishableKey),
+            URLQueryItem(name: "callback_scheme", value: scheme),
+        ]
+        let (initData, initResponse) = try await URLSession.shared.data(from: components.url!)
+        guard let http = initResponse as? HTTPURLResponse, http.statusCode == 200 else {
+            throw OneloError.serverError("Failed to initiate hosted auth flow")
+        }
+        let initJson = (try? JSONSerialization.jsonObject(with: initData)) as? [String: Any] ?? [:]
+        guard
+            let hostedUrlString = initJson["hosted_url"] as? String,
+            let hostedUrl = URL(string: hostedUrlString)
+        else {
+            throw OneloError.serverError("Invalid initiate response")
+        }
+
+        // 2. Open hosted page via ASWebAuthenticationSession
+        let callbackUrl: URL = try await withCheckedThrowingContinuation { continuation in
+            let session = ASWebAuthenticationSession(
+                url: hostedUrl,
+                callbackURLScheme: scheme
+            ) { url, error in
+                if let error = error as? ASWebAuthenticationSessionError,
+                   error.code == .canceledLogin {
+                    continuation.resume(throwing: OneloError.cancelled)
+                    return
+                }
+                if let error {
+                    continuation.resume(throwing: OneloError.serverError(error.localizedDescription))
+                    return
+                }
+                guard let url else {
+                    continuation.resume(throwing: OneloError.serverError("No callback URL"))
+                    return
+                }
+                continuation.resume(returning: url)
+            }
+            session.presentationContextProvider = context
+            session.prefersEphemeralWebBrowserSession = false
+            session.start()
+        }
+
+        // 3. Extract code from callback URL
+        guard
+            let callbackComponents = URLComponents(url: callbackUrl, resolvingAgainstBaseURL: false),
+            let code = callbackComponents.queryItems?.first(where: { $0.name == "code" })?.value
+        else {
+            throw OneloError.serverError("No code in callback URL")
+        }
+
+        // 4. Exchange code for session
+        let exchangeBody: [String: String] = ["code": code, "publishableKey": config.publishableKey]
+        let exchangeUrl = config.apiUrl.appendingPathComponent("/api/sdk/auth/hosted-callback")
+        var request = URLRequest(url: exchangeUrl)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: exchangeBody)
+
+        let (exchangeData, exchangeResponse) = try await URLSession.shared.data(for: request)
+        guard let exchangeHttp = exchangeResponse as? HTTPURLResponse, exchangeHttp.statusCode == 200 else {
+            let json = (try? JSONSerialization.jsonObject(with: exchangeData)) as? [String: Any] ?? [:]
+            let msg = json["error"] as? String ?? "Code exchange failed"
+            throw OneloError.serverError(msg)
+        }
+
+        let json = (try? JSONSerialization.jsonObject(with: exchangeData)) as? [String: Any] ?? [:]
+        guard
+            let accessToken = json["access_token"] as? String,
+            let refreshToken = json["refresh_token"] as? String,
+            let expiresIn = json["expires_in"] as? Int,
+            let userData = json["user"] as? [String: Any],
+            let userId = userData["id"] as? String
+        else {
+            let msg = json["error"] as? String ?? "Invalid session response"
+            throw OneloError.serverError(msg)
+        }
+
+        let userEmail = userData["email"] as? String
+        let expiresAt = Date().addingTimeInterval(TimeInterval(expiresIn))
+        let user = OneloUser(id: userId, email: userEmail, role: .member, tenantId: nil)
+        let session = OneloSession(accessToken: accessToken, refreshToken: refreshToken, expiresAt: expiresAt, user: user)
+        try saveSession(session)
+        currentSession = session
+        return session
+    }
+
     /// Sign in — goes through Onelo backend to track last_seen_at and validate app access.
     public func signIn(email: String, password: String) async throws -> OneloSession {
         isLoading = true
@@ -74,6 +175,11 @@ public final class OneloAuth: ObservableObject {
             pkceVerifier = nil
             try await refreshPKCE()
             return try await _signInAttempt(email: email, password: password, isRetry: true)
+        }
+
+        // Surface hosted-flow-required as a typed error
+        if let errStr = json["error"] as? String, errStr == "hosted_flow_required" {
+            throw OneloError.requiresHostedFlow
         }
 
         guard

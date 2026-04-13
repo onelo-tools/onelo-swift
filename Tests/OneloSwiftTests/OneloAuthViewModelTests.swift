@@ -109,6 +109,16 @@ final class OneloAuthViewModelTests: XCTestCase {
         await vm.submitSignUp()
         XCTAssertNotNil(vm.errorMessage)
     }
+
+    func test_cancelled_error_has_description() {
+        let error = OneloError.cancelled
+        XCTAssertEqual(error.errorDescription, "Sign in was cancelled")
+    }
+
+    func test_requiresHostedFlow_error_has_description() {
+        let error = OneloError.requiresHostedFlow
+        XCTAssertNotNil(error.errorDescription)
+    }
 }
 
 // MARK: - Mock

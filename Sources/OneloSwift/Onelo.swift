@@ -22,6 +22,7 @@ public final class Onelo {
 
     public init(
         publishableKey: String,
+        callbackScheme: String = "",
         baseURL: URL = URL(string: "https://api.onelo.tools")!
     ) {
         let client = _OneloHTTPClient(publishableKey: publishableKey, baseURL: baseURL)
@@ -30,7 +31,11 @@ public final class Onelo {
         self.paywall = OneloPaywall(client: client)
         self.forms = OneloForms(client: client)
         self.waitlist = OneloWaitlist(client: client)
-        let oneloAuth = OneloAuth(config: OneloConfig(publishableKey: publishableKey))
+        let oneloAuth = OneloAuth(config: OneloConfig(
+            publishableKey: publishableKey,
+            apiUrl: baseURL,
+            callbackScheme: callbackScheme
+        ))
         self.auth = OneloAuthModule(auth: oneloAuth)
     }
 

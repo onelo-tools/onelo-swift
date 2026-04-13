@@ -1,7 +1,7 @@
 import Foundation
 
 public enum OneloSDK {
-    public static let sdkVersion = "2.2.0"
+    public static let sdkVersion = "2.3.0"
 }
 
 public enum UserRole: String, Codable, Sendable {
@@ -39,13 +39,17 @@ public struct OneloConfig: Sendable {
     public let publishableKey: String
     /// Override API base URL (default: https://api.onelo.tools)
     public let apiUrl: URL
+    /// Callback scheme for hosted auth flow (e.g., "myapp://")
+    public let callbackScheme: String
 
     public init(
         publishableKey: String,
-        apiUrl: URL = URL(string: "https://api.onelo.tools")!
+        apiUrl: URL = URL(string: "https://api.onelo.tools")!,
+        callbackScheme: String = ""
     ) {
         self.publishableKey = publishableKey
         self.apiUrl = apiUrl
+        self.callbackScheme = callbackScheme
     }
 }
 
@@ -80,6 +84,8 @@ public enum OneloError: LocalizedError, Sendable {
     case keychainError(String)
     case networkError(String)
     case serverError(String)
+    case cancelled
+    case requiresHostedFlow
 
     public var errorDescription: String? {
         switch self {
@@ -89,6 +95,8 @@ public enum OneloError: LocalizedError, Sendable {
         case .keychainError(let msg): return "Keychain error: \(msg)"
         case .networkError(let msg): return "Network error: \(msg)"
         case .serverError(let msg): return msg
+        case .cancelled: return "Sign in was cancelled"
+        case .requiresHostedFlow: return "This app requires the hosted sign-in flow. Use presentHostedSignIn()."
         }
     }
 }
