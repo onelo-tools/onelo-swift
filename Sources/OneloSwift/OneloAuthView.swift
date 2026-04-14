@@ -34,8 +34,9 @@ public struct OneloAuthView<Content: View>: View {
     @State private var allowCustomBranding: Bool = false
     @State private var isAuthenticated: Bool = false
     @State private var isReady: Bool = false
+    @State private var appName: String = "App"
+    @State private var appLogoUrl: URL? = nil
 
-    /// Returns the config to render. On free plan, enforces Onelo brand.
     private var effectiveConfig: OneloAuthConfig {
         allowCustomBranding ? requestedConfig : .oneloBranded
     }
@@ -44,8 +45,7 @@ public struct OneloAuthView<Content: View>: View {
     ///
     /// ```swift
     /// OneloAuthView(auth: auth) {
-    ///     ContentView()
-    ///         .environmentObject(auth)
+    ///     ContentView().environmentObject(auth)
     /// }
     /// ```
     public init(
@@ -64,12 +64,12 @@ public struct OneloAuthView<Content: View>: View {
             if isAuthenticated {
                 content()
             } else if !isReady {
-                // Wait for SDK config to load — prevents any flash before plan is known
                 effectiveConfig.backgroundColor.ignoresSafeArea()
+            } else if allowCustomBranding {
+                // Paid plan: inline form, matches hosted page design exactly
+                InlineAuthView(vm: vm, config: effectiveConfig, appName: appName, appLogoUrl: appLogoUrl)
             } else {
-                // Always use hosted flow — works on free and paid plans.
-                // On paid plans, "Powered by Onelo" branding is controlled via app settings.
-                // For a fully custom UI, use auth.signIn() / auth.signUp() directly.
+                // Free plan: open hosted page in browser
                 HostedSignInButton(auth: auth, config: effectiveConfig, onSuccess: nil)
             }
         }
@@ -81,9 +81,203 @@ public struct OneloAuthView<Content: View>: View {
         }
         .task {
             guard let oneloAuth = auth as? OneloAuth else { return }
-            for await value in oneloAuth.$isReady.values {
-                isReady = value
+            for await value in oneloAuth.$isReady.values { isReady = value }
+        }
+        .task {
+            guard let oneloAuth = auth as? OneloAuth else { return }
+            for await value in oneloAuth.$allowCustomBranding.values { allowCustomBranding = value }
+        }
+        .task {
+            guard let oneloAuth = auth as? OneloAuth else { return }
+            for await value in oneloAuth.$hostedAppName.values { appName = value }
+        }
+        .task {
+            guard let oneloAuth = auth as? OneloAuth else { return }
+            for await value in oneloAuth.$hostedAppLogoUrl.values { appLogoUrl = value }
+        }
+    }
+}
+
+// MARK: - Inline auth view (paid plan) — matches hosted page design
+
+private struct InlineAuthView: View {
+    @ObservedObject var vm: OneloAuthViewModel
+    let config: OneloAuthConfig
+    let appName: String
+    let appLogoUrl: URL?
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack {
+                config.backgroundColor.ignoresSafeArea()
+
+                ScrollView {
+                    VStack {
+                        Spacer(minLength: 0)
+
+                        VStack(spacing: 0) {
+                            // Logo
+                            Group {
+                                if let url = appLogoUrl {
+                                    AsyncImage(url: url) { phase in
+                                        if let img = phase.image {
+                                            img.resizable().scaledToFill()
+                                                .frame(width: 64, height: 64)
+                                                .clipShape(RoundedRectangle(cornerRadius: 14))
+                                        } else {
+                                            OneloLogoMark(size: 64)
+                                        }
+                                    }
+                                } else {
+                                    OneloLogoMark(size: 64)
+                                }
+                            }
+                            .padding(.bottom, 16)
+
+                            // Title — matches hosted page: "Sign in to AppName"
+                            (Text("Sign in to ")
+                                .foregroundStyle(config.textColor)
+                            + Text(appName)
+                                .foregroundStyle(oneloOrange))
+                            .font(.title2.bold())
+                            .multilineTextAlignment(.center)
+                            .padding(.bottom, 6)
+
+                            Text("Secure authentication powered by Onelo")
+                                .font(.subheadline)
+                                .foregroundStyle(config.subtitleColor)
+                                .multilineTextAlignment(.center)
+                                .padding(.bottom, 32)
+
+                            // Form
+                            switch vm.screen {
+                            case .signIn:
+                                InlineSignInForm(vm: vm, config: config)
+                            case .signUp:
+                                InlineSignUpForm(vm: vm, config: config)
+                            case .forgotPassword:
+                                InlineForgotPasswordForm(vm: vm, config: config)
+                            }
+                        }
+                        .padding(.horizontal, 32)
+                        .frame(maxWidth: 420)
+
+                        Spacer(minLength: 0)
+                    }
+                    .frame(minHeight: geo.size.height)
+                    .frame(maxWidth: .infinity)
+                }
+
+                // Footer pinned bottom-center
+                VStack {
+                    Spacer()
+                    OneloFooter()
+                        .padding(.bottom, 20)
+                }
             }
+            .frame(width: geo.size.width, height: geo.size.height)
+        }
+    }
+}
+
+private struct InlineSignInForm: View {
+    @ObservedObject var vm: OneloAuthViewModel
+    let config: OneloAuthConfig
+
+    var body: some View {
+        VStack(spacing: config.itemSpacing) {
+            AuthTextField("you@example.com", text: $vm.email, config: config)
+            AuthSecureField("Password", text: $vm.password, config: config)
+
+            if let err = vm.errorMessage {
+                Text(err).font(.caption).foregroundStyle(.red)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            AuthButton("Sign In", config: config, isLoading: vm.isLoading) {
+                Task { await vm.submitSignIn() }
+            }
+            .padding(.top, 4)
+
+            HStack(spacing: 4) {
+                Text("Don't have an account?").foregroundStyle(config.subtitleColor)
+                Button("Sign up") { vm.showSignUp() }
+                    .buttonStyle(.plain).foregroundStyle(config.accentColor)
+            }
+            .font(.subheadline)
+            .padding(.top, 4)
+        }
+    }
+}
+
+private struct InlineSignUpForm: View {
+    @ObservedObject var vm: OneloAuthViewModel
+    let config: OneloAuthConfig
+
+    var body: some View {
+        VStack(spacing: config.itemSpacing) {
+            AuthTextField("you@example.com", text: $vm.email, config: config)
+            AuthSecureField("Password", text: $vm.password, config: config)
+            AuthSecureField("Confirm password", text: $vm.confirmPassword, config: config)
+
+            if let err = vm.errorMessage {
+                Text(err).font(.caption).foregroundStyle(.red)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            if vm.signUpVerificationSent {
+                Text("Check your email to verify your account.")
+                    .font(.subheadline).foregroundStyle(.green)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            AuthButton("Create Account", config: config, isLoading: vm.isLoading) {
+                Task { await vm.submitSignUp() }
+            }
+            .padding(.top, 4)
+
+            HStack(spacing: 4) {
+                Text("Already have an account?").foregroundStyle(config.subtitleColor)
+                Button("Sign in") { vm.showSignIn() }
+                    .buttonStyle(.plain).foregroundStyle(config.accentColor)
+            }
+            .font(.subheadline)
+            .padding(.top, 4)
+        }
+    }
+}
+
+private struct InlineForgotPasswordForm: View {
+    @ObservedObject var vm: OneloAuthViewModel
+    let config: OneloAuthConfig
+
+    var body: some View {
+        VStack(spacing: config.itemSpacing) {
+            Text("Enter your email and we'll send you a reset link.")
+                .font(.subheadline).foregroundStyle(config.subtitleColor)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.bottom, 4)
+
+            if vm.forgotPasswordSent {
+                Text("Check your email for the reset link.")
+                    .font(.subheadline).foregroundStyle(.green)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                AuthTextField("you@example.com", text: $vm.email, config: config)
+
+                if let err = vm.errorMessage {
+                    Text(err).font(.caption).foregroundStyle(.red)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                AuthButton("Send Reset Link", config: config, isLoading: vm.isLoading) {
+                    Task { await vm.submitForgotPassword() }
+                }
+                .padding(.top, 4)
+            }
+
+            Button("Back to sign in") { vm.showSignIn() }
+                .buttonStyle(.plain).font(.subheadline).foregroundStyle(config.accentColor)
+                .padding(.top, 4)
         }
     }
 }
@@ -372,7 +566,7 @@ private struct AuthButton: View {
 
 private let oneloOrange = Color(red: 0.976, green: 0.451, blue: 0.086) // #f97316
 
-// MARK: - Onelo Logo
+// MARK: - Onelo Logo (with dark background — used in hosted flow button)
 
 private struct OneloLogo: View {
     var size: CGFloat = 56
@@ -380,15 +574,24 @@ private struct OneloLogo: View {
     var body: some View {
         ZStack {
             RoundedRectangle(cornerRadius: size * 0.22)
-                .fill(Color(red: 0.067, green: 0.067, blue: 0.067)) // #111111
+                .fill(Color(red: 0.067, green: 0.067, blue: 0.067))
                 .frame(width: size, height: size)
-
-            Image("onelo-logo-white", bundle: .module)
-                .resizable()
-                .scaledToFit()
-                .frame(width: size * 0.72, height: size * 0.72)
+            OneloLogoMark(size: size * 0.72)
         }
         .frame(width: size, height: size)
+    }
+}
+
+// MARK: - Onelo Logo Mark (just the white symbol, no background)
+
+private struct OneloLogoMark: View {
+    var size: CGFloat = 56
+
+    var body: some View {
+        Image("onelo-logo-white", bundle: .module)
+            .resizable()
+            .scaledToFit()
+            .frame(width: size, height: size)
     }
 }
 
