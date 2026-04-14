@@ -26,35 +26,45 @@ private final class WindowContextProvider: NSObject, ASWebAuthenticationPresenta
 ///     // user signed in
 /// }
 /// ```
-public struct OneloAuthView: View {
+public struct OneloAuthView<Content: View>: View {
     @StateObject private var vm: OneloAuthViewModel
     private let requestedConfig: OneloAuthConfig
     private let auth: any OneloAuthProtocol
+    private let content: () -> Content
     @State private var allowCustomBranding: Bool = false
+    @State private var isAuthenticated: Bool = false
 
     /// Returns the config to render. On free plan, enforces Onelo brand.
     private var effectiveConfig: OneloAuthConfig {
-        if !allowCustomBranding {
-            return .oneloBranded
-        }
-        return requestedConfig
+        allowCustomBranding ? requestedConfig : .oneloBranded
     }
 
+    /// Create an auth view. The `content` closure is shown after successful sign-in.
+    ///
+    /// ```swift
+    /// OneloAuthView(auth: auth) {
+    ///     ContentView()
+    ///         .environmentObject(auth)
+    /// }
+    /// ```
     public init(
         auth: any OneloAuthProtocol,
         config: OneloAuthConfig = .default,
-        onSuccess: @escaping (OneloSession) -> Void
+        @ViewBuilder content: @escaping () -> Content
     ) {
-        _vm = StateObject(wrappedValue: OneloAuthViewModel(auth: auth, onSuccess: onSuccess))
+        self.content = content
         self.requestedConfig = config
         self.auth = auth
+        _vm = StateObject(wrappedValue: OneloAuthViewModel(auth: auth, onSuccess: nil))
     }
 
     public var body: some View {
         Group {
-            if !allowCustomBranding {
+            if isAuthenticated {
+                content()
+            } else if !allowCustomBranding {
                 // Free tier: full-screen branded hosted flow
-                HostedSignInButton(auth: auth, config: effectiveConfig, onSuccess: vm.onSuccess)
+                HostedSignInButton(auth: auth, config: effectiveConfig, onSuccess: nil)
             } else {
                 // Paid tier: inline customisable form
                 ZStack {
@@ -96,6 +106,13 @@ public struct OneloAuthView: View {
                         .padding(effectiveConfig.contentPadding)
                     }
                 }
+            }
+        }
+        .task {
+            guard let oneloAuth = auth as? OneloAuth else { return }
+            // Observe session — switch to content view on sign-in, back to auth on sign-out
+            for await session in oneloAuth.$currentSession.values {
+                isAuthenticated = session != nil
             }
         }
         .task {
