@@ -140,7 +140,7 @@ public struct OneloAuthView<Content: View>: View {
 
 // MARK: - Embedded web auth view (WKWebView)
 
-private final class WebAuthCoordinator: NSObject, WKNavigationDelegate {
+private final class WebAuthCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
     let callbackScheme: String
     let onCode: (String) -> Void
     let onError: (String) -> Void
@@ -160,6 +160,7 @@ private final class WebAuthCoordinator: NSObject, WKNavigationDelegate {
             decisionHandler(.allow)
             return
         }
+        // Intercept auth callback
         if url.scheme?.lowercased() == callbackScheme.lowercased() {
             let code = URLComponents(url: url, resolvingAgainstBaseURL: false)?
                 .queryItems?.first(where: { $0.name == "code" })?.value
@@ -169,9 +170,38 @@ private final class WebAuthCoordinator: NSObject, WKNavigationDelegate {
                 DispatchQueue.main.async { self.onError("Auth callback missing code parameter") }
             }
             decisionHandler(.cancel)
-        } else {
-            decisionHandler(.allow)
+            return
         }
+        // Open external links (e.g. onelo.tools) in the system browser
+        if navigationAction.navigationType == .linkActivated,
+           let scheme = url.scheme, (scheme == "https" || scheme == "http"),
+           url.host != webView.url?.host {
+            #if os(macOS)
+            NSWorkspace.shared.open(url)
+            #elseif os(iOS)
+            UIApplication.shared.open(url)
+            #endif
+            decisionHandler(.cancel)
+            return
+        }
+        decisionHandler(.allow)
+    }
+
+    // Handle target="_blank" links — open in system browser instead of new WKWebView
+    func webView(
+        _ webView: WKWebView,
+        createWebViewWith configuration: WKWebViewConfiguration,
+        for navigationAction: WKNavigationAction,
+        windowFeatures: WKWindowFeatures
+    ) -> WKWebView? {
+        if let url = navigationAction.request.url {
+            #if os(macOS)
+            NSWorkspace.shared.open(url)
+            #elseif os(iOS)
+            UIApplication.shared.open(url)
+            #endif
+        }
+        return nil
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
@@ -201,6 +231,7 @@ private struct EmbeddedWebAuthView: NSViewRepresentable {
     func makeNSView(context: Context) -> WKWebView {
         let webView = WKWebView()
         webView.navigationDelegate = context.coordinator
+        webView.uiDelegate = context.coordinator
         webView.load(URLRequest(url: url))
         return webView
     }
@@ -228,6 +259,7 @@ private struct EmbeddedWebAuthView: UIViewRepresentable {
     func makeUIView(context: Context) -> WKWebView {
         let webView = WKWebView()
         webView.navigationDelegate = context.coordinator
+        webView.uiDelegate = context.coordinator
         webView.load(URLRequest(url: url))
         return webView
     }
