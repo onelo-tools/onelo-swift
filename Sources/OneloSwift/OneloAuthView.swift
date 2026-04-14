@@ -33,6 +33,7 @@ public struct OneloAuthView<Content: View>: View {
     private let content: () -> Content
     @State private var allowCustomBranding: Bool = false
     @State private var isAuthenticated: Bool = false
+    @State private var isReady: Bool = false
 
     /// Returns the config to render. On free plan, enforces Onelo brand.
     private var effectiveConfig: OneloAuthConfig {
@@ -62,6 +63,9 @@ public struct OneloAuthView<Content: View>: View {
         Group {
             if isAuthenticated {
                 content()
+            } else if !isReady {
+                // Wait for SDK to resolve plan before showing any auth UI (prevents flash)
+                effectiveConfig.backgroundColor.ignoresSafeArea()
             } else if !allowCustomBranding {
                 // Free tier: full-screen branded hosted flow
                 HostedSignInButton(auth: auth, config: effectiveConfig, onSuccess: nil)
@@ -119,6 +123,12 @@ public struct OneloAuthView<Content: View>: View {
             guard let oneloAuth = auth as? OneloAuth else { return }
             for await value in oneloAuth.$allowCustomBranding.values {
                 allowCustomBranding = value
+            }
+        }
+        .task {
+            guard let oneloAuth = auth as? OneloAuth else { return }
+            for await value in oneloAuth.$isReady.values {
+                isReady = value
             }
         }
     }

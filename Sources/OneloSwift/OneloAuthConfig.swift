@@ -46,11 +46,11 @@ public struct OneloAuthConfig {
 
     // MARK: - Presets
 
-    /// Onelo brand indigo (#6366f1)
-    private static let oneloIndigo = Color(red: 99/255, green: 102/255, blue: 241/255)
+    /// Onelo brand orange (#f97316)
+    private static let oneloOrange = Color(red: 249/255, green: 115/255, blue: 22/255)
 
     public init(
-        accentColor: Color = Color(red: 99/255, green: 102/255, blue: 241/255),
+        accentColor: Color = Color(red: 249/255, green: 115/255, blue: 22/255),
         backgroundColor: Color = {
             #if canImport(UIKit)
             return Color(uiColor: .systemBackground)
@@ -101,7 +101,7 @@ public struct OneloAuthConfig {
     /// Locked Onelo brand config used automatically on free plan.
     /// Identical to `.default` — exists so the intent is explicit in code.
     public static let oneloBranded = OneloAuthConfig(
-        accentColor: Self.oneloIndigo,
+        accentColor: Self.oneloOrange,
         buttonForegroundColor: .white,
         inputBorderColor: Color.primary.opacity(0.1),
         inputBorderWidth: 1
