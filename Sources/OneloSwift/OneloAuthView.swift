@@ -205,7 +205,14 @@ private struct EmbeddedWebAuthView: NSViewRepresentable {
         return webView
     }
 
-    func updateNSView(_ nsView: WKWebView, context: Context) {}
+    func updateNSView(_ nsView: WKWebView, context: Context) {
+        // Let the window title bar follow the system appearance (dark/light mode)
+        // rather than being stuck at whatever the default window color is.
+        DispatchQueue.main.async {
+            guard let window = nsView.window else { return }
+            window.appearance = nil // follow system
+        }
+    }
 }
 #elseif os(iOS)
 private struct EmbeddedWebAuthView: UIViewRepresentable {
