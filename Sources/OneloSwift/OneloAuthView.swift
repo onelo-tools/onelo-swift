@@ -70,45 +70,64 @@ public struct OneloAuthView<Content: View>: View {
                 // Free tier: full-screen branded hosted flow
                 HostedSignInButton(auth: auth, config: effectiveConfig, onSuccess: nil)
             } else {
-                // Paid tier: inline customisable form
-                ZStack {
-                    effectiveConfig.backgroundColor.ignoresSafeArea()
+                // Paid tier: inline customisable form — centered card layout
+                GeometryReader { geo in
+                    ZStack {
+                        effectiveConfig.backgroundColor.ignoresSafeArea()
 
-                    ScrollView {
-                        VStack(spacing: 0) {
-                            VStack(spacing: 8) {
-                                if let logo = effectiveConfig.appLogo {
-                                    logo
-                                        .resizable()
-                                        .scaledToFit()
-                                        .frame(width: 56, height: 56)
-                                        .clipShape(RoundedRectangle(cornerRadius: effectiveConfig.cornerRadius))
+                        ScrollView {
+                            VStack {
+                                Spacer(minLength: 0)
+
+                                VStack(spacing: 0) {
+                                    // Logo + app name
+                                    VStack(spacing: 12) {
+                                        if let logo = effectiveConfig.appLogo {
+                                            logo
+                                                .resizable()
+                                                .scaledToFit()
+                                                .frame(width: 64, height: 64)
+                                                .clipShape(RoundedRectangle(cornerRadius: 14))
+                                        } else {
+                                            OneloLogo(size: 64)
+                                        }
+                                        if !effectiveConfig.appName.isEmpty {
+                                            Text(effectiveConfig.appName)
+                                                .font(.title3.bold())
+                                                .foregroundStyle(effectiveConfig.textColor)
+                                        }
+                                    }
+                                    .padding(.bottom, 32)
+
+                                    Group {
+                                        switch vm.screen {
+                                        case .signIn:         SignInScreen(vm: vm, config: effectiveConfig)
+                                        case .signUp:         SignUpScreen(vm: vm, config: effectiveConfig)
+                                        case .forgotPassword: ForgotPasswordScreen(vm: vm, config: effectiveConfig)
+                                        }
+                                    }
                                 }
-                                if !effectiveConfig.appName.isEmpty {
-                                    Text(effectiveConfig.appName)
-                                        .font(.headline)
-                                        .foregroundStyle(effectiveConfig.textColor)
-                                }
+                                .padding(effectiveConfig.contentPadding)
+                                .frame(maxWidth: 400)
+
+                                Spacer(minLength: 0)
                             }
-                            .padding(.bottom, 32)
+                            .frame(minHeight: geo.size.height)
+                            .frame(maxWidth: .infinity)
+                        }
 
-                            Group {
-                                switch vm.screen {
-                                case .signIn:         SignInScreen(vm: vm, config: effectiveConfig)
-                                case .signUp:         SignUpScreen(vm: vm, config: effectiveConfig)
-                                case .forgotPassword: ForgotPasswordScreen(vm: vm, config: effectiveConfig)
-                                }
-                            }
-
-                            Spacer(minLength: 32)
-
+                        // Footer pinned to bottom-left
+                        VStack {
+                            Spacer()
                             HStack {
                                 OneloFooter()
                                 Spacer()
                             }
+                            .padding(.horizontal, effectiveConfig.contentPadding.leading)
+                            .padding(.bottom, 20)
                         }
-                        .padding(effectiveConfig.contentPadding)
                     }
+                    .frame(width: geo.size.width, height: geo.size.height)
                 }
             }
         }
@@ -443,8 +462,12 @@ private struct OneloLogo: View {
 private struct OneloFooter: View {
     var body: some View {
         Link(destination: URL(string: "https://onelo.tools")!) {
-            HStack(spacing: 5) {
-                OneloLogo(size: 16)
+            HStack(spacing: 4) {
+                Image("onelo-logo-white", bundle: .module)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 12, height: 12)
+                    .opacity(0.4)
                 Text("Powered by ")
                     .foregroundStyle(Color.primary.opacity(0.35))
                 + Text("Onelo")
