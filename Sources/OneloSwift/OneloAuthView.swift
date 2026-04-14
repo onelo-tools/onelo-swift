@@ -31,15 +31,11 @@ public struct OneloAuthView<Content: View>: View {
     private let requestedConfig: OneloAuthConfig
     private let auth: any OneloAuthProtocol
     private let content: () -> Content
-    @State private var allowCustomBranding: Bool = false
     @State private var isAuthenticated: Bool = false
     @State private var isReady: Bool = false
-    @State private var appName: String = "App"
-    @State private var appLogoUrl: URL? = nil
+    @State private var authError: String? = nil
 
-    private var effectiveConfig: OneloAuthConfig {
-        allowCustomBranding ? requestedConfig : .oneloBranded
-    }
+    private var effectiveConfig: OneloAuthConfig { requestedConfig }
 
     /// Create an auth view. The `content` closure is shown after successful sign-in.
     ///
@@ -63,14 +59,37 @@ public struct OneloAuthView<Content: View>: View {
         Group {
             if isAuthenticated {
                 content()
-            } else if !isReady {
-                effectiveConfig.backgroundColor.ignoresSafeArea()
-            } else if allowCustomBranding {
-                // Paid plan: inline form, matches hosted page design exactly
-                InlineAuthView(vm: vm, config: effectiveConfig, appName: appName, appLogoUrl: appLogoUrl)
             } else {
-                // Free plan: open hosted page in browser
-                HostedSignInButton(auth: auth, config: effectiveConfig, onSuccess: nil)
+                // Background while hosted flow is open (or loading)
+                ZStack {
+                    effectiveConfig.backgroundColor.ignoresSafeArea()
+
+                    if let err = authError {
+                        // User cancelled or error — show retry button
+                        VStack(spacing: 16) {
+                            if err != "cancelled" {
+                                Text(err)
+                                    .font(.caption)
+                                    .foregroundStyle(.red)
+                                    .multilineTextAlignment(.center)
+                            }
+                            Button("Sign In") {
+                                authError = nil
+                                Task { await launchHostedFlow() }
+                            }
+                            .buttonStyle(.plain)
+                            .font(.headline)
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 32)
+                            .padding(.vertical, 12)
+                            .background(oneloOrange)
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                        }
+                    } else if isReady {
+                        ProgressView()
+                            .tint(.white.opacity(0.3))
+                    }
+                }
             }
         }
         .task {
@@ -81,19 +100,27 @@ public struct OneloAuthView<Content: View>: View {
         }
         .task {
             guard let oneloAuth = auth as? OneloAuth else { return }
-            for await value in oneloAuth.$isReady.values { isReady = value }
+            for await value in oneloAuth.$isReady.values {
+                isReady = value
+                if value && !isAuthenticated {
+                    await launchHostedFlow()
+                }
+            }
         }
-        .task {
-            guard let oneloAuth = auth as? OneloAuth else { return }
-            for await value in oneloAuth.$allowCustomBranding.values { allowCustomBranding = value }
-        }
-        .task {
-            guard let oneloAuth = auth as? OneloAuth else { return }
-            for await value in oneloAuth.$hostedAppName.values { appName = value }
-        }
-        .task {
-            guard let oneloAuth = auth as? OneloAuth else { return }
-            for await value in oneloAuth.$hostedAppLogoUrl.values { appLogoUrl = value }
+    }
+
+    @MainActor
+    private func launchHostedFlow() async {
+        guard let oneloAuth = auth as? OneloAuth else { return }
+        do {
+            #if os(iOS) || os(macOS)
+            let context = WindowContextProvider()
+            _ = try await oneloAuth.presentHostedSignIn(from: context)
+            #endif
+        } catch OneloError.cancelled {
+            authError = "cancelled"
+        } catch {
+            authError = error.localizedDescription
         }
     }
 }
