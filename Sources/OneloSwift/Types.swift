@@ -1,7 +1,7 @@
 import Foundation
 
 public enum OneloSDK {
-    public static let sdkVersion = "2.1.0"
+    public static let sdkVersion = "3.3.0-staging"
 }
 
 public enum UserRole: String, Codable, Sendable {
@@ -37,15 +37,21 @@ public struct OneloSession: Sendable {
 public struct OneloConfig: Sendable {
     /// Publishable key from Onelo dashboard (onelo_pk_live_...)
     public let publishableKey: String
-    /// Override API base URL (default: https://api.onelo.tools)
+    /// API base URL — pre-filled by the Onelo dashboard snippet. No default; must be set explicitly.
     public let apiUrl: URL
+    /// Custom URL scheme registered in your app target (e.g. "myapp").
+    /// Must match the scheme registered via `app.setAsDefaultProtocolClient` (Electron)
+    /// or Info.plist URL Types (Swift).
+    public let callbackScheme: String
 
     public init(
         publishableKey: String,
-        apiUrl: URL = URL(string: "https://api.onelo.tools")!
+        apiUrl: URL,
+        callbackScheme: String
     ) {
         self.publishableKey = publishableKey
         self.apiUrl = apiUrl
+        self.callbackScheme = callbackScheme
     }
 }
 
@@ -69,6 +75,12 @@ public enum OneloError: LocalizedError, Sendable {
     case keychainError(String)
     case networkError(String)
     case serverError(String)
+    /// User dismissed the auth window without signing in.
+    case cancelled
+    /// App is on the Free plan — direct signIn()/signUp() calls are not allowed.
+    case hostedFlowRequired
+    /// User account has been suspended or deleted by an admin.
+    case userRevoked
 
     public var errorDescription: String? {
         switch self {
@@ -78,6 +90,9 @@ public enum OneloError: LocalizedError, Sendable {
         case .keychainError(let msg): return "Keychain error: \(msg)"
         case .networkError(let msg): return "Network error: \(msg)"
         case .serverError(let msg): return msg
+        case .cancelled: return "Authentication was cancelled"
+        case .hostedFlowRequired: return "This plan requires the hosted auth flow"
+        case .userRevoked: return "Your account has been deactivated"
         }
     }
 }

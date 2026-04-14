@@ -17,6 +17,10 @@ public final class OneloAuth: ObservableObject {
     @Published public private(set) var isRevoked: Bool = false
     /// Set when the user account has been deleted or suspended by an admin.
     @Published public private(set) var isUserRevoked: Bool = false
+    /// App name returned by /api/sdk/auth/initiate (populated after hosted flow is initiated).
+    @Published public private(set) var hostedAppName: String = ""
+    /// App logo URL returned by /api/sdk/auth/initiate.
+    @Published public private(set) var hostedAppLogoUrl: URL? = nil
 
     private var client: AuthClient?
     private let keychain: KeychainStorage
@@ -150,6 +154,64 @@ public final class OneloAuth: ObservableObject {
         }
 
         return true
+    }
+
+    // MARK: - Hosted flow (WKWebView)
+
+    /// Calls /api/sdk/auth/initiate and returns the URL to load in the embedded web view.
+    /// Also populates `hostedAppName` and `hostedAppLogoUrl`.
+    public func initiateHostedFlow() async throws -> URL {
+        var components = URLComponents(url: config.apiUrl.appendingPathComponent("/api/sdk/auth/initiate"), resolvingAgainstBaseURL: false)!
+        components.queryItems = [
+            URLQueryItem(name: "key", value: config.publishableKey),
+            URLQueryItem(name: "callback_scheme", value: config.callbackScheme),
+        ]
+
+        let (data, response) = try await URLSession.shared.data(from: components.url!)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw OneloError.serverError("Failed to initiate hosted flow")
+        }
+
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let hostedUrlStr = json["hosted_url"] as? String,
+              let hostedUrl = URL(string: hostedUrlStr) else {
+            throw OneloError.serverError("Invalid initiate response")
+        }
+
+        hostedAppName = json["app_name"] as? String ?? ""
+        if let logoStr = json["app_logo_url"] as? String {
+            hostedAppLogoUrl = URL(string: logoStr)
+        }
+
+        return hostedUrl
+    }
+
+    /// Exchanges the auth code returned by the hosted page for a session.
+    public func exchangeHostedCode(_ code: String) async throws -> OneloSession {
+        let json = try await backendPost(
+            path: "/api/sdk/auth/hosted-callback",
+            body: ["code": code, "publishableKey": config.publishableKey]
+        )
+
+        // hosted-callback returns tokens at the top level (not nested under "session")
+        guard
+            let accessToken = json["access_token"] as? String,
+            let refreshToken = json["refresh_token"] as? String,
+            let expiresIn = json["expires_in"] as? Int,
+            let userData = json["user"] as? [String: Any],
+            let userId = userData["id"] as? String
+        else {
+            let msg = json["error"] as? String ?? "Code exchange failed"
+            throw OneloError.serverError(msg)
+        }
+
+        let userEmail = userData["email"] as? String
+        let expiresAt = Date().addingTimeInterval(TimeInterval(expiresIn))
+        let user = OneloUser(id: userId, email: userEmail, role: .member, tenantId: nil)
+        let session = OneloSession(accessToken: accessToken, refreshToken: refreshToken, expiresAt: expiresAt, user: user)
+        try saveSession(session)
+        currentSession = session
+        return session
     }
 
     public func signOut() async throws {
