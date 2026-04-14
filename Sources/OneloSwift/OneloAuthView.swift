@@ -58,6 +58,7 @@ public struct OneloAuthView<Content: View>: View {
                         showRetry = true
                     }
                 )
+                .frame(minWidth: 440, minHeight: 680)
                 .ignoresSafeArea()
             } else {
                 // Loading state or retry after cancel/error
