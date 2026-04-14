@@ -37,14 +37,14 @@ public struct OneloSession: Sendable {
 public struct OneloConfig: Sendable {
     /// Publishable key from Onelo dashboard (onelo_pk_live_...)
     public let publishableKey: String
-    /// Override API base URL (default: https://api.onelo.tools)
+    /// Onelo API base URL — required. Get this from your Onelo dashboard snippet.
     public let apiUrl: URL
     /// Callback scheme for hosted auth flow (e.g., "myapp://")
     public let callbackScheme: String
 
     public init(
         publishableKey: String,
-        apiUrl: URL = URL(string: "https://api.onelo.tools")!,
+        apiUrl: URL,
         callbackScheme: String = ""
     ) {
         self.publishableKey = publishableKey

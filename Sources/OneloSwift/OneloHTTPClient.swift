@@ -7,7 +7,7 @@ final class _OneloHTTPClient: Sendable {
     let baseURL: URL
     nonisolated(unsafe) var userPlan: String?
 
-    init(publishableKey: String, baseURL: URL = URL(string: "https://api.onelo.tools")!) {
+    init(publishableKey: String, baseURL: URL) {
         self.publishableKey = publishableKey
         self.baseURL = baseURL
     }

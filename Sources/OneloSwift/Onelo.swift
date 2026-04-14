@@ -23,7 +23,7 @@ public final class Onelo {
     public init(
         publishableKey: String,
         callbackScheme: String = "",
-        baseURL: URL = URL(string: "https://api.onelo.tools")!
+        baseURL: URL
     ) {
         let client = _OneloHTTPClient(publishableKey: publishableKey, baseURL: baseURL)
         self.httpClient = client
