@@ -1,23 +1,6 @@
 // Sources/OneloSwift/OneloAuthView.swift
 import SwiftUI
-import AuthenticationServices
-
-#if os(iOS)
-private final class WindowContextProvider: NSObject, ASWebAuthenticationPresentationContextProviding {
-    func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
-        UIApplication.shared.connectedScenes
-            .compactMap { $0 as? UIWindowScene }
-            .flatMap { $0.windows }
-            .first { $0.isKeyWindow } ?? ASPresentationAnchor()
-    }
-}
-#elseif os(macOS)
-private final class WindowContextProvider: NSObject, ASWebAuthenticationPresentationContextProviding {
-    func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
-        NSApplication.shared.keyWindow ?? NSApplication.shared.windows.first ?? ASPresentationAnchor()
-    }
-}
-#endif
+import WebKit
 
 /// Drop-in SwiftUI authentication view.
 ///
@@ -33,7 +16,9 @@ public struct OneloAuthView<Content: View>: View {
     private let content: () -> Content
     @State private var isAuthenticated: Bool = false
     @State private var isReady: Bool = false
-    @State private var authError: String? = nil
+    @State private var hostedUrl: URL? = nil
+    @State private var showRetry: Bool = false
+    @State private var errorMessage: String? = nil
 
     private var effectiveConfig: OneloAuthConfig { requestedConfig }
 
@@ -59,23 +44,38 @@ public struct OneloAuthView<Content: View>: View {
         Group {
             if isAuthenticated {
                 content()
+            } else if let url = hostedUrl, !showRetry {
+                // Hosted page embedded in the app window via WKWebView
+                EmbeddedWebAuthView(
+                    url: url,
+                    callbackScheme: callbackScheme,
+                    onCode: { code in
+                        Task { await handleCode(code) }
+                    },
+                    onError: { err in
+                        hostedUrl = nil
+                        errorMessage = err
+                        showRetry = true
+                    }
+                )
+                .ignoresSafeArea()
             } else {
-                // Background while hosted flow is open (or loading)
+                // Loading state or retry after cancel/error
                 ZStack {
                     effectiveConfig.backgroundColor.ignoresSafeArea()
 
-                    if let err = authError {
-                        // User cancelled or error — show retry button
+                    if showRetry {
                         VStack(spacing: 16) {
-                            if err != "cancelled" {
+                            if let err = errorMessage {
                                 Text(err)
                                     .font(.caption)
                                     .foregroundStyle(.red)
                                     .multilineTextAlignment(.center)
                             }
                             Button("Sign In") {
-                                authError = nil
-                                Task { await launchHostedFlow() }
+                                showRetry = false
+                                errorMessage = nil
+                                Task { await loadHostedUrl() }
                             }
                             .buttonStyle(.plain)
                             .font(.headline)
@@ -103,27 +103,130 @@ public struct OneloAuthView<Content: View>: View {
             for await value in oneloAuth.$isReady.values {
                 isReady = value
                 if value && !isAuthenticated {
-                    await launchHostedFlow()
+                    await loadHostedUrl()
                 }
             }
         }
     }
 
+    private var callbackScheme: String {
+        (auth as? OneloAuth)?.config.callbackScheme ?? ""
+    }
+
     @MainActor
-    private func launchHostedFlow() async {
+    private func loadHostedUrl() async {
         guard let oneloAuth = auth as? OneloAuth else { return }
         do {
-            #if os(iOS) || os(macOS)
-            let context = WindowContextProvider()
-            _ = try await oneloAuth.presentHostedSignIn(from: context)
-            #endif
-        } catch OneloError.cancelled {
-            authError = "cancelled"
+            hostedUrl = try await oneloAuth.initiateHostedFlow()
         } catch {
-            authError = error.localizedDescription
+            errorMessage = error.localizedDescription
+            showRetry = true
+        }
+    }
+
+    @MainActor
+    private func handleCode(_ code: String) async {
+        guard let oneloAuth = auth as? OneloAuth else { return }
+        do {
+            _ = try await oneloAuth.exchangeHostedCode(code)
+        } catch {
+            hostedUrl = nil
+            errorMessage = error.localizedDescription
+            showRetry = true
         }
     }
 }
+
+// MARK: - Embedded web auth view (WKWebView)
+
+private final class WebAuthCoordinator: NSObject, WKNavigationDelegate {
+    let callbackScheme: String
+    let onCode: (String) -> Void
+    let onError: (String) -> Void
+
+    init(callbackScheme: String, onCode: @escaping (String) -> Void, onError: @escaping (String) -> Void) {
+        self.callbackScheme = callbackScheme
+        self.onCode = onCode
+        self.onError = onError
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        decidePolicyFor navigationAction: WKNavigationAction,
+        decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+    ) {
+        guard let url = navigationAction.request.url else {
+            decisionHandler(.allow)
+            return
+        }
+        if url.scheme?.lowercased() == callbackScheme.lowercased() {
+            let code = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                .queryItems?.first(where: { $0.name == "code" })?.value
+            if let code {
+                DispatchQueue.main.async { self.onCode(code) }
+            } else {
+                DispatchQueue.main.async { self.onError("Auth callback missing code parameter") }
+            }
+            decisionHandler(.cancel)
+        } else {
+            decisionHandler(.allow)
+        }
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        let nsError = error as NSError
+        guard nsError.domain != "WebKitErrorDomain" else { return }
+        DispatchQueue.main.async { self.onError(error.localizedDescription) }
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        let nsError = error as NSError
+        guard nsError.domain != "WebKitErrorDomain" else { return }
+        DispatchQueue.main.async { self.onError(error.localizedDescription) }
+    }
+}
+
+#if os(macOS)
+private struct EmbeddedWebAuthView: NSViewRepresentable {
+    let url: URL
+    let callbackScheme: String
+    let onCode: (String) -> Void
+    let onError: (String) -> Void
+
+    func makeCoordinator() -> WebAuthCoordinator {
+        WebAuthCoordinator(callbackScheme: callbackScheme, onCode: onCode, onError: onError)
+    }
+
+    func makeNSView(context: Context) -> WKWebView {
+        let webView = WKWebView()
+        webView.navigationDelegate = context.coordinator
+        webView.load(URLRequest(url: url))
+        return webView
+    }
+
+    func updateNSView(_ nsView: WKWebView, context: Context) {}
+}
+#elseif os(iOS)
+private struct EmbeddedWebAuthView: UIViewRepresentable {
+    let url: URL
+    let callbackScheme: String
+    let onCode: (String) -> Void
+    let onError: (String) -> Void
+
+    func makeCoordinator() -> WebAuthCoordinator {
+        WebAuthCoordinator(callbackScheme: callbackScheme, onCode: onCode, onError: onError)
+    }
+
+    func makeUIView(context: Context) -> WKWebView {
+        let webView = WKWebView()
+        webView.navigationDelegate = context.coordinator
+        webView.load(URLRequest(url: url))
+        return webView
+    }
+
+    func updateUIView(_ uiView: WKWebView, context: Context) {}
+}
+#endif
 
 // MARK: - Inline auth view (paid plan) — matches hosted page design
 

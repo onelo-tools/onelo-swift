@@ -152,6 +152,66 @@ public final class OneloAuth: ObservableObject {
         return session
     }
 
+    // MARK: - Hosted flow (WKWebView)
+
+    /// Calls /api/sdk/auth/initiate and returns the URL to load in the embedded WKWebView.
+    /// Also populates `hostedAppName` and `hostedAppLogoUrl`.
+    public func initiateHostedFlow() async throws -> URL {
+        let scheme = config.callbackScheme
+        var components = URLComponents(url: config.apiUrl.appendingPathComponent("/api/sdk/auth/initiate"), resolvingAgainstBaseURL: false)!
+        components.queryItems = [
+            URLQueryItem(name: "key", value: config.publishableKey),
+            URLQueryItem(name: "callback_scheme", value: scheme),
+        ]
+        let (data, response) = try await URLSession.shared.data(from: components.url!)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw OneloError.serverError("Failed to initiate hosted auth flow")
+        }
+        let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        guard let urlStr = json["hosted_url"] as? String, let url = URL(string: urlStr) else {
+            throw OneloError.serverError("Invalid initiate response")
+        }
+        if let name = json["app_name"] as? String { hostedAppName = name }
+        if let logoStr = json["app_logo_url"] as? String { hostedAppLogoUrl = URL(string: logoStr) }
+        return url
+    }
+
+    /// Exchanges the auth code (intercepted from the WKWebView callback URL) for a session.
+    public func exchangeHostedCode(_ code: String) async throws -> OneloSession {
+        let url = config.apiUrl.appendingPathComponent("/api/sdk/auth/hosted-callback")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: [
+            "code": code,
+            "publishableKey": config.publishableKey,
+        ])
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+            let msg = json["error"] as? String ?? "Code exchange failed"
+            throw OneloError.serverError(msg)
+        }
+        let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        guard
+            let accessToken = json["access_token"] as? String,
+            let refreshToken = json["refresh_token"] as? String,
+            let expiresIn = json["expires_in"] as? Int,
+            let userData = json["user"] as? [String: Any],
+            let userId = userData["id"] as? String
+        else {
+            let msg = json["error"] as? String ?? "Invalid session response"
+            throw OneloError.serverError(msg)
+        }
+        let userEmail = userData["email"] as? String
+        let expiresAt = Date().addingTimeInterval(TimeInterval(expiresIn))
+        let user = OneloUser(id: userId, email: userEmail, role: .member, tenantId: nil)
+        let session = OneloSession(accessToken: accessToken, refreshToken: refreshToken, expiresAt: expiresAt, user: user)
+        try saveSession(session)
+        currentSession = session
+        return session
+    }
+
     /// Sign in — goes through Onelo backend to track last_seen_at and validate app access.
     public func signIn(email: String, password: String) async throws -> OneloSession {
         isLoading = true
