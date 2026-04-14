@@ -747,7 +747,8 @@ private struct OneloFooter: View {
     }
 }
 
-// MARK: - Hosted Sign In Button (free tier)
+// MARK: - Hosted Sign In Button (legacy — no longer used by OneloAuthView)
+// Kept for reference only. OneloAuthView now uses EmbeddedWebAuthView (WKWebView).
 
 private struct HostedSignInButton: View {
     let auth: any OneloAuthProtocol
@@ -866,31 +867,11 @@ private struct HostedSignInButton: View {
         errorMessage = nil
         defer { isLoading = false }
         do {
-            #if os(iOS) || os(macOS)
-            let context = WindowContextProvider()
-            let session = try await oneloAuth.presentHostedSignIn(from: context)
-            // Sync updated app metadata after sign-in completes
-            appName = oneloAuth.hostedAppName
-            appLogoUrl = oneloAuth.hostedAppLogoUrl
-            onSuccess?(session)
-            #endif
-        } catch OneloError.cancelled {
-            // User dismissed — no error shown
+            let url = try await oneloAuth.initiateHostedFlow()
+            // Legacy path — callers should use OneloAuthView (WKWebView) instead
+            _ = url
         } catch {
             errorMessage = error.localizedDescription
-        }
-    }
-}
-
-// MARK: - HostedSignInButton app metadata sync extension
-// appName / appLogoUrl are populated after presentHostedSignIn() calls /initiate.
-// We observe OneloAuth.$hostedAppName and $hostedAppLogoUrl to update the UI
-// if the button is shown before the first sign-in attempt completes.
-private extension HostedSignInButton {
-    func observeAppMetadata() async {
-        guard let oneloAuth = auth as? OneloAuth else { return }
-        for await name in oneloAuth.$hostedAppName.values {
-            appName = name
         }
     }
 }
