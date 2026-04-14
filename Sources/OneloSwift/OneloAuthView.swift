@@ -64,84 +64,19 @@ public struct OneloAuthView<Content: View>: View {
             if isAuthenticated {
                 content()
             } else if !isReady {
-                // Wait for SDK to resolve plan before showing any auth UI (prevents flash)
+                // Wait for SDK config to load — prevents any flash before plan is known
                 effectiveConfig.backgroundColor.ignoresSafeArea()
-            } else if !allowCustomBranding {
-                // Free tier: full-screen branded hosted flow
-                HostedSignInButton(auth: auth, config: effectiveConfig, onSuccess: nil)
             } else {
-                // Paid tier: inline customisable form — centered card layout
-                GeometryReader { geo in
-                    ZStack {
-                        effectiveConfig.backgroundColor.ignoresSafeArea()
-
-                        ScrollView {
-                            VStack {
-                                Spacer(minLength: 0)
-
-                                VStack(spacing: 0) {
-                                    // Logo + app name
-                                    VStack(spacing: 12) {
-                                        if let logo = effectiveConfig.appLogo {
-                                            logo
-                                                .resizable()
-                                                .scaledToFit()
-                                                .frame(width: 64, height: 64)
-                                                .clipShape(RoundedRectangle(cornerRadius: 14))
-                                        } else {
-                                            OneloLogo(size: 64)
-                                        }
-                                        if !effectiveConfig.appName.isEmpty {
-                                            Text(effectiveConfig.appName)
-                                                .font(.title3.bold())
-                                                .foregroundStyle(effectiveConfig.textColor)
-                                        }
-                                    }
-                                    .padding(.bottom, 32)
-
-                                    Group {
-                                        switch vm.screen {
-                                        case .signIn:         SignInScreen(vm: vm, config: effectiveConfig)
-                                        case .signUp:         SignUpScreen(vm: vm, config: effectiveConfig)
-                                        case .forgotPassword: ForgotPasswordScreen(vm: vm, config: effectiveConfig)
-                                        }
-                                    }
-                                }
-                                .padding(effectiveConfig.contentPadding)
-                                .frame(maxWidth: 400)
-
-                                Spacer(minLength: 0)
-                            }
-                            .frame(minHeight: geo.size.height)
-                            .frame(maxWidth: .infinity)
-                        }
-
-                        // Footer pinned to bottom-left
-                        VStack {
-                            Spacer()
-                            HStack {
-                                OneloFooter()
-                                Spacer()
-                            }
-                            .padding(.horizontal, effectiveConfig.contentPadding.leading)
-                            .padding(.bottom, 20)
-                        }
-                    }
-                    .frame(width: geo.size.width, height: geo.size.height)
-                }
+                // Always use hosted flow — works on free and paid plans.
+                // On paid plans, "Powered by Onelo" branding is controlled via app settings.
+                // For a fully custom UI, use auth.signIn() / auth.signUp() directly.
+                HostedSignInButton(auth: auth, config: effectiveConfig, onSuccess: nil)
             }
         }
         .task {
             guard let oneloAuth = auth as? OneloAuth else { return }
-            // Observe session — switch to content view on sign-in, back to auth on sign-out
             for await session in oneloAuth.$currentSession.values {
                 isAuthenticated = session != nil
-            }
-        }
-        .task {
-            guard let oneloAuth = auth as? OneloAuth else { return }
-            for await value in oneloAuth.$allowCustomBranding.values {
-                allowCustomBranding = value
             }
         }
         .task {
