@@ -1,5 +1,23 @@
 // Sources/OneloSwift/OneloAuthView.swift
 import SwiftUI
+import AuthenticationServices
+
+#if os(iOS)
+private final class WindowContextProvider: NSObject, ASWebAuthenticationPresentationContextProviding {
+    func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
+        UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .flatMap { $0.windows }
+            .first { $0.isKeyWindow } ?? ASPresentationAnchor()
+    }
+}
+#elseif os(macOS)
+private final class WindowContextProvider: NSObject, ASWebAuthenticationPresentationContextProviding {
+    func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
+        NSApplication.shared.keyWindow ?? NSApplication.shared.windows.first ?? ASPresentationAnchor()
+    }
+}
+#endif
 
 /// Drop-in SwiftUI authentication view.
 ///
@@ -8,57 +26,63 @@ import SwiftUI
 ///     // user signed in
 /// }
 /// ```
-public struct OneloAuthView: View {
+public struct OneloAuthView<Content: View>: View {
     @StateObject private var vm: OneloAuthViewModel
-    private let config: OneloAuthConfig
+    private let requestedConfig: OneloAuthConfig
+    private let auth: any OneloAuthProtocol
+    private let content: () -> Content
+    @State private var allowCustomBranding: Bool = false
+    @State private var isAuthenticated: Bool = false
+    @State private var isReady: Bool = false
 
+    /// Returns the config to render. On free plan, enforces Onelo brand.
+    private var effectiveConfig: OneloAuthConfig {
+        allowCustomBranding ? requestedConfig : .oneloBranded
+    }
+
+    /// Create an auth view. The `content` closure is shown after successful sign-in.
+    ///
+    /// ```swift
+    /// OneloAuthView(auth: auth) {
+    ///     ContentView()
+    ///         .environmentObject(auth)
+    /// }
+    /// ```
     public init(
         auth: any OneloAuthProtocol,
         config: OneloAuthConfig = .default,
-        onSuccess: @escaping (OneloSession) -> Void
+        @ViewBuilder content: @escaping () -> Content
     ) {
-        _vm = StateObject(wrappedValue: OneloAuthViewModel(auth: auth, onSuccess: onSuccess))
-        self.config = config
+        self.content = content
+        self.requestedConfig = config
+        self.auth = auth
+        _vm = StateObject(wrappedValue: OneloAuthViewModel(auth: auth, onSuccess: nil))
     }
 
     public var body: some View {
-        ZStack {
-            config.backgroundColor.ignoresSafeArea()
-
-            ScrollView {
-                VStack(spacing: 0) {
-                    // Logo / app name
-                    VStack(spacing: 8) {
-                        if let logo = config.appLogo {
-                            logo
-                                .resizable()
-                                .scaledToFit()
-                                .frame(width: 56, height: 56)
-                                .clipShape(RoundedRectangle(cornerRadius: config.cornerRadius))
-                        }
-                        if !config.appName.isEmpty {
-                            Text(config.appName)
-                                .font(.headline)
-                                .foregroundStyle(config.textColor)
-                        }
-                    }
-                    .padding(.bottom, 32)
-
-                    // Active screen
-                    Group {
-                        switch vm.screen {
-                        case .signIn:         SignInScreen(vm: vm, config: config)
-                        case .signUp:         SignUpScreen(vm: vm, config: config)
-                        case .forgotPassword: ForgotPasswordScreen(vm: vm, config: config)
-                        }
-                    }
-
-                    Spacer(minLength: 32)
-
-                    // Hardcoded Onelo branding — cannot be removed
-                    OneloFooter(subtitleColor: config.subtitleColor)
-                }
-                .padding(config.contentPadding)
+        Group {
+            if isAuthenticated {
+                content()
+            } else if !isReady {
+                // Wait for SDK config to load — prevents any flash before plan is known
+                effectiveConfig.backgroundColor.ignoresSafeArea()
+            } else {
+                // Always use hosted flow — works on free and paid plans.
+                // On paid plans, "Powered by Onelo" branding is controlled via app settings.
+                // For a fully custom UI, use auth.signIn() / auth.signUp() directly.
+                HostedSignInButton(auth: auth, config: effectiveConfig, onSuccess: nil)
+            }
+        }
+        .task {
+            guard let oneloAuth = auth as? OneloAuth else { return }
+            for await session in oneloAuth.$currentSession.values {
+                isAuthenticated = session != nil
+            }
+        }
+        .task {
+            guard let oneloAuth = auth as? OneloAuth else { return }
+            for await value in oneloAuth.$isReady.values {
+                isReady = value
             }
         }
     }
@@ -280,7 +304,7 @@ private struct AuthTextField: View {
             .clipShape(RoundedRectangle(cornerRadius: config.cornerRadius))
             .overlay(
                 RoundedRectangle(cornerRadius: config.cornerRadius)
-                    .strokeBorder(Color.primary.opacity(0.1), lineWidth: 1)
+                    .strokeBorder(config.inputBorderColor, lineWidth: config.inputBorderWidth)
             )
             .foregroundStyle(config.textColor)
     }
@@ -305,7 +329,7 @@ private struct AuthSecureField: View {
             .clipShape(RoundedRectangle(cornerRadius: config.cornerRadius))
             .overlay(
                 RoundedRectangle(cornerRadius: config.cornerRadius)
-                    .strokeBorder(Color.primary.opacity(0.1), lineWidth: 1)
+                    .strokeBorder(config.inputBorderColor, lineWidth: config.inputBorderWidth)
             )
             .foregroundStyle(config.textColor)
     }
@@ -328,7 +352,7 @@ private struct AuthButton: View {
         Button(action: action) {
             Group {
                 if isLoading {
-                    ProgressView().tint(.white)
+                    ProgressView().tint(config.buttonForegroundColor)
                 } else {
                     Text(label).fontWeight(.semibold)
                 }
@@ -336,7 +360,7 @@ private struct AuthButton: View {
             .frame(maxWidth: .infinity)
             .frame(height: config.buttonHeight)
             .background(config.accentColor)
-            .foregroundStyle(.white)
+            .foregroundStyle(config.buttonForegroundColor)
             .clipShape(RoundedRectangle(cornerRadius: config.cornerRadius))
         }
         .buttonStyle(.plain)
@@ -344,17 +368,196 @@ private struct AuthButton: View {
     }
 }
 
-private struct OneloFooter: View {
-    let subtitleColor: Color
+// MARK: - Onelo brand color
+
+private let oneloOrange = Color(red: 0.976, green: 0.451, blue: 0.086) // #f97316
+
+// MARK: - Onelo Logo
+
+private struct OneloLogo: View {
+    var size: CGFloat = 56
 
     var body: some View {
-        Link(destination: URL(string: "https://onelo.tools")!) {
-            Text("Powered by ")
-                .foregroundStyle(subtitleColor.opacity(0.6))
-            + Text("Onelo")
-                .foregroundStyle(subtitleColor.opacity(0.8))
+        ZStack {
+            RoundedRectangle(cornerRadius: size * 0.22)
+                .fill(Color(red: 0.067, green: 0.067, blue: 0.067)) // #111111
+                .frame(width: size, height: size)
+
+            Image("onelo-logo-white", bundle: .module)
+                .resizable()
+                .scaledToFit()
+                .frame(width: size * 0.72, height: size * 0.72)
         }
-        .font(.caption2)
+        .frame(width: size, height: size)
+    }
+}
+
+// MARK: - Onelo Footer (with logo, left-aligned)
+
+private struct OneloFooter: View {
+    var body: some View {
+        Link(destination: URL(string: "https://onelo.tools")!) {
+            HStack(spacing: 4) {
+                Image("onelo-logo-white", bundle: .module)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 12, height: 12)
+                    .opacity(0.4)
+                Text("Powered by ")
+                    .foregroundStyle(Color.primary.opacity(0.35))
+                + Text("Onelo")
+                    .foregroundStyle(Color.primary.opacity(0.55))
+            }
+            .font(.caption2)
+        }
         .buttonStyle(.plain)
+    }
+}
+
+// MARK: - Hosted Sign In Button (free tier)
+
+private struct HostedSignInButton: View {
+    let auth: any OneloAuthProtocol
+    let config: OneloAuthConfig
+    let onSuccess: ((OneloSession) -> Void)?
+
+    @State private var isLoading = false
+    @State private var errorMessage: String?
+    @State private var appName: String = "App"
+    @State private var appLogoUrl: URL? = nil
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack {
+                // Background
+                config.backgroundColor.ignoresSafeArea()
+
+                VStack(spacing: 0) {
+                    Spacer()
+
+                    // App / Onelo branding block
+                    VStack(spacing: 16) {
+                        // Show app logo if available, otherwise Onelo logo
+                        if let logoUrl = appLogoUrl {
+                            AsyncImage(url: logoUrl) { phase in
+                                if let image = phase.image {
+                                    image
+                                        .resizable()
+                                        .scaledToFill()
+                                        .frame(width: 72, height: 72)
+                                        .clipShape(RoundedRectangle(cornerRadius: 16))
+                                } else {
+                                    OneloLogo(size: 72)
+                                }
+                            }
+                        } else {
+                            OneloLogo(size: 72)
+                        }
+
+                        VStack(spacing: 4) {
+                            (Text("Sign in to ")
+                                .foregroundStyle(config.textColor)
+                            + Text(appName)
+                                .foregroundStyle(oneloOrange))
+                            .font(.title2.bold())
+
+                            Text("Secure authentication powered by Onelo")
+                                .font(.subheadline)
+                                .foregroundStyle(config.subtitleColor)
+                                .multilineTextAlignment(.center)
+                        }
+                    }
+                    .padding(.bottom, 40)
+
+                    // Sign In button
+                    VStack(spacing: 12) {
+                        if isLoading {
+                            ProgressView()
+                                .tint(oneloOrange)
+                                .frame(height: config.buttonHeight)
+                        } else {
+                            Button {
+                                Task { await signIn() }
+                            } label: {
+                                Text("Sign In")
+                                    .fontWeight(.semibold)
+                                    .frame(maxWidth: .infinity)
+                                    .frame(height: config.buttonHeight)
+                                    .background(oneloOrange)
+                                    .foregroundStyle(.white)
+                                    .clipShape(RoundedRectangle(cornerRadius: config.cornerRadius))
+                            }
+                            .buttonStyle(.plain)
+                        }
+
+                        if let err = errorMessage {
+                            Text(err)
+                                .font(.caption)
+                                .foregroundStyle(.red)
+                                .multilineTextAlignment(.center)
+                        }
+                    }
+                    .padding(.horizontal, config.contentPadding.leading)
+
+                    Spacer()
+
+                    // Footer — left aligned
+                    HStack {
+                        OneloFooter()
+                        Spacer()
+                    }
+                    .padding(.horizontal, config.contentPadding.leading)
+                    .padding(.bottom, 24)
+                }
+                .frame(width: geo.size.width)
+            }
+        }
+        .task {
+            guard let oneloAuth = auth as? OneloAuth else { return }
+            for await name in oneloAuth.$hostedAppName.values {
+                appName = name
+            }
+        }
+        .task {
+            guard let oneloAuth = auth as? OneloAuth else { return }
+            for await logoUrl in oneloAuth.$hostedAppLogoUrl.values {
+                appLogoUrl = logoUrl
+            }
+        }
+    }
+
+    @MainActor
+    private func signIn() async {
+        guard let oneloAuth = auth as? OneloAuth else { return }
+        isLoading = true
+        errorMessage = nil
+        defer { isLoading = false }
+        do {
+            #if os(iOS) || os(macOS)
+            let context = WindowContextProvider()
+            let session = try await oneloAuth.presentHostedSignIn(from: context)
+            // Sync updated app metadata after sign-in completes
+            appName = oneloAuth.hostedAppName
+            appLogoUrl = oneloAuth.hostedAppLogoUrl
+            onSuccess?(session)
+            #endif
+        } catch OneloError.cancelled {
+            // User dismissed — no error shown
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+}
+
+// MARK: - HostedSignInButton app metadata sync extension
+// appName / appLogoUrl are populated after presentHostedSignIn() calls /initiate.
+// We observe OneloAuth.$hostedAppName and $hostedAppLogoUrl to update the UI
+// if the button is shown before the first sign-in attempt completes.
+private extension HostedSignInButton {
+    func observeAppMetadata() async {
+        guard let oneloAuth = auth as? OneloAuth else { return }
+        for await name in oneloAuth.$hostedAppName.values {
+            appName = name
+        }
     }
 }
