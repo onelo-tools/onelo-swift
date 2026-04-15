@@ -206,6 +206,13 @@ private final class WebAuthCoordinator: NSObject, WKNavigationDelegate, WKUIDele
         return nil
     }
 
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        webView.evaluateJavaScript(
+            "document.documentElement.style.overflowX='hidden';" +
+            "document.body.style.overflowX='hidden';"
+        )
+    }
+
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
         let nsError = error as NSError
         guard nsError.domain != "WebKitErrorDomain" else { return }
@@ -262,6 +269,9 @@ private struct EmbeddedWebAuthView: UIViewRepresentable {
         let webView = WKWebView()
         webView.navigationDelegate = context.coordinator
         webView.uiDelegate = context.coordinator
+        webView.scrollView.contentInsetAdjustmentBehavior = .never
+        webView.scrollView.showsHorizontalScrollIndicator = false
+        webView.scrollView.alwaysBounceHorizontal = false
         webView.load(URLRequest(url: url))
         return webView
     }
