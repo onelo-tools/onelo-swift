@@ -58,8 +58,10 @@ public struct OneloAuthView<Content: View>: View {
                         showRetry = true
                     }
                 )
+                #if os(macOS)
                 .frame(minWidth: 440, minHeight: 680)
                 .ignoresSafeArea()
+                #endif
             } else {
                 // Loading state or retry after cancel/error
                 ZStack {
