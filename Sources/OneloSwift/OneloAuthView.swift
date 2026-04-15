@@ -280,7 +280,6 @@ private struct EmbeddedWebAuthView: UIViewRepresentable {
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
         webView.uiDelegate = context.coordinator
-        webView.scrollView.contentInsetAdjustmentBehavior = .never
         webView.scrollView.showsHorizontalScrollIndicator = false
         webView.scrollView.alwaysBounceHorizontal = false
         webView.load(URLRequest(url: url))
