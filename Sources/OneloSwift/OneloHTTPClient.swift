@@ -5,8 +5,6 @@ import Foundation
 final class _OneloHTTPClient: Sendable {
     let publishableKey: String
     let baseURL: URL
-    nonisolated(unsafe) var userPlan: String?
-
     init(publishableKey: String, baseURL: URL) {
         self.publishableKey = publishableKey
         self.baseURL = baseURL

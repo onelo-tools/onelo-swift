@@ -4,6 +4,7 @@ import Foundation
 
 public enum FeatureStatus: String, Sendable {
     case enabled
+    case disabled
     case greyed
     case hidden
     case upsell
@@ -14,6 +15,7 @@ public struct FeatureState: Sendable {
     public let status: FeatureStatus
 
     public var isEnabled: Bool { status == .enabled }
+    public var isDisabled: Bool { status == .disabled }
     public var isVisible: Bool { status != .hidden }
     public var isGreyed: Bool { status == .greyed }
     public var isUpsell: Bool { status == .upsell }

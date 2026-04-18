@@ -4,9 +4,9 @@ import Foundation
 ///
 /// ```swift
 /// let onelo = Onelo(publishableKey: "pk_live_...")
-/// await onelo.identify(userId, plan: "pro")
+/// await onelo.identify(userId)
 ///
-/// if onelo.features.isEnabled("export-button") {
+/// if onelo.features.feature("export-button").isEnabled {
 ///     showExportButton()
 /// }
 /// ```
@@ -40,11 +40,8 @@ public final class Onelo {
     }
 
     /// Set user context. Call once after login.
-    /// Loads feature states from the server.
-    public func identify(_ userId: String, plan: String? = nil) async {
-        httpClient.userPlan = plan
-        await features._load()
-        let names = Array(features._cache.keys)
-        await features._ping(names: names)
+    /// Loads feature states from the server and starts polling.
+    public func identify(_ userId: String) async {
+        await features._load(userId: userId)
     }
 }
