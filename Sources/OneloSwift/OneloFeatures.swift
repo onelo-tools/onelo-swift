@@ -7,6 +7,7 @@ public final class OneloFeatures {
     private var discoveredNames: Set<String> = []
     private var configVersion: Int = 0
     private var pollTask: Task<Void, Never>?
+    private var pendingPingTask: Task<Void, Never>?
 
     static let pollInterval: TimeInterval = 60
 
@@ -16,10 +17,19 @@ public final class OneloFeatures {
 
     // MARK: - Public API
 
+    /// Declares a list of feature names upfront — registers them immediately via batch-ping.
+    /// Call this at app startup with all known feature names.
+    public func declare(_ names: [String]) {
+        for name in names { discoveredNames.insert(name) }
+        _scheduleBatchPing()
+    }
+
     /// Returns the feature state for the given name.
-    /// Registers the name for auto-discovery on next batch-ping.
+    /// Registers the name for auto-discovery if seen for the first time.
     public func feature(_ name: String) -> FeatureState {
+        let isNew = !discoveredNames.contains(name)
         discoveredNames.insert(name)
+        if isNew { _scheduleBatchPing() }
         let status = cache[name] ?? .hidden
         return FeatureState(name: name, status: status)
     }
@@ -35,9 +45,20 @@ public final class OneloFeatures {
     func _stopPolling() {
         pollTask?.cancel()
         pollTask = nil
+        pendingPingTask?.cancel()
+        pendingPingTask = nil
     }
 
     // MARK: - Private
+
+    private func _scheduleBatchPing() {
+        pendingPingTask?.cancel()
+        pendingPingTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            guard !Task.isCancelled else { return }
+            await self?._batchPing()
+        }
+    }
 
     private func _batchPing() async {
         let names = Array(discoveredNames)
