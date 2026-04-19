@@ -8,15 +8,13 @@ private let planTiers: [String: Int] = [
 ]
 
 public final class OneloPaywall {
-    private let client: _OneloHTTPClient
+    init() {}
 
-    init(client: _OneloHTTPClient) {
-        self.client = client
-    }
-
-    public func check(_ requiredPlan: String) -> Bool {
-        let userTier = planTiers[client.userPlan ?? "free"] ?? 0
-        let requiredTier = planTiers[requiredPlan] ?? 0
+    /// Returns true if `userPlan` meets or exceeds `requiredPlan`.
+    /// Pass the user's billing plan from your backend or Onelo session.
+    public func check(_ requiredPlan: String, userPlan: String = "free") -> Bool {
+        let userTier = planTiers[userPlan.lowercased()] ?? 0
+        let requiredTier = planTiers[requiredPlan.lowercased()] ?? 0
         return userTier >= requiredTier
     }
 }

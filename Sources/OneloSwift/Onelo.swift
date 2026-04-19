@@ -28,7 +28,7 @@ public final class Onelo {
         let client = _OneloHTTPClient(publishableKey: publishableKey, baseURL: baseURL)
         self.httpClient = client
         self.features = OneloFeatures(client: client)
-        self.paywall = OneloPaywall(client: client)
+        self.paywall = OneloPaywall()
         self.forms = OneloForms(client: client)
         self.waitlist = OneloWaitlist(client: client)
         let oneloAuth = OneloAuth(config: OneloConfig(
