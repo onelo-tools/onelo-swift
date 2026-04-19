@@ -1,6 +1,8 @@
 import Foundation
+import Observation
 
 @MainActor
+@Observable
 public final class OneloFeatures {
     private let client: _OneloHTTPClient
     private var cache: [String: FeatureStatus] = [:]
