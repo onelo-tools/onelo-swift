@@ -1,7 +1,7 @@
 import Foundation
 
 public enum OneloSDK {
-    public static let sdkVersion = "3.5.2-staging"
+    public static let sdkVersion = "3.5.3-staging"
 }
 
 public enum UserRole: String, Codable, Sendable {
