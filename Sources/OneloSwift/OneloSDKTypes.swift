@@ -8,6 +8,9 @@ public enum FeatureStatus: String, Sendable {
     case greyed
     case hidden
     case upsell
+    case new
+    case beta
+    case coming_soon
 }
 
 public struct FeatureState: Sendable {
@@ -19,6 +22,19 @@ public struct FeatureState: Sendable {
     public var isVisible: Bool { status != .hidden }
     public var isGreyed: Bool { status == .greyed }
     public var isUpsell: Bool { status == .upsell }
+    public var isNew: Bool { status == .new }
+    public var isBeta: Bool { status == .beta }
+    public var isComingSoon: Bool { status == .coming_soon }
+
+    /// SwiftUI badge label for promotional statuses. Returns nil for non-badge statuses.
+    public var badgeLabel: String? {
+        switch status {
+        case .new: return "New"
+        case .beta: return "Beta"
+        case .coming_soon: return "Coming Soon"
+        default: return nil
+        }
+    }
 }
 
 // MARK: - Form types
