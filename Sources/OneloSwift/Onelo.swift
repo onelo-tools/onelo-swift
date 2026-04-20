@@ -37,6 +37,7 @@ public final class Onelo {
             callbackScheme: callbackScheme
         ))
         self.auth = OneloAuthModule(auth: oneloAuth)
+        Task { await features._load(userId: nil) }
     }
 
     /// Set user context. Call once after login.
