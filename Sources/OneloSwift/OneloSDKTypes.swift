@@ -17,7 +17,7 @@ public struct FeatureState: Sendable {
     public let name: String
     public let status: FeatureStatus
 
-    public var isEnabled: Bool { status == .enabled }
+    public var isEnabled: Bool { status == .enabled || status == .new || status == .beta }
     public var isDisabled: Bool { status == .disabled }
     public var isVisible: Bool { status != .hidden }
     public var isGreyed: Bool { status == .greyed }
