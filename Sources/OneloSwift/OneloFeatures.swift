@@ -38,6 +38,11 @@ public final class OneloFeatures {
 
     // MARK: - Internal
 
+    /// Test helper — injects cache entries without a network call.
+    func _setCache(_ entries: [String: FeatureStatus]) {
+        for (k, v) in entries { cache[k] = v }
+    }
+
     func _load(userId: String?) async {
         await _batchPing()
         await _resolve(userId: userId)

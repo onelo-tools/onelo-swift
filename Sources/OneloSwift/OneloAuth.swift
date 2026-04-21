@@ -30,6 +30,9 @@ public final class OneloAuth: ObservableObject {
     private let keychain: KeychainStorage
     let config: OneloConfig
     private var pkceVerifier: String?
+    #if DEBUG
+    private var _skipInitialize: Bool = false
+    #endif
 
     private enum KeychainKeys {
         static let accessToken = "access_token"
@@ -447,6 +450,9 @@ public final class OneloAuth: ObservableObject {
     // MARK: - Private
 
     private func initialize() async {
+        #if DEBUG
+        guard !_skipInitialize else { return }
+        #endif
         do {
             let resolved = try await resolveConfig()
             allowCustomBranding = resolved.allowCustomBranding
@@ -630,6 +636,26 @@ public final class OneloAuth: ObservableObject {
 
         return json
     }
+
+    // MARK: - Testing support
+
+    #if DEBUG
+    /// Initializer for unit tests. Sets `_skipInitialize` before the enqueued Task runs,
+    /// preventing `initialize()` from making network calls or mutating state.
+    /// Tests control session state directly via `_injectSessionForTesting` / `_clearSessionForTesting`.
+    convenience init(_testingConfig config: OneloConfig) {
+        self.init(config: config)
+        _skipInitialize = true
+    }
+
+    func _injectSessionForTesting(_ session: OneloSession) {
+        currentSession = session
+    }
+
+    func _clearSessionForTesting() {
+        currentSession = nil
+    }
+    #endif
 
     func backendPostAny(path: String, body: [String: Any]) async throws -> [String: Any] {
         let url = config.apiUrl.appendingPathComponent(path)

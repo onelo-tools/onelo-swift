@@ -1,26 +1,27 @@
 import XCTest
 @testable import OneloSwift
 
+@MainActor
 final class OneloFeaturesTests: XCTestCase {
 
     func testUnknownFeatureReturnsHidden() {
-        let client = _OneloHTTPClient(publishableKey: "pk_test")
+        let client = _OneloHTTPClient(publishableKey: "pk_test", baseURL: URL(string: "https://example.com")!)
         let features = OneloFeatures(client: client)
-        XCTAssertFalse(features.isEnabled("nonexistent"))
-        XCTAssertEqual(features.status("nonexistent"), .hidden)
+        XCTAssertFalse(features.feature("nonexistent").isEnabled)
+        XCTAssertEqual(features.feature("nonexistent").status, .hidden)
     }
 
     func testIsEnabledReturnsTrueAfterCacheSet() {
-        let client = _OneloHTTPClient(publishableKey: "pk_test")
+        let client = _OneloHTTPClient(publishableKey: "pk_test", baseURL: URL(string: "https://example.com")!)
         let features = OneloFeatures(client: client)
-        features._cache = ["export-button": .enabled]
-        XCTAssertTrue(features.isEnabled("export-button"))
+        features._setCache(["export-button": .enabled])
+        XCTAssertTrue(features.feature("export-button").isEnabled)
     }
 
     func testStatusReturnsCorrectValue() {
-        let client = _OneloHTTPClient(publishableKey: "pk_test")
+        let client = _OneloHTTPClient(publishableKey: "pk_test", baseURL: URL(string: "https://example.com")!)
         let features = OneloFeatures(client: client)
-        features._cache = ["dark-mode": .greyed]
-        XCTAssertEqual(features.status("dark-mode"), .greyed)
+        features._setCache(["dark-mode": .greyed])
+        XCTAssertEqual(features.feature("dark-mode").status, .greyed)
     }
 }

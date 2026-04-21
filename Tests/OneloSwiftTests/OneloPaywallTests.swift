@@ -4,30 +4,22 @@ import XCTest
 final class OneloPaywallTests: XCTestCase {
 
     func testFreeUserCanAccessFree() {
-        let client = _OneloHTTPClient(publishableKey: "pk_test")
-        client.userPlan = "free"
-        let paywall = OneloPaywall(client: client)
-        XCTAssertTrue(paywall.check("free"))
+        let paywall = OneloPaywall()
+        XCTAssertTrue(paywall.check("free", userPlan: "free"))
     }
 
     func testFreeUserCannotAccessPro() {
-        let client = _OneloHTTPClient(publishableKey: "pk_test")
-        client.userPlan = "free"
-        let paywall = OneloPaywall(client: client)
-        XCTAssertFalse(paywall.check("pro"))
+        let paywall = OneloPaywall()
+        XCTAssertFalse(paywall.check("pro", userPlan: "free"))
     }
 
     func testProUserCanAccessPro() {
-        let client = _OneloHTTPClient(publishableKey: "pk_test")
-        client.userPlan = "pro"
-        let paywall = OneloPaywall(client: client)
-        XCTAssertTrue(paywall.check("pro"))
+        let paywall = OneloPaywall()
+        XCTAssertTrue(paywall.check("pro", userPlan: "pro"))
     }
 
     func testProUserCannotAccessBusiness() {
-        let client = _OneloHTTPClient(publishableKey: "pk_test")
-        client.userPlan = "pro"
-        let paywall = OneloPaywall(client: client)
-        XCTAssertFalse(paywall.check("business"))
+        let paywall = OneloPaywall()
+        XCTAssertFalse(paywall.check("business", userPlan: "pro"))
     }
 }

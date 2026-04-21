@@ -3,8 +3,8 @@ import Foundation
 /// Main entry point for the Onelo SDK.
 ///
 /// ```swift
-/// let onelo = Onelo(publishableKey: "pk_live_...")
-/// await onelo.identify(userId)
+/// let onelo = Onelo(publishableKey: "pk_live_...", baseURL: URL(string: "https://...")!)
+/// await onelo.identify(userId)   // only needed when NOT using Onelo Auth
 ///
 /// if onelo.features.feature("export-button").isEnabled {
 ///     showExportButton()
@@ -37,12 +37,26 @@ public final class Onelo {
             callbackScheme: callbackScheme
         ))
         self.auth = OneloAuthModule(auth: oneloAuth)
+
+        print("[OneloBridge] SDK initialized — features._load(nil)") // TODO: remove debug
         Task { await features._load(userId: nil) }
+
+        // Auto-identify features when Onelo Auth session changes
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            for await session in self.auth.authObject.$currentSession.values {
+                let userId = session?.user.id
+                print("[OneloBridge] Auth state changed → userId: \(userId ?? "nil")") // TODO: remove debug
+                print("[OneloBridge] features._load(userId: \(userId ?? "nil"))") // TODO: remove debug
+                await self.features._load(userId: userId)
+            }
+        }
     }
 
-    /// Set user context. Call once after login.
-    /// Loads feature states from the server and starts polling.
+    /// Set user context for feature targeting. Call once after login.
+    /// Only needed when NOT using Onelo Auth — Onelo Auth sets this automatically.
     public func identify(_ userId: String) async {
+        print("[OneloBridge] identify(userId: \(userId)) → features._load") // TODO: remove debug
         await features._load(userId: userId)
     }
 }
