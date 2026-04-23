@@ -19,6 +19,7 @@ public final class Onelo {
     public let forms: OneloForms
     public let waitlist: OneloWaitlist
     public let auth: OneloAuthModule
+    public let monitor: OneloMonitor
 
     public init(
         publishableKey: String,
@@ -37,6 +38,7 @@ public final class Onelo {
             callbackScheme: callbackScheme
         ))
         self.auth = OneloAuthModule(auth: oneloAuth)
+        self.monitor = OneloMonitor(publishableKey: publishableKey, apiUrl: baseURL.absoluteString)
 
         print("[OneloBridge] SDK initialized — features._load(nil)") // TODO: remove debug
         Task { await features._load(userId: nil) }
