@@ -20,6 +20,7 @@ public final class Onelo {
     public let waitlist: OneloWaitlist
     public let auth: OneloAuthModule
     public let monitor: OneloMonitor
+    public let feedback: OneloFeedback
 
     public init(
         publishableKey: String,
@@ -28,10 +29,12 @@ public final class Onelo {
     ) {
         let client = _OneloHTTPClient(publishableKey: publishableKey, baseURL: baseURL)
         self.httpClient = client
-        self.features = OneloFeatures(client: client)
+        let featuresModule = OneloFeatures(client: client)
+        self.features = featuresModule
         self.paywall = OneloPaywall()
         self.forms = OneloForms(client: client)
         self.waitlist = OneloWaitlist(client: client)
+        self.feedback = OneloFeedback(publishableKey: publishableKey, baseURL: baseURL, features: featuresModule)
         let oneloAuth = OneloAuth(config: OneloConfig(
             publishableKey: publishableKey,
             apiUrl: baseURL,

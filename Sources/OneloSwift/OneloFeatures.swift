@@ -36,6 +36,13 @@ public final class OneloFeatures {
         return FeatureState(name: name, status: status)
     }
 
+    /// Returns the names of all features currently enabled in the cache.
+    /// Used by `OneloFeedback` to attach session context to the initiate request.
+    public func getActiveFeatures() -> [String] {
+        let active: Set<FeatureStatus> = [.enabled, .new, .beta]
+        return cache.compactMap { name, status in active.contains(status) ? name : nil }
+    }
+
     // MARK: - Internal
 
     /// Test helper — injects cache entries without a network call.
