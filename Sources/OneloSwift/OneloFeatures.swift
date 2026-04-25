@@ -5,6 +5,7 @@ import Observation
 @Observable
 public final class OneloFeatures {
     private let client: _OneloHTTPClient
+    private weak var monitor: OneloMonitor?
     private var cache: [String: FeatureStatus] = [:]
     private var discoveredNames: Set<String> = []
     private var configVersion: Int = 0
@@ -13,8 +14,9 @@ public final class OneloFeatures {
 
     static let pollInterval: TimeInterval = 60
 
-    init(client: _OneloHTTPClient) {
+    init(client: _OneloHTTPClient, monitor: OneloMonitor? = nil) {
         self.client = client
+        self.monitor = monitor
     }
 
     // MARK: - Public API
@@ -33,6 +35,7 @@ public final class OneloFeatures {
         discoveredNames.insert(name)
         if isNew { _scheduleBatchPing() }
         let status = cache[name] ?? .hidden
+        monitor?._trackFeatureCall(name)
         return FeatureState(name: name, status: status)
     }
 

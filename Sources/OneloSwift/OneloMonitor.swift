@@ -19,6 +19,8 @@ private struct BufferedEvent: Encodable {
     let ok: Bool
     let durationMs: Int?
     let error: String?
+    let source: String
+    let platform: String
     // meta omitted — [String: Any] is not directly Encodable; skip for V1
 }
 
@@ -37,15 +39,56 @@ public class OneloMonitor {
         }
     }
 
-    public func event(_ featureName: String, options: MonitorEventOptions) {
+    private func _push(featureName: String, ok: Bool, durationMs: Int?, error: String?, source: String) {
         lock.lock()
         buffer.append(BufferedEvent(
             featureName: featureName,
-            ok: options.ok,
-            durationMs: options.durationMs,
-            error: options.error
+            ok: ok,
+            durationMs: durationMs,
+            error: error,
+            source: source,
+            platform: "swift"
         ))
         lock.unlock()
+    }
+
+    public func event(_ featureName: String, options: MonitorEventOptions) {
+        _push(featureName: featureName, ok: options.ok, durationMs: options.durationMs,
+              error: options.error, source: "event")
+    }
+
+    public func _trackFeatureCall(_ featureName: String) {
+        _push(featureName: featureName, ok: true, durationMs: nil, error: nil, source: "feature_call")
+    }
+
+    @discardableResult
+    public func track<T>(_ featureName: String, _ fn: () throws -> T) rethrows -> T {
+        let start = Date()
+        do {
+            let result = try fn()
+            let ms = Int(Date().timeIntervalSince(start) * 1000)
+            _push(featureName: featureName, ok: true, durationMs: ms, error: nil, source: "track")
+            return result
+        } catch {
+            let ms = Int(Date().timeIntervalSince(start) * 1000)
+            _push(featureName: featureName, ok: false, durationMs: ms, error: error.localizedDescription, source: "track")
+            throw error
+        }
+    }
+
+    @discardableResult
+    public func track<T>(_ featureName: String, _ fn: () async throws -> T) async rethrows -> T {
+        let start = Date()
+        do {
+            let result = try await fn()
+            let ms = Int(Date().timeIntervalSince(start) * 1000)
+            _push(featureName: featureName, ok: true, durationMs: ms, error: nil, source: "track")
+            return result
+        } catch {
+            let ms = Int(Date().timeIntervalSince(start) * 1000)
+            _push(featureName: featureName, ok: false, durationMs: ms, error: error.localizedDescription, source: "track")
+            throw error
+        }
     }
 
     public func flush() {

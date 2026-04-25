@@ -29,7 +29,9 @@ public final class Onelo {
     ) {
         let client = _OneloHTTPClient(publishableKey: publishableKey, baseURL: baseURL)
         self.httpClient = client
-        let featuresModule = OneloFeatures(client: client)
+        let monitorInstance = OneloMonitor(publishableKey: publishableKey, apiUrl: baseURL.absoluteString)
+        self.monitor = monitorInstance
+        let featuresModule = OneloFeatures(client: client, monitor: monitorInstance)
         self.features = featuresModule
         self.paywall = OneloPaywall()
         self.forms = OneloForms(client: client)
@@ -41,7 +43,6 @@ public final class Onelo {
             callbackScheme: callbackScheme
         ))
         self.auth = OneloAuthModule(auth: oneloAuth)
-        self.monitor = OneloMonitor(publishableKey: publishableKey, apiUrl: baseURL.absoluteString)
 
         print("[OneloBridge] SDK initialized — features._load(nil)") // TODO: remove debug
         Task { await features._load(userId: nil) }
