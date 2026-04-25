@@ -1,6 +1,10 @@
 import SwiftUI
 import WebKit
 
+#if os(macOS)
+private var _coordinatorKey: UInt8 = 0
+#endif
+
 // MARK: - Options
 
 public struct OpenFeedbackOptions {
@@ -24,7 +28,13 @@ public final class OneloFeedback: NSObject, ObservableObject {
     private let features: OneloFeatures
 
     @Published public var isPresented = false
-    private var hostedURL: URL?
+    /// The resolved hosted URL — available after `open()` resolves.
+    /// AppKit apps can read this directly instead of using `.feedbackSheet()`.
+    public private(set) var hostedURL: URL?
+
+#if os(macOS)
+    private weak var feedbackWindow: NSWindow?
+#endif
 
     init(publishableKey: String, baseURL: URL, features: OneloFeatures) {
         self.publishableKey = publishableKey
@@ -32,7 +42,11 @@ public final class OneloFeedback: NSObject, ObservableObject {
         self.features = features
     }
 
-    public func open(options: OpenFeedbackOptions = OpenFeedbackOptions()) async throws {
+    // MARK: - Initiate (shared)
+
+    /// Fetches the hosted URL and stores it. Call this before opening any UI.
+    /// `open()` and `openAsWindow()` both call this internally.
+    public func fetchHostedURL(options: OpenFeedbackOptions = OpenFeedbackOptions()) async throws -> URL {
         var comps = URLComponents(
             url: baseURL.appendingPathComponent("/api/sdk/feedback/initiate"),
             resolvingAgainstBaseURL: false
@@ -57,7 +71,15 @@ public final class OneloFeedback: NSObject, ObservableObject {
             let url    = URL(string: urlStr)
         else { throw URLError(.badServerResponse) }
 
-        hostedURL   = url
+        return url
+    }
+
+    // MARK: - SwiftUI path
+
+    /// Fetches the hosted URL and sets `isPresented = true`.
+    /// Use with `.feedbackSheet(onelo.feedback)` in SwiftUI apps.
+    public func open(options: OpenFeedbackOptions = OpenFeedbackOptions()) async throws {
+        hostedURL   = try await fetchHostedURL(options: options)
         isPresented = true
     }
 
@@ -67,6 +89,55 @@ public final class OneloFeedback: NSObject, ObservableObject {
             Task { @MainActor [weak self] in self?.isPresented = false }
         }
     }
+
+#if os(macOS)
+    // MARK: - AppKit path (macOS)
+
+    /// Opens the feedback form in a standalone NSWindow.
+    /// Use this in AppKit-first or mixed AppKit/SwiftUI apps where `.feedbackSheet()` doesn't work
+    /// (e.g., apps with NSWindow at `.screenSaverWindowLevel` or without a SwiftUI root view).
+    public func openAsWindow(options: OpenFeedbackOptions = OpenFeedbackOptions()) async throws {
+        // Reuse existing window if still open
+        if let existing = feedbackWindow, existing.isVisible {
+            existing.makeKeyAndOrderFront(nil)
+            return
+        }
+
+        let url = try await fetchHostedURL(options: options)
+        hostedURL = url
+
+        let win = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 480, height: 560),
+            styleMask: [.titled, .closable, .resizable, .miniaturizable],
+            backing: .buffered,
+            defer: false
+        )
+        win.title = "Send Feedback"
+        win.minSize = NSSize(width: 400, height: 480)
+        win.isReleasedWhenClosed = false
+        win.appearance = nil // follow system
+
+        let webConfig = WKWebViewConfiguration()
+        webConfig.userContentController.addUserScript(FeedbackWebCoordinator.relayScript)
+
+        let webView = WKWebView(frame: win.contentRect(forFrameRect: win.frame), configuration: webConfig)
+        webView.autoresizingMask = [.width, .height]
+
+        let coordinator = FeedbackWebCoordinator { [weak win] in
+            win?.close()
+        }
+        // Retain coordinator for the window's lifetime via an associated object
+        objc_setAssociatedObject(win, &_coordinatorKey, coordinator, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+        webView.navigationDelegate = coordinator
+        webView.uiDelegate = coordinator
+        webView.load(URLRequest(url: url))
+
+        win.contentView = webView
+        win.center()
+        win.makeKeyAndOrderFront(nil)
+        feedbackWindow = win
+    }
+#endif
 }
 
 // MARK: - Navigation coordinator
