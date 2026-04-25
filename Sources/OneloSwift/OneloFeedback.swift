@@ -94,49 +94,120 @@ public final class OneloFeedback: NSObject, ObservableObject {
     // MARK: - AppKit path (macOS)
 
     /// Opens the feedback form in a standalone NSWindow.
-    /// Use this in AppKit-first or mixed AppKit/SwiftUI apps where `.feedbackSheet()` doesn't work
-    /// (e.g., apps with NSWindow at `.screenSaverWindowLevel` or without a SwiftUI root view).
-    public func openAsWindow(options: OpenFeedbackOptions = OpenFeedbackOptions()) async throws {
+    /// The window appears immediately with a dark background; the form loads inside once the
+    /// initiate request resolves — no blocking wait before the window is visible.
+    public func openAsWindow(options: OpenFeedbackOptions = OpenFeedbackOptions()) {
         // Reuse existing window if still open
         if let existing = feedbackWindow, existing.isVisible {
             existing.makeKeyAndOrderFront(nil)
             return
         }
 
-        let url = try await fetchHostedURL(options: options)
-        hostedURL = url
-
+        // 1. Create window and WebView immediately — show before any network call
         let win = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 480, height: 560),
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 720),
             styleMask: [.titled, .closable, .resizable, .miniaturizable],
             backing: .buffered,
             defer: false
         )
         win.title = "Send Feedback"
-        win.minSize = NSSize(width: 400, height: 480)
+        win.minSize = NSSize(width: 480, height: 680)
         win.isReleasedWhenClosed = false
-        win.appearance = nil // follow system
+        win.appearance = nil
 
         let webConfig = WKWebViewConfiguration()
         webConfig.userContentController.addUserScript(FeedbackWebCoordinator.relayScript)
 
         let webView = WKWebView(frame: win.contentRect(forFrameRect: win.frame), configuration: webConfig)
         webView.autoresizingMask = [.width, .height]
+        // Dark background while loading so there's no white flash
+        webView.setValue(false, forKey: "drawsBackground")
 
-        let coordinator = FeedbackWebCoordinator { [weak win] in
-            win?.close()
-        }
-        // Retain coordinator for the window's lifetime via an associated object
+        let coordinator = FeedbackWebCoordinator { [weak win] in win?.close() }
         objc_setAssociatedObject(win, &_coordinatorKey, coordinator, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
         webView.navigationDelegate = coordinator
         webView.uiDelegate = coordinator
-        webView.load(URLRequest(url: url))
+
+        // Load skeleton screen immediately — shimmer animation while network resolves
+        webView.loadHTMLString(Self.skeletonHTML, baseURL: nil)
 
         win.contentView = webView
         win.center()
         win.makeKeyAndOrderFront(nil)
         feedbackWindow = win
+
+        // 2. Fetch hosted URL in background — navigate WebView when ready
+        Task { [weak self, weak webView, weak win] in
+            guard let self else { return }
+            do {
+                let url = try await self.fetchHostedURL(options: options)
+                self.hostedURL = url
+                await MainActor.run {
+                    webView?.load(URLRequest(url: url))
+                    win?.makeKeyAndOrderFront(nil)
+                }
+            } catch {
+                await MainActor.run { win?.close() }
+            }
+        }
     }
+
+    // Skeleton screen shown while the hosted URL is being fetched.
+    // Mirrors the rough layout of the feedback form with a shimmer animation.
+    private static let skeletonHTML = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+      body {
+        background: #111;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        padding: 40px 36px 32px;
+        overflow: hidden;
+      }
+      @keyframes shimmer {
+        0%   { background-position: -600px 0; }
+        100% { background-position: 600px 0; }
+      }
+      .sk {
+        border-radius: 10px;
+        background: linear-gradient(90deg, #1e1e1e 25%, #2a2a2a 50%, #1e1e1e 75%);
+        background-size: 600px 100%;
+        animation: shimmer 1.4s infinite linear;
+      }
+      /* App icon */
+      .icon  { width: 64px; height: 64px; border-radius: 14px; margin: 0 auto 16px; }
+      /* Title line */
+      .title { width: 220px; height: 22px; margin: 0 auto 40px; border-radius: 6px; }
+      /* Type selector cards */
+      .cards { display: flex; gap: 12px; margin-bottom: 32px; }
+      .card  { flex: 1; height: 76px; border-radius: 12px; }
+      /* Field labels + inputs */
+      .label { width: 60px; height: 13px; border-radius: 4px; margin-bottom: 8px; }
+      .input { width: 100%; height: 44px; border-radius: 10px; margin-bottom: 24px; }
+      .textarea { width: 100%; height: 110px; border-radius: 10px; margin-bottom: 32px; }
+      /* Submit button */
+      .btn   { width: 100%; height: 48px; border-radius: 12px; }
+    </style>
+    </head>
+    <body>
+      <div class="sk icon"></div>
+      <div class="sk title"></div>
+      <div class="cards">
+        <div class="sk card"></div>
+        <div class="sk card"></div>
+        <div class="sk card"></div>
+      </div>
+      <div class="sk label"></div>
+      <div class="sk input"></div>
+      <div class="sk label"></div>
+      <div class="sk textarea"></div>
+      <div class="sk btn"></div>
+    </body>
+    </html>
+    """
 #endif
 }
 
