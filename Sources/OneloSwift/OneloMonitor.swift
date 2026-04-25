@@ -64,7 +64,7 @@ public class OneloMonitor {
     public init(publishableKey: String, apiUrl: String) {
         self.publishableKey = publishableKey
         self.apiUrl = apiUrl
-        flushTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+        flushTimer = Timer.scheduledTimer(withTimeInterval: 15.0, repeats: true) { [weak self] _ in
             self?.flush()
         }
         _registerGlobalHandlers()
@@ -91,8 +91,13 @@ public class OneloMonitor {
         }
     }
 
+    private let maxBufferSize = 200
+
     private func _push(featureName: String, ok: Bool, durationMs: Int?, error: String?, source: String, meta: [String: Any]? = nil) {
         lock.lock()
+        if buffer.count >= maxBufferSize {
+            buffer.removeFirst()
+        }
         let encodableMeta: [String: AnyEncodable]? = meta.map { dict in
             Dictionary(uniqueKeysWithValues: dict.map { ($0.key, AnyEncodable(value: $0.value)) })
         }
@@ -108,6 +113,9 @@ public class OneloMonitor {
             meta: encodableMeta
         ))
         lock.unlock()
+        if !ok || source == "global_error" {
+            flush()
+        }
     }
 
     public func event(_ featureName: String, options: MonitorEventOptions) {
@@ -120,31 +128,31 @@ public class OneloMonitor {
     }
 
     @discardableResult
-    public func track<T>(_ featureName: String, _ fn: () throws -> T) rethrows -> T {
+    public func track<T>(_ featureName: String, meta: [String: Any]? = nil, _ fn: () throws -> T) rethrows -> T {
         let start = Date()
         do {
             let result = try fn()
             let ms = Int(Date().timeIntervalSince(start) * 1000)
-            _push(featureName: featureName, ok: true, durationMs: ms, error: nil, source: "track")
+            _push(featureName: featureName, ok: true, durationMs: ms, error: nil, source: "track", meta: meta)
             return result
         } catch {
             let ms = Int(Date().timeIntervalSince(start) * 1000)
-            _push(featureName: featureName, ok: false, durationMs: ms, error: error.localizedDescription, source: "track")
+            _push(featureName: featureName, ok: false, durationMs: ms, error: error.localizedDescription, source: "track", meta: meta)
             throw error
         }
     }
 
     @discardableResult
-    public func track<T>(_ featureName: String, _ fn: () async throws -> T) async rethrows -> T {
+    public func track<T>(_ featureName: String, meta: [String: Any]? = nil, _ fn: () async throws -> T) async rethrows -> T {
         let start = Date()
         do {
             let result = try await fn()
             let ms = Int(Date().timeIntervalSince(start) * 1000)
-            _push(featureName: featureName, ok: true, durationMs: ms, error: nil, source: "track")
+            _push(featureName: featureName, ok: true, durationMs: ms, error: nil, source: "track", meta: meta)
             return result
         } catch {
             let ms = Int(Date().timeIntervalSince(start) * 1000)
-            _push(featureName: featureName, ok: false, durationMs: ms, error: error.localizedDescription, source: "track")
+            _push(featureName: featureName, ok: false, durationMs: ms, error: error.localizedDescription, source: "track", meta: meta)
             throw error
         }
     }
