@@ -35,7 +35,7 @@ public final class OneloFeatures {
         discoveredNames.insert(name)
         if isNew { _scheduleBatchPing() }
         let status = cache[name] ?? .hidden
-        monitor?._trackFeatureCall(name)
+        if isNew { monitor?._trackFeatureCall(name) }
         return FeatureState(name: name, status: status)
     }
 
