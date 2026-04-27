@@ -30,6 +30,7 @@ public final class OneloAuth: ObservableObject {
     private let keychain: KeychainStorage
     let config: OneloConfig
     private var pkceVerifier: String?
+    private var _cachedAttestToken: String?
     #if DEBUG
     private var _skipInitialize: Bool = false
     #endif
@@ -69,7 +70,9 @@ public final class OneloAuth: ObservableObject {
             URLQueryItem(name: "key", value: config.publishableKey),
             URLQueryItem(name: "callback_scheme", value: scheme),
         ]
-        let (initData, initResponse) = try await URLSession.shared.data(from: components.url!)
+        var initRequest = URLRequest(url: components.url!)
+        addStandardHeaders(&initRequest)
+        let (initData, initResponse) = try await URLSession.shared.data(for: initRequest)
         guard let http = initResponse as? HTTPURLResponse, http.statusCode == 200 else {
             throw OneloError.serverError("Failed to initiate hosted auth flow")
         }
@@ -126,6 +129,7 @@ public final class OneloAuth: ObservableObject {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: exchangeBody)
+        addStandardHeaders(&request)
 
         let (exchangeData, exchangeResponse) = try await URLSession.shared.data(for: request)
         guard let exchangeHttp = exchangeResponse as? HTTPURLResponse, exchangeHttp.statusCode == 200 else {
@@ -166,7 +170,9 @@ public final class OneloAuth: ObservableObject {
             URLQueryItem(name: "key", value: config.publishableKey),
             URLQueryItem(name: "callback_scheme", value: scheme),
         ]
-        let (data, response) = try await URLSession.shared.data(from: components.url!)
+        var request = URLRequest(url: components.url!)
+        addStandardHeaders(&request)
+        let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             throw OneloError.serverError("Failed to initiate hosted auth flow")
         }
@@ -189,6 +195,7 @@ public final class OneloAuth: ObservableObject {
             "code": code,
             "publishableKey": config.publishableKey,
         ])
+        addStandardHeaders(&request)
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
@@ -362,6 +369,7 @@ public final class OneloAuth: ObservableObject {
             "refresh_token": refreshToken,
             "publishableKey": config.publishableKey,
         ])
+        addStandardHeaders(&request)
 
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse else {
@@ -470,6 +478,7 @@ public final class OneloAuth: ObservableObject {
                 localStorage: AuthClient.Configuration.defaultLocalStorage
             )
             isReady = true
+            Task.detached { [weak self] in await self?._refreshAttestToken() }
             await restoreSession()
         } catch OneloError.invalidPublishableKey {
             // Key was revoked or app deleted — clear session and signal to the UI
@@ -508,7 +517,8 @@ public final class OneloAuth: ObservableObject {
             URLQueryItem(name: "code_challenge", value: challenge),
         ]
 
-        let configRequest = URLRequest(url: components.url!)
+        var configRequest = URLRequest(url: components.url!)
+        addStandardHeaders(&configRequest)
         let (data, response) = try await URLSession.shared.data(for: configRequest)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             throw OneloError.invalidPublishableKey("Server rejected the key")
@@ -522,6 +532,35 @@ public final class OneloAuth: ObservableObject {
             throw OneloError.notAuthenticated
         }
         return client
+    }
+
+    /// Adds standard SDK headers (X-Publishable-Key, X-Bundle-Id, X-Attest-Token) to a request.
+    private func addStandardHeaders(_ request: inout URLRequest) {
+        request.setValue(config.publishableKey, forHTTPHeaderField: "X-Publishable-Key")
+        if let bundleId = Bundle.main.bundleIdentifier {
+            request.setValue(bundleId, forHTTPHeaderField: "X-Bundle-Id")
+        }
+        if let attestToken = _cachedAttestToken {
+            request.setValue(attestToken, forHTTPHeaderField: "X-Attest-Token")
+        }
+        #if os(macOS)
+        if let fp = OneloCodesignFallback.codesignFingerprint() {
+            request.setValue(fp, forHTTPHeaderField: "X-Codesign-Fingerprint")
+        }
+        #endif
+    }
+
+    /// Fetches a fresh App Attest token and caches it. No-op on unsupported platforms.
+    func _refreshAttestToken() async {
+        #if canImport(DeviceCheck)
+        if #available(iOS 14.0, macOS 11.0, *) {
+            let attest = OneloAppAttest(
+                baseURL: config.apiUrl.absoluteString,
+                publishableKey: config.publishableKey
+            )
+            _cachedAttestToken = try? await attest.getAttestToken()
+        }
+        #endif
     }
 
     private func restoreSession() async {
@@ -558,7 +597,7 @@ public final class OneloAuth: ObservableObject {
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-        request.setValue(config.publishableKey, forHTTPHeaderField: "X-Publishable-Key")
+        addStandardHeaders(&request)
 
         guard let (data, response) = try? await URLSession.shared.data(for: request),
               let http = response as? HTTPURLResponse else {
@@ -609,6 +648,7 @@ public final class OneloAuth: ObservableObject {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        addStandardHeaders(&request)
 
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse else {
@@ -663,6 +703,7 @@ public final class OneloAuth: ObservableObject {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        addStandardHeaders(&request)
 
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse else {
