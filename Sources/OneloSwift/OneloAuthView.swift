@@ -56,6 +56,10 @@ public struct OneloAuthView<Content: View>: View {
                         hostedUrl = nil
                         errorMessage = err
                         showRetry = true
+                    },
+                    onSessionExpired: {
+                        hostedUrl = nil
+                        Task { await loadHostedUrl() }
                     }
                 )
                 #if os(macOS)
@@ -142,15 +146,26 @@ public struct OneloAuthView<Content: View>: View {
 
 // MARK: - Embedded web auth view (WKWebView)
 
-private final class WebAuthCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
+private final class WebAuthCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
     let callbackScheme: String
     let onCode: (String) -> Void
     let onError: (String) -> Void
+    let onSessionExpired: () -> Void
 
-    init(callbackScheme: String, onCode: @escaping (String) -> Void, onError: @escaping (String) -> Void) {
+    init(callbackScheme: String, onCode: @escaping (String) -> Void, onError: @escaping (String) -> Void, onSessionExpired: @escaping () -> Void) {
         self.callbackScheme = callbackScheme
         self.onCode = onCode
         self.onError = onError
+        self.onSessionExpired = onSessionExpired
+    }
+
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        if message.name == "oneloNative",
+           let body = message.body as? [String: Any],
+           let type = body["type"] as? String,
+           type == "onelo:session_expired" {
+            DispatchQueue.main.async { self.onSessionExpired() }
+        }
     }
 
     func webView(
@@ -226,19 +241,36 @@ private final class WebAuthCoordinator: NSObject, WKNavigationDelegate, WKUIDele
     }
 }
 
+// JS relay: forward onelo:session_expired postMessage → WKScriptMessage handler
+private let sessionExpiredRelayScript = WKUserScript(
+    source: """
+    window.addEventListener('message', function(e) {
+        if (e.data && e.data.type === 'onelo:session_expired') {
+            window.webkit.messageHandlers.oneloNative.postMessage({ type: 'onelo:session_expired' });
+        }
+    });
+    """,
+    injectionTime: .atDocumentEnd,
+    forMainFrameOnly: true
+)
+
 #if os(macOS)
 private struct EmbeddedWebAuthView: NSViewRepresentable {
     let url: URL
     let callbackScheme: String
     let onCode: (String) -> Void
     let onError: (String) -> Void
+    let onSessionExpired: () -> Void
 
     func makeCoordinator() -> WebAuthCoordinator {
-        WebAuthCoordinator(callbackScheme: callbackScheme, onCode: onCode, onError: onError)
+        WebAuthCoordinator(callbackScheme: callbackScheme, onCode: onCode, onError: onError, onSessionExpired: onSessionExpired)
     }
 
     func makeNSView(context: Context) -> WKWebView {
-        let webView = WKWebView()
+        let config = WKWebViewConfiguration()
+        config.userContentController.add(context.coordinator, name: "oneloNative")
+        config.userContentController.addUserScript(sessionExpiredRelayScript)
+        let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
         webView.uiDelegate = context.coordinator
         webView.load(URLRequest(url: url))
@@ -246,8 +278,6 @@ private struct EmbeddedWebAuthView: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: WKWebView, context: Context) {
-        // Let the window title bar follow the system appearance (dark/light mode)
-        // rather than being stuck at whatever the default window color is.
         DispatchQueue.main.async {
             guard let window = nsView.window else { return }
             window.appearance = nil // follow system
@@ -260,13 +290,16 @@ private struct EmbeddedWebAuthView: UIViewRepresentable {
     let callbackScheme: String
     let onCode: (String) -> Void
     let onError: (String) -> Void
+    let onSessionExpired: () -> Void
 
     func makeCoordinator() -> WebAuthCoordinator {
-        WebAuthCoordinator(callbackScheme: callbackScheme, onCode: onCode, onError: onError)
+        WebAuthCoordinator(callbackScheme: callbackScheme, onCode: onCode, onError: onError, onSessionExpired: onSessionExpired)
     }
 
     func makeUIView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
+        config.userContentController.add(context.coordinator, name: "oneloNative")
+        config.userContentController.addUserScript(sessionExpiredRelayScript)
         let noZoomScript = WKUserScript(
             source: """
             var meta = document.querySelector('meta[name=viewport]');
