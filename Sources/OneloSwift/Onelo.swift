@@ -53,11 +53,6 @@ public final class Onelo {
                 if let token = self.auth.authObject.cachedAttestToken() {
                     self.httpClient.attestToken = token
                 }
-                #if os(macOS)
-                if let fp = OneloCodesignFallback.codesignFingerprint() {
-                    self.httpClient.codesignFingerprint = fp
-                }
-                #endif
                 await self.features._load(userId: nil)
                 break
             }

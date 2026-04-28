@@ -549,11 +549,6 @@ public final class OneloAuth: ObservableObject {
         if let attestToken = _cachedAttestToken {
             request.setValue(attestToken, forHTTPHeaderField: "X-Attest-Token")
         }
-        #if os(macOS)
-        if let fp = OneloCodesignFallback.codesignFingerprint() {
-            request.setValue(fp, forHTTPHeaderField: "X-Codesign-Fingerprint")
-        }
-        #endif
     }
 
     /// Fetches a fresh App Attest token and caches it. No-op on unsupported platforms.
