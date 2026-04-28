@@ -44,13 +44,23 @@ public final class Onelo {
         ))
         self.auth = OneloAuthModule(auth: oneloAuth)
 
-        Task {
-            await _ensureSecurityHeaders(
-                publishableKey: publishableKey,
-                baseURL: baseURL,
-                client: client
-            )
-            await features._load(userId: nil)
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            // Wait for OneloAuth to finish initializing (it handles attestation internally)
+            for await ready in self.auth.authObject.$isReady.values {
+                guard ready else { continue }
+                // Copy attest token from OneloAuth to the features HTTP client
+                if let token = self.auth.authObject.cachedAttestToken() {
+                    self.httpClient.attestToken = token
+                }
+                #if os(macOS)
+                if let fp = OneloCodesignFallback.codesignFingerprint() {
+                    self.httpClient.codesignFingerprint = fp
+                }
+                #endif
+                await self.features._load(userId: nil)
+                break
+            }
         }
 
         // Re-identify features when auth session changes
@@ -69,49 +79,3 @@ public final class Onelo {
     }
 }
 
-// MARK: - Security attestation
-
-/// Checks attest_required from /api/sdk/config, then runs platform-appropriate attestation.
-/// Writes result directly to httpClient so all subsequent requests carry the header.
-@MainActor
-private func _ensureSecurityHeaders(
-    publishableKey: String,
-    baseURL: URL,
-    client: _OneloHTTPClient
-) async {
-    guard let attestRequired = await _fetchAttestRequired(publishableKey: publishableKey, baseURL: baseURL),
-          attestRequired else {
-        return // not required — skip entirely
-    }
-
-    #if os(macOS)
-    if #available(macOS 14.0, *) {
-        await _runAppAttest(publishableKey: publishableKey, baseURL: baseURL, client: client)
-    } else {
-        // macOS 11–13: use codesign fingerprint fallback
-        if let fp = OneloCodesignFallback.codesignFingerprint() {
-            client.codesignFingerprint = fp
-        }
-    }
-    #elseif os(iOS)
-    if #available(iOS 14.0, *) {
-        await _runAppAttest(publishableKey: publishableKey, baseURL: baseURL, client: client)
-    }
-    #endif
-}
-
-@available(iOS 14.0, macOS 14.0, *)
-private func _runAppAttest(publishableKey: String, baseURL: URL, client: _OneloHTTPClient) async {
-    let attester = OneloAppAttest(baseURL: baseURL.absoluteString, publishableKey: publishableKey)
-    guard let token = try? await attester.getAttestToken() else { return }
-    client.attestToken = token
-}
-
-private func _fetchAttestRequired(publishableKey: String, baseURL: URL) async -> Bool? {
-    var components = URLComponents(url: baseURL.appendingPathComponent("api/sdk/config"), resolvingAgainstBaseURL: false)
-    components?.queryItems = [URLQueryItem(name: "key", value: publishableKey)]
-    guard let url = components?.url else { return nil }
-    guard let (data, _) = try? await URLSession.shared.data(from: url) else { return nil }
-    guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
-    return json["attest_required"] as? Bool
-}

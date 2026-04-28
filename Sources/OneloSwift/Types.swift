@@ -59,6 +59,7 @@ struct ResolvedConfig: Decodable {
     let supabaseAnonKey: String
     let tenantId: String
     let allowCustomBranding: Bool
+    let attestRequired: Bool
     let appName: String?
     let appLogoUrl: String?
 
@@ -67,6 +68,7 @@ struct ResolvedConfig: Decodable {
         case supabaseAnonKey = "supabase_anon_key"
         case tenantId = "tenant_id"
         case allowCustomBranding = "allow_custom_branding"
+        case attestRequired = "attest_required"
         case appName = "app_name"
         case appLogoUrl = "app_logo_url"
     }
@@ -78,6 +80,7 @@ struct ResolvedConfig: Decodable {
         tenantId = try c.decode(String.self, forKey: .tenantId)
         // Default false — safe fallback if backend doesn't send the field yet
         allowCustomBranding = (try? c.decode(Bool.self, forKey: .allowCustomBranding)) ?? false
+        attestRequired = (try? c.decode(Bool.self, forKey: .attestRequired)) ?? false
         appName = try? c.decode(String.self, forKey: .appName)
         appLogoUrl = try? c.decode(String.self, forKey: .appLogoUrl)
     }

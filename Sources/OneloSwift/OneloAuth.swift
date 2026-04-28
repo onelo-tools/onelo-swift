@@ -21,6 +21,9 @@ public final class OneloAuth: ObservableObject {
     /// True if the tenant's plan allows developer customization of the auth UI.
     /// Populated after `isReady` becomes true.
     @Published public private(set) var allowCustomBranding: Bool = false
+    /// True if the backend requires App Attest for this app.
+    /// Populated after `isReady` becomes true.
+    @Published public private(set) var attestRequired: Bool = false
     /// App name returned by /initiate — shown in HostedSignInButton before Safari opens.
     @Published public private(set) var hostedAppName: String = "App"
     /// App logo URL returned by /initiate — shown in HostedSignInButton if set, otherwise Onelo logo.
@@ -464,6 +467,7 @@ public final class OneloAuth: ObservableObject {
         do {
             let resolved = try await resolveConfig()
             allowCustomBranding = resolved.allowCustomBranding
+            attestRequired = resolved.attestRequired
             if let name = resolved.appName, !name.isEmpty { hostedAppName = name }
             if let logoStr = resolved.appLogoUrl { hostedAppLogoUrl = URL(string: logoStr) }
 
@@ -477,8 +481,10 @@ public final class OneloAuth: ObservableObject {
                 headers: ["apikey": resolved.supabaseAnonKey],
                 localStorage: AuthClient.Configuration.defaultLocalStorage
             )
+            if resolved.attestRequired {
+                await _refreshAttestToken()  // await — ensures token is ready before isReady = true
+            }
             isReady = true
-            Task.detached { [weak self] in await self?._refreshAttestToken() }
             await restoreSession()
         } catch OneloError.invalidPublishableKey {
             // Key was revoked or app deleted — clear session and signal to the UI
@@ -562,6 +568,10 @@ public final class OneloAuth: ObservableObject {
         }
         #endif
     }
+
+    /// Returns the cached App Attest token, if any. Used by Onelo to copy the token
+    /// to the features HTTP client after initialization completes.
+    func cachedAttestToken() -> String? { _cachedAttestToken }
 
     private func restoreSession() async {
         guard
