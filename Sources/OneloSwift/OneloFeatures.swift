@@ -109,17 +109,13 @@ public final class OneloFeatures {
 
     private func _poll(userId: String?) async {
         do {
-            var components = URLComponents(url: client.baseURL.appendingPathComponent("/api/sdk/features/poll"), resolvingAgainstBaseURL: false)!
             var queryItems = [
                 URLQueryItem(name: "key", value: client.publishableKey),
                 URLQueryItem(name: "version", value: String(configVersion)),
             ]
             if let uid = userId { queryItems.append(URLQueryItem(name: "userId", value: uid)) }
-            components.queryItems = queryItems
 
-            guard let url = components.url else { return }
-            let (data, _) = try await URLSession.shared.data(from: url)
-            guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+            let json = try await client.get(path: "/api/sdk/features/poll", queryItems: queryItems)
 
             if let changed = json["changed"] as? Bool, !changed { return }
 

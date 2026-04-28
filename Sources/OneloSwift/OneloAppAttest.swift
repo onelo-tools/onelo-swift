@@ -73,12 +73,18 @@ public final class OneloAppAttest {
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
+        #if os(macOS)
+        let platform = "macos"
+        #else
+        let platform = "ios"
+        #endif
+
         let body: [String: String] = [
             "attestation":     attestation.base64EncodedString(),
             "key_id":          keyId,
             "bundle_id":       bundleId,
             "challenge":       challenge,
-            "platform":        "ios",
+            "platform":        platform,
             "publishable_key": publishableKey,
         ]
         req.httpBody = try JSONEncoder().encode(body)

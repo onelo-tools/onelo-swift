@@ -44,17 +44,20 @@ public final class Onelo {
         ))
         self.auth = OneloAuthModule(auth: oneloAuth)
 
-        print("[OneloBridge] SDK initialized — features._load(nil)") // TODO: remove debug
-        Task { await features._load(userId: nil) }
+        Task {
+            await _ensureSecurityHeaders(
+                publishableKey: publishableKey,
+                baseURL: baseURL,
+                client: client
+            )
+            await features._load(userId: nil)
+        }
 
-        // Auto-identify features when Onelo Auth session changes
+        // Re-identify features when auth session changes
         Task { @MainActor [weak self] in
             guard let self else { return }
             for await session in self.auth.authObject.$currentSession.values {
-                let userId = session?.user.id
-                print("[OneloBridge] Auth state changed → userId: \(userId ?? "nil")") // TODO: remove debug
-                print("[OneloBridge] features._load(userId: \(userId ?? "nil"))") // TODO: remove debug
-                await self.features._load(userId: userId)
+                await self.features._load(userId: session?.user.id)
             }
         }
     }
@@ -62,7 +65,53 @@ public final class Onelo {
     /// Set user context for feature targeting. Call once after login.
     /// Only needed when NOT using Onelo Auth — Onelo Auth sets this automatically.
     public func identify(_ userId: String) async {
-        print("[OneloBridge] identify(userId: \(userId)) → features._load") // TODO: remove debug
         await features._load(userId: userId)
     }
+}
+
+// MARK: - Security attestation
+
+/// Checks attest_required from /api/sdk/config, then runs platform-appropriate attestation.
+/// Writes result directly to httpClient so all subsequent requests carry the header.
+@MainActor
+private func _ensureSecurityHeaders(
+    publishableKey: String,
+    baseURL: URL,
+    client: _OneloHTTPClient
+) async {
+    guard let attestRequired = await _fetchAttestRequired(publishableKey: publishableKey, baseURL: baseURL),
+          attestRequired else {
+        return // not required — skip entirely
+    }
+
+    #if os(macOS)
+    if #available(macOS 14.0, *) {
+        await _runAppAttest(publishableKey: publishableKey, baseURL: baseURL, client: client)
+    } else {
+        // macOS 11–13: use codesign fingerprint fallback
+        if let fp = OneloCodesignFallback.codesignFingerprint() {
+            client.codesignFingerprint = fp
+        }
+    }
+    #elseif os(iOS)
+    if #available(iOS 14.0, *) {
+        await _runAppAttest(publishableKey: publishableKey, baseURL: baseURL, client: client)
+    }
+    #endif
+}
+
+@available(iOS 14.0, macOS 14.0, *)
+private func _runAppAttest(publishableKey: String, baseURL: URL, client: _OneloHTTPClient) async {
+    let attester = OneloAppAttest(baseURL: baseURL.absoluteString, publishableKey: publishableKey)
+    guard let token = try? await attester.getAttestToken() else { return }
+    client.attestToken = token
+}
+
+private func _fetchAttestRequired(publishableKey: String, baseURL: URL) async -> Bool? {
+    var components = URLComponents(url: baseURL.appendingPathComponent("api/sdk/config"), resolvingAgainstBaseURL: false)
+    components?.queryItems = [URLQueryItem(name: "key", value: publishableKey)]
+    guard let url = components?.url else { return nil }
+    guard let (data, _) = try? await URLSession.shared.data(from: url) else { return nil }
+    guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+    return json["attest_required"] as? Bool
 }
