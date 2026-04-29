@@ -19,6 +19,8 @@ public struct OneloAuthView<Content: View>: View {
     @State private var hostedUrl: URL? = nil
     @State private var showRetry: Bool = false
     @State private var errorMessage: String? = nil
+    @State private var isOnExternalPage: Bool = false
+    @State private var reloadWebView: Bool = false
 
     private var effectiveConfig: OneloAuthConfig { requestedConfig }
 
@@ -46,26 +48,48 @@ public struct OneloAuthView<Content: View>: View {
                 content()
             } else if let url = hostedUrl, !showRetry {
                 // Hosted page embedded in the app window via WKWebView
-                EmbeddedWebAuthView(
-                    url: url,
-                    callbackScheme: callbackScheme,
-                    onCode: { code in
-                        Task { await handleCode(code) }
-                    },
-                    onError: { err in
-                        hostedUrl = nil
-                        errorMessage = err
-                        showRetry = true
-                    },
-                    onSessionExpired: {
-                        hostedUrl = nil
-                        Task { await loadHostedUrl() }
+                ZStack(alignment: .topLeading) {
+                    EmbeddedWebAuthView(
+                        url: url,
+                        callbackScheme: callbackScheme,
+                        onCode: { code in
+                            Task { await handleCode(code) }
+                        },
+                        onError: { err in
+                            hostedUrl = nil
+                            errorMessage = err
+                            showRetry = true
+                        },
+                        onSessionExpired: {
+                            hostedUrl = nil
+                            Task { await loadHostedUrl() }
+                        },
+                        onExternalNavigation: { isExternal in
+                            isOnExternalPage = isExternal
+                        },
+                        shouldReload: $reloadWebView
+                    )
+                    #if os(macOS)
+                    .frame(minWidth: 440, minHeight: 680)
+                    .ignoresSafeArea()
+                    #endif
+
+                    if isOnExternalPage {
+                        Button(action: {
+                            isOnExternalPage = false
+                            reloadWebView = true
+                        }) {
+                            Label("Use a different method", systemImage: "chevron.left")
+                                .font(.subheadline.weight(.medium))
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 7)
+                                .background(.ultraThinMaterial)
+                                .clipShape(Capsule())
+                        }
+                        .buttonStyle(.plain)
+                        .padding(12)
                     }
-                )
-                #if os(macOS)
-                .frame(minWidth: 440, minHeight: 680)
-                .ignoresSafeArea()
-                #endif
+                }
             } else {
                 // Loading state or retry after cancel/error
                 ZStack {
@@ -148,12 +172,15 @@ public struct OneloAuthView<Content: View>: View {
 
 private final class WebAuthCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
     let callbackScheme: String
+    let originalHost: String?
     let onCode: (String) -> Void
     let onError: (String) -> Void
     let onSessionExpired: () -> Void
+    var onExternalNavigation: ((Bool) -> Void)?
 
-    init(callbackScheme: String, onCode: @escaping (String) -> Void, onError: @escaping (String) -> Void, onSessionExpired: @escaping () -> Void) {
+    init(callbackScheme: String, originalHost: String?, onCode: @escaping (String) -> Void, onError: @escaping (String) -> Void, onSessionExpired: @escaping () -> Void) {
         self.callbackScheme = callbackScheme
+        self.originalHost = originalHost
         self.onCode = onCode
         self.onError = onError
         self.onSessionExpired = onSessionExpired
@@ -226,6 +253,8 @@ private final class WebAuthCoordinator: NSObject, WKNavigationDelegate, WKUIDele
             "document.documentElement.style.overflowX='hidden';" +
             "document.body.style.overflowX='hidden';"
         )
+        let isExternal = webView.url?.host != nil && webView.url?.host != originalHost
+        DispatchQueue.main.async { self.onExternalNavigation?(isExternal) }
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
@@ -261,9 +290,13 @@ private struct EmbeddedWebAuthView: NSViewRepresentable {
     let onCode: (String) -> Void
     let onError: (String) -> Void
     let onSessionExpired: () -> Void
+    var onExternalNavigation: ((Bool) -> Void)? = nil
+    @Binding var shouldReload: Bool
 
     func makeCoordinator() -> WebAuthCoordinator {
-        WebAuthCoordinator(callbackScheme: callbackScheme, onCode: onCode, onError: onError, onSessionExpired: onSessionExpired)
+        let c = WebAuthCoordinator(callbackScheme: callbackScheme, originalHost: url.host, onCode: onCode, onError: onError, onSessionExpired: onSessionExpired)
+        c.onExternalNavigation = onExternalNavigation
+        return c
     }
 
     func makeNSView(context: Context) -> WKWebView {
@@ -278,6 +311,10 @@ private struct EmbeddedWebAuthView: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: WKWebView, context: Context) {
+        if shouldReload {
+            nsView.load(URLRequest(url: url))
+            DispatchQueue.main.async { shouldReload = false }
+        }
         DispatchQueue.main.async {
             guard let window = nsView.window else { return }
             window.appearance = nil // follow system
@@ -291,9 +328,13 @@ private struct EmbeddedWebAuthView: UIViewRepresentable {
     let onCode: (String) -> Void
     let onError: (String) -> Void
     let onSessionExpired: () -> Void
+    var onExternalNavigation: ((Bool) -> Void)? = nil
+    @Binding var shouldReload: Bool
 
     func makeCoordinator() -> WebAuthCoordinator {
-        WebAuthCoordinator(callbackScheme: callbackScheme, onCode: onCode, onError: onError, onSessionExpired: onSessionExpired)
+        let c = WebAuthCoordinator(callbackScheme: callbackScheme, originalHost: url.host, onCode: onCode, onError: onError, onSessionExpired: onSessionExpired)
+        c.onExternalNavigation = onExternalNavigation
+        return c
     }
 
     func makeUIView(context: Context) -> WKWebView {
@@ -319,7 +360,12 @@ private struct EmbeddedWebAuthView: UIViewRepresentable {
         return webView
     }
 
-    func updateUIView(_ uiView: WKWebView, context: Context) {}
+    func updateUIView(_ uiView: WKWebView, context: Context) {
+        if shouldReload {
+            uiView.load(URLRequest(url: url))
+            DispatchQueue.main.async { shouldReload = false }
+        }
+    }
 }
 #endif
 
