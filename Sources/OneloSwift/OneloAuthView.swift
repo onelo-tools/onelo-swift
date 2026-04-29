@@ -130,6 +130,8 @@ public struct OneloAuthView<Content: View>: View {
                 isAuthenticated = session != nil
                 if wasAuthenticated && session == nil && isReady {
                     hostedUrl = nil
+                    showRetry = false
+                    errorMessage = nil
                     await loadHostedUrl()
                 }
             }
