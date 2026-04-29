@@ -126,9 +126,8 @@ public struct OneloAuthView<Content: View>: View {
         .task {
             guard let oneloAuth = auth as? OneloAuth else { return }
             for await session in oneloAuth.$currentSession.values {
-                let wasAuthenticated = isAuthenticated
                 isAuthenticated = session != nil
-                if wasAuthenticated && session == nil && isReady {
+                if session == nil && isReady {
                     hostedUrl = nil
                     showRetry = false
                     errorMessage = nil
