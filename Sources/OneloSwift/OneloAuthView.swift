@@ -206,10 +206,14 @@ private final class WebAuthCoordinator: NSObject, WKNavigationDelegate, WKUIDele
         }
         // Intercept auth callback
         if url.scheme?.lowercased() == callbackScheme.lowercased() {
-            let code = URLComponents(url: url, resolvingAgainstBaseURL: false)?
-                .queryItems?.first(where: { $0.name == "code" })?.value
-            if let code {
+            let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+            let items = components?.queryItems
+            if let code = items?.first(where: { $0.name == "code" })?.value {
                 DispatchQueue.main.async { self.onCode(code) }
+            } else if let error = items?.first(where: { $0.name == "error" })?.value,
+                      error == "expired_token" || error == "invalid_token" || error == "token_expired" {
+                // Token expired while user was idle — reload hosted page silently
+                DispatchQueue.main.async { self.onSessionExpired() }
             } else {
                 DispatchQueue.main.async { self.onError("Auth callback missing code parameter") }
             }
