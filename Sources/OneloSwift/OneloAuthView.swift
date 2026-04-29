@@ -173,14 +173,16 @@ public struct OneloAuthView<Content: View>: View {
 private final class WebAuthCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
     let callbackScheme: String
     let originalHost: String?
+    let originalPath: String?
     let onCode: (String) -> Void
     let onError: (String) -> Void
     let onSessionExpired: () -> Void
     var onExternalNavigation: ((Bool) -> Void)?
 
-    init(callbackScheme: String, originalHost: String?, onCode: @escaping (String) -> Void, onError: @escaping (String) -> Void, onSessionExpired: @escaping () -> Void) {
+    init(callbackScheme: String, originalHost: String?, originalPath: String?, onCode: @escaping (String) -> Void, onError: @escaping (String) -> Void, onSessionExpired: @escaping () -> Void) {
         self.callbackScheme = callbackScheme
         self.originalHost = originalHost
+        self.originalPath = originalPath
         self.onCode = onCode
         self.onError = onError
         self.onSessionExpired = onSessionExpired
@@ -257,8 +259,16 @@ private final class WebAuthCoordinator: NSObject, WKNavigationDelegate, WKUIDele
             "document.documentElement.style.overflowX='hidden';" +
             "document.body.style.overflowX='hidden';"
         )
-        let isExternal = webView.url?.host != nil && webView.url?.host != originalHost
+        guard let currentURL = webView.url else { return }
+        let currentHost = currentURL.host
+        let isExternal = currentHost != nil && currentHost != originalHost
         DispatchQueue.main.async { self.onExternalNavigation?(isExternal) }
+
+        // Detect landing on the same host but wrong path (e.g. /?error=... after failed OAuth)
+        // — reload the hosted auth page silently instead of showing blank/wrong content
+        if !isExternal, let path = originalPath, !currentURL.path.hasPrefix(path) {
+            DispatchQueue.main.async { self.onSessionExpired() }
+        }
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
@@ -298,7 +308,7 @@ private struct EmbeddedWebAuthView: NSViewRepresentable {
     @Binding var shouldReload: Bool
 
     func makeCoordinator() -> WebAuthCoordinator {
-        let c = WebAuthCoordinator(callbackScheme: callbackScheme, originalHost: url.host, onCode: onCode, onError: onError, onSessionExpired: onSessionExpired)
+        let c = WebAuthCoordinator(callbackScheme: callbackScheme, originalHost: url.host, originalPath: url.path, onCode: onCode, onError: onError, onSessionExpired: onSessionExpired)
         c.onExternalNavigation = onExternalNavigation
         return c
     }
@@ -336,7 +346,7 @@ private struct EmbeddedWebAuthView: UIViewRepresentable {
     @Binding var shouldReload: Bool
 
     func makeCoordinator() -> WebAuthCoordinator {
-        let c = WebAuthCoordinator(callbackScheme: callbackScheme, originalHost: url.host, onCode: onCode, onError: onError, onSessionExpired: onSessionExpired)
+        let c = WebAuthCoordinator(callbackScheme: callbackScheme, originalHost: url.host, originalPath: url.path, onCode: onCode, onError: onError, onSessionExpired: onSessionExpired)
         c.onExternalNavigation = onExternalNavigation
         return c
     }
