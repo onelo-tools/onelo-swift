@@ -21,6 +21,7 @@ public struct OneloAuthView<Content: View>: View {
     @State private var errorMessage: String? = nil
     @State private var isOnExternalPage: Bool = false
     @State private var reloadWebView: Bool = false
+    @State private var isLoadingUrl: Bool = false
 
     private var effectiveConfig: OneloAuthConfig { requestedConfig }
 
@@ -121,32 +122,39 @@ public struct OneloAuthView<Content: View>: View {
                             .tint(.white.opacity(0.3))
                     }
                 }
-                .onAppear {
-                    guard isReady && hostedUrl == nil && !showRetry else { return }
-                    Task { await loadHostedUrl() }
-                }
             }
+        }
+        // Handles re-creation pattern: view is built fresh after logout while isReady is already true.
+        // In that case @Published never emits a new value, so we check auth.isReady directly on appear.
+        .onAppear {
+            guard let oneloAuth = auth as? OneloAuth else { return }
+            guard oneloAuth.isReady && !isAuthenticated && hostedUrl == nil && !showRetry else { return }
+            Task { await loadHostedUrl() }
         }
         .task {
             guard let oneloAuth = auth as? OneloAuth else { return }
             for await session in oneloAuth.$currentSession.values {
                 isAuthenticated = session != nil
+                // Handles embedded pattern: same view instance, session goes nil on logout.
+                // Clear stale hosted URL and reload immediately — no reliance on .onChange timing.
+                if session == nil {
+                    hostedUrl = nil
+                    showRetry = false
+                    errorMessage = nil
+                    if isReady {
+                        await loadHostedUrl()
+                    }
+                }
             }
         }
         .task {
             guard let oneloAuth = auth as? OneloAuth else { return }
             for await value in oneloAuth.$isReady.values {
                 isReady = value
-                if value && !isAuthenticated {
+                // Handles initial launch: view appears before isReady, then isReady fires.
+                if value && !isAuthenticated && hostedUrl == nil && !showRetry {
                     await loadHostedUrl()
                 }
-            }
-        }
-        .onChange(of: isAuthenticated) { _, newValue in
-            if !newValue {
-                hostedUrl = nil
-                showRetry = false
-                errorMessage = nil
             }
         }
     }
@@ -157,7 +165,10 @@ public struct OneloAuthView<Content: View>: View {
 
     @MainActor
     private func loadHostedUrl() async {
+        guard !isLoadingUrl, hostedUrl == nil else { return }
         guard let oneloAuth = auth as? OneloAuth else { return }
+        isLoadingUrl = true
+        defer { isLoadingUrl = false }
         do {
             hostedUrl = try await oneloAuth.initiateHostedFlow()
         } catch {
