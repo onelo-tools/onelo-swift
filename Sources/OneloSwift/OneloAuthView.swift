@@ -121,18 +121,16 @@ public struct OneloAuthView<Content: View>: View {
                             .tint(.white.opacity(0.3))
                     }
                 }
+                .onAppear {
+                    guard isReady && hostedUrl == nil && !showRetry else { return }
+                    Task { await loadHostedUrl() }
+                }
             }
         }
         .task {
             guard let oneloAuth = auth as? OneloAuth else { return }
             for await session in oneloAuth.$currentSession.values {
                 isAuthenticated = session != nil
-                if session == nil && isReady {
-                    hostedUrl = nil
-                    showRetry = false
-                    errorMessage = nil
-                    await loadHostedUrl()
-                }
             }
         }
         .task {
@@ -142,6 +140,13 @@ public struct OneloAuthView<Content: View>: View {
                 if value && !isAuthenticated {
                     await loadHostedUrl()
                 }
+            }
+        }
+        .onChange(of: isAuthenticated) { _, newValue in
+            if !newValue {
+                hostedUrl = nil
+                showRetry = false
+                errorMessage = nil
             }
         }
     }
