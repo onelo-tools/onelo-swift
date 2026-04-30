@@ -2,6 +2,10 @@ import Foundation
 import CommonCrypto
 import Supabase
 import AuthenticationServices
+#if DEBUG
+import os
+private let _authLog = Logger(subsystem: "com.onelo.sdk", category: "auth")
+#endif
 
 /// OneloAuth — Swift SDK for Onelo authentication.
 ///
@@ -345,17 +349,17 @@ public final class OneloAuth: ObservableObject {
             try? await client.signOut()
         }
         #if DEBUG
-        print("[OneloAuth] signOut: keychain.clear() about to run")
+        _authLog.debug("signOut: keychain.clear() about to run")
         #endif
         try keychain.clear()
         #if DEBUG
-        print("[OneloAuth] signOut: currentSession = nil")
+        _authLog.debug("signOut: currentSession = nil")
         #endif
         currentSession = nil
         pkceVerifier = nil
         Task { await self.initialize() }
         #if DEBUG
-        print("[OneloAuth] signOut: done, initialize() spawned")
+        _authLog.debug("signOut: done, initialize() spawned")
         #endif
     }
 

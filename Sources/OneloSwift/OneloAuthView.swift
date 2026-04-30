@@ -2,6 +2,10 @@
 import SwiftUI
 import WebKit
 import Combine
+#if DEBUG
+import os
+private let _viewLog = Logger(subsystem: "com.onelo.sdk", category: "authview")
+#endif
 
 /// Drop-in SwiftUI authentication view.
 ///
@@ -138,7 +142,7 @@ public struct OneloAuthView<Content: View>: View {
             let wasAuthenticated = isAuthenticated
             isAuthenticated = session != nil
             #if DEBUG
-            print("[OneloAuthView] sessionPublisher: session=\(session != nil ? "non-nil" : "nil"), wasAuthenticated=\(wasAuthenticated), isReady=\(isReady)")
+            _viewLog.debug("sessionPublisher: session=\(session != nil ? "non-nil" : "nil"), wasAuthenticated=\(wasAuthenticated), isReady=\(isReady)")
             #endif
             if wasAuthenticated && session == nil {
                 hostedUrl = nil
@@ -146,12 +150,12 @@ public struct OneloAuthView<Content: View>: View {
                 errorMessage = nil
                 if isReady {
                     #if DEBUG
-                    print("[OneloAuthView] signOut detected → loadHostedUrl()")
+                    _viewLog.debug("signOut detected → loadHostedUrl()")
                     #endif
                     Task { await loadHostedUrl() }
                 } else {
                     #if DEBUG
-                    print("[OneloAuthView] signOut detected but isReady=false, waiting for readyPublisher")
+                    _viewLog.debug("signOut detected but isReady=false, waiting for readyPublisher")
                     #endif
                 }
             }
@@ -159,11 +163,11 @@ public struct OneloAuthView<Content: View>: View {
         .onReceive(readyPublisher) { ready in
             isReady = ready
             #if DEBUG
-            print("[OneloAuthView] readyPublisher: ready=\(ready), isAuthenticated=\(isAuthenticated), hostedUrl=\(hostedUrl != nil ? "set" : "nil")")
+            _viewLog.debug("readyPublisher: ready=\(ready), isAuthenticated=\(isAuthenticated), hostedUrl=\(hostedUrl != nil ? "set" : "nil")")
             #endif
             if ready && !isAuthenticated && hostedUrl == nil && !showRetry {
                 #if DEBUG
-                print("[OneloAuthView] readyPublisher trigger → loadHostedUrl()")
+                _viewLog.debug("readyPublisher trigger → loadHostedUrl()")
                 #endif
                 Task { await loadHostedUrl() }
             }
@@ -171,11 +175,11 @@ public struct OneloAuthView<Content: View>: View {
         .onAppear {
             guard let oneloAuth = auth as? OneloAuth else { return }
             #if DEBUG
-            print("[OneloAuthView] onAppear: isReady=\(oneloAuth.isReady), isAuthenticated=\(isAuthenticated)")
+            _viewLog.debug("onAppear: isReady=\(oneloAuth.isReady), isAuthenticated=\(isAuthenticated)")
             #endif
             guard oneloAuth.isReady && !isAuthenticated && hostedUrl == nil && !showRetry else { return }
             #if DEBUG
-            print("[OneloAuthView] onAppear trigger → loadHostedUrl()")
+            _viewLog.debug("onAppear trigger → loadHostedUrl()")
             #endif
             Task { await loadHostedUrl() }
         }
@@ -188,17 +192,17 @@ public struct OneloAuthView<Content: View>: View {
     @MainActor
     private func loadHostedUrl() async {
         #if DEBUG
-        print("[OneloAuthView] loadHostedUrl() called: isLoadingUrl=\(isLoadingUrl), hostedUrl=\(hostedUrl != nil ? "set" : "nil")")
+        _viewLog.debug("loadHostedUrl() called: isLoadingUrl=\(isLoadingUrl), hostedUrl=\(hostedUrl != nil ? "set" : "nil")")
         #endif
         guard !isLoadingUrl, hostedUrl == nil else {
             #if DEBUG
-            print("[OneloAuthView] loadHostedUrl() SKIPPED by guard")
+            _viewLog.debug("loadHostedUrl() SKIPPED by guard")
             #endif
             return
         }
         guard let oneloAuth = auth as? OneloAuth else {
             #if DEBUG
-            print("[OneloAuthView] loadHostedUrl() SKIPPED — auth cast failed")
+            _viewLog.debug("loadHostedUrl() SKIPPED — auth cast failed")
             #endif
             return
         }
@@ -206,15 +210,15 @@ public struct OneloAuthView<Content: View>: View {
         defer { isLoadingUrl = false }
         do {
             #if DEBUG
-            print("[OneloAuthView] calling initiateHostedFlow()…")
+            _viewLog.debug("calling initiateHostedFlow()…")
             #endif
             hostedUrl = try await oneloAuth.initiateHostedFlow()
             #if DEBUG
-            print("[OneloAuthView] hostedUrl set: \(hostedUrl?.absoluteString ?? "nil")")
+            _viewLog.debug("hostedUrl set OK")
             #endif
         } catch {
             #if DEBUG
-            print("[OneloAuthView] initiateHostedFlow() error: \(error)")
+            _viewLog.debug("initiateHostedFlow() error: \(error.localizedDescription)")
             #endif
             errorMessage = error.localizedDescription
             showRetry = true
