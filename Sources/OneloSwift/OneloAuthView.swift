@@ -85,7 +85,7 @@ public struct OneloAuthView<Content: View>: View {
                         shouldReload: $reloadWebView
                     )
                     #if os(macOS)
-                    .frame(minWidth: 440, minHeight: 680)
+                    .frame(minWidth: 440)
                     .ignoresSafeArea()
                     #endif
 
@@ -401,6 +401,7 @@ private struct EmbeddedWebAuthView: NSViewRepresentable {
             let titleBarHeight = window.frame.height - (window.contentView?.frame.height ?? 0)
             let newWindowHeight = contentHeight + titleBarHeight
             guard abs(window.frame.height - newWindowHeight) > 4 else { return }
+            window.minSize = NSSize(width: 440, height: newWindowHeight)
             var frame = window.frame
             frame.origin.y -= (newWindowHeight - frame.height)
             frame.size.height = newWindowHeight
