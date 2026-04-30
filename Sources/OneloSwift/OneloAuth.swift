@@ -477,6 +477,7 @@ public final class OneloAuth: ObservableObject {
         #if DEBUG
         guard !_skipInitialize else { return }
         #endif
+        isReady = false
         do {
             let resolved = try await resolveConfig()
             allowCustomBranding = resolved.allowCustomBranding
