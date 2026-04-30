@@ -248,6 +248,7 @@ private final class WebAuthCoordinator: NSObject, WKNavigationDelegate, WKUIDele
     let onError: (String) -> Void
     let onSessionExpired: () -> Void
     var onExternalNavigation: ((Bool) -> Void)?
+    var onContentHeight: ((CGFloat) -> Void)?
 
     init(callbackScheme: String, originalHost: String?, originalPath: String?, onCode: @escaping (String) -> Void, onError: @escaping (String) -> Void, onSessionExpired: @escaping () -> Void) {
         self.callbackScheme = callbackScheme
@@ -338,6 +339,21 @@ private final class WebAuthCoordinator: NSObject, WKNavigationDelegate, WKUIDele
         // — reload the hosted auth page silently instead of showing blank/wrong content
         if !isExternal, let path = originalPath, !currentURL.path.hasPrefix(path) {
             DispatchQueue.main.async { self.onSessionExpired() }
+            return
+        }
+
+        if onContentHeight != nil {
+            // Small delay to let Next.js finish rendering before measuring height
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                webView.evaluateJavaScript("document.documentElement.scrollHeight") { result, _ in
+                    let h: CGFloat
+                    if let n = result as? CGFloat { h = n }
+                    else if let n = result as? Int { h = CGFloat(n) }
+                    else if let n = result as? Double { h = CGFloat(n) }
+                    else { return }
+                    DispatchQueue.main.async { self.onContentHeight?(h) }
+                }
+            }
         }
     }
 
@@ -380,6 +396,16 @@ private struct EmbeddedWebAuthView: NSViewRepresentable {
     func makeCoordinator() -> WebAuthCoordinator {
         let c = WebAuthCoordinator(callbackScheme: callbackScheme, originalHost: url.host, originalPath: url.path, onCode: onCode, onError: onError, onSessionExpired: onSessionExpired)
         c.onExternalNavigation = onExternalNavigation
+        c.onContentHeight = { contentHeight in
+            guard let window = NSApp.windows.first(where: { $0.isKeyWindow }) ?? NSApp.windows.first else { return }
+            let titleBarHeight = window.frame.height - (window.contentView?.frame.height ?? 0)
+            let newWindowHeight = contentHeight + titleBarHeight
+            guard abs(window.frame.height - newWindowHeight) > 4 else { return }
+            var frame = window.frame
+            frame.origin.y -= (newWindowHeight - frame.height)
+            frame.size.height = newWindowHeight
+            window.setFrame(frame, display: true, animate: false)
+        }
         return c
     }
 
@@ -390,6 +416,8 @@ private struct EmbeddedWebAuthView: NSViewRepresentable {
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
         webView.uiDelegate = context.coordinator
+        webView.enclosingScrollView?.hasVerticalScroller = false
+        webView.enclosingScrollView?.verticalScrollElasticity = .none
         webView.load(URLRequest(url: url))
         return webView
     }
