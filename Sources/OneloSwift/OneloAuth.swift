@@ -351,7 +351,7 @@ public final class OneloAuth: ObservableObject {
         #if DEBUG
         _authLog.debug("signOut: keychain.clear() about to run")
         #endif
-        try keychain.clear()
+        try? keychain.clear()
         #if DEBUG
         _authLog.debug("signOut: currentSession = nil")
         #endif
