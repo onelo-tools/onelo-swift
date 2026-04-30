@@ -1,6 +1,7 @@
 // Sources/OneloSwift/OneloAuthView.swift
 import SwiftUI
 import WebKit
+import Combine
 
 /// Drop-in SwiftUI authentication view.
 ///
@@ -14,6 +15,8 @@ public struct OneloAuthView<Content: View>: View {
     private let requestedConfig: OneloAuthConfig
     private let auth: any OneloAuthProtocol
     private let content: () -> Content
+    private let sessionPublisher: AnyPublisher<OneloSession?, Never>
+    private let readyPublisher: AnyPublisher<Bool, Never>
     @State private var isAuthenticated: Bool = false
     @State private var isReady: Bool = false
     @State private var hostedUrl: URL? = nil
@@ -41,6 +44,13 @@ public struct OneloAuthView<Content: View>: View {
         self.requestedConfig = config
         self.auth = auth
         _vm = StateObject(wrappedValue: OneloAuthViewModel(auth: auth, onSuccess: nil))
+        if let oneloAuth = auth as? OneloAuth {
+            sessionPublisher = oneloAuth.$currentSession.eraseToAnyPublisher()
+            readyPublisher = oneloAuth.$isReady.eraseToAnyPublisher()
+        } else {
+            sessionPublisher = Just(Optional<OneloSession>.none).eraseToAnyPublisher()
+            readyPublisher = Just(false).eraseToAnyPublisher()
+        }
     }
 
     public var body: some View {
@@ -124,38 +134,50 @@ public struct OneloAuthView<Content: View>: View {
                 }
             }
         }
-        // Handles re-creation pattern: view is built fresh after logout while isReady is already true.
-        // In that case @Published never emits a new value, so we check auth.isReady directly on appear.
+        .onReceive(sessionPublisher) { session in
+            let wasAuthenticated = isAuthenticated
+            isAuthenticated = session != nil
+            #if DEBUG
+            print("[OneloAuthView] sessionPublisher: session=\(session != nil ? "non-nil" : "nil"), wasAuthenticated=\(wasAuthenticated), isReady=\(isReady)")
+            #endif
+            if wasAuthenticated && session == nil {
+                hostedUrl = nil
+                showRetry = false
+                errorMessage = nil
+                if isReady {
+                    #if DEBUG
+                    print("[OneloAuthView] signOut detected → loadHostedUrl()")
+                    #endif
+                    Task { await loadHostedUrl() }
+                } else {
+                    #if DEBUG
+                    print("[OneloAuthView] signOut detected but isReady=false, waiting for readyPublisher")
+                    #endif
+                }
+            }
+        }
+        .onReceive(readyPublisher) { ready in
+            isReady = ready
+            #if DEBUG
+            print("[OneloAuthView] readyPublisher: ready=\(ready), isAuthenticated=\(isAuthenticated), hostedUrl=\(hostedUrl != nil ? "set" : "nil")")
+            #endif
+            if ready && !isAuthenticated && hostedUrl == nil && !showRetry {
+                #if DEBUG
+                print("[OneloAuthView] readyPublisher trigger → loadHostedUrl()")
+                #endif
+                Task { await loadHostedUrl() }
+            }
+        }
         .onAppear {
             guard let oneloAuth = auth as? OneloAuth else { return }
+            #if DEBUG
+            print("[OneloAuthView] onAppear: isReady=\(oneloAuth.isReady), isAuthenticated=\(isAuthenticated)")
+            #endif
             guard oneloAuth.isReady && !isAuthenticated && hostedUrl == nil && !showRetry else { return }
+            #if DEBUG
+            print("[OneloAuthView] onAppear trigger → loadHostedUrl()")
+            #endif
             Task { await loadHostedUrl() }
-        }
-        .task {
-            guard let oneloAuth = auth as? OneloAuth else { return }
-            for await session in oneloAuth.$currentSession.values {
-                isAuthenticated = session != nil
-                // Handles embedded pattern: same view instance, session goes nil on logout.
-                // Clear stale hosted URL and reload immediately — no reliance on .onChange timing.
-                if session == nil {
-                    hostedUrl = nil
-                    showRetry = false
-                    errorMessage = nil
-                    if isReady {
-                        await loadHostedUrl()
-                    }
-                }
-            }
-        }
-        .task {
-            guard let oneloAuth = auth as? OneloAuth else { return }
-            for await value in oneloAuth.$isReady.values {
-                isReady = value
-                // Handles initial launch: view appears before isReady, then isReady fires.
-                if value && !isAuthenticated && hostedUrl == nil && !showRetry {
-                    await loadHostedUrl()
-                }
-            }
         }
     }
 
@@ -165,13 +187,35 @@ public struct OneloAuthView<Content: View>: View {
 
     @MainActor
     private func loadHostedUrl() async {
-        guard !isLoadingUrl, hostedUrl == nil else { return }
-        guard let oneloAuth = auth as? OneloAuth else { return }
+        #if DEBUG
+        print("[OneloAuthView] loadHostedUrl() called: isLoadingUrl=\(isLoadingUrl), hostedUrl=\(hostedUrl != nil ? "set" : "nil")")
+        #endif
+        guard !isLoadingUrl, hostedUrl == nil else {
+            #if DEBUG
+            print("[OneloAuthView] loadHostedUrl() SKIPPED by guard")
+            #endif
+            return
+        }
+        guard let oneloAuth = auth as? OneloAuth else {
+            #if DEBUG
+            print("[OneloAuthView] loadHostedUrl() SKIPPED — auth cast failed")
+            #endif
+            return
+        }
         isLoadingUrl = true
         defer { isLoadingUrl = false }
         do {
+            #if DEBUG
+            print("[OneloAuthView] calling initiateHostedFlow()…")
+            #endif
             hostedUrl = try await oneloAuth.initiateHostedFlow()
+            #if DEBUG
+            print("[OneloAuthView] hostedUrl set: \(hostedUrl?.absoluteString ?? "nil")")
+            #endif
         } catch {
+            #if DEBUG
+            print("[OneloAuthView] initiateHostedFlow() error: \(error)")
+            #endif
             errorMessage = error.localizedDescription
             showRetry = true
         }

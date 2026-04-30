@@ -344,10 +344,19 @@ public final class OneloAuth: ObservableObject {
         if let client {
             try? await client.signOut()
         }
+        #if DEBUG
+        print("[OneloAuth] signOut: keychain.clear() about to run")
+        #endif
         try keychain.clear()
+        #if DEBUG
+        print("[OneloAuth] signOut: currentSession = nil")
+        #endif
         currentSession = nil
         pkceVerifier = nil
         Task { await self.initialize() }
+        #if DEBUG
+        print("[OneloAuth] signOut: done, initialize() spawned")
+        #endif
     }
 
     public func resetPassword(email: String, redirectTo: URL? = nil) async throws {
