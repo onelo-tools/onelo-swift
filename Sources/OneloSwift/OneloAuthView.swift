@@ -250,7 +250,7 @@ private final class WebAuthCoordinator: NSObject, WKNavigationDelegate, WKUIDele
     let onSessionExpired: () -> Void
     var onExternalNavigation: ((Bool) -> Void)?
     var onContentHeight: ((CGFloat) -> Void)?
-    var onAppleOAuth: ((String) -> Void)?
+    var onNativeOAuth: ((String, String) -> Void)?
     private var _appleAuthSession: ASWebAuthenticationSession?
 
     init(callbackScheme: String, originalHost: String?, originalPath: String?, onCode: @escaping (String) -> Void, onError: @escaping (String) -> Void, onSessionExpired: @escaping () -> Void) {
@@ -268,12 +268,14 @@ private final class WebAuthCoordinator: NSObject, WKNavigationDelegate, WKUIDele
               let type = body["type"] as? String else { return }
         if type == "onelo:session_expired" {
             DispatchQueue.main.async { self.onSessionExpired() }
-        } else if type == "onelo:apple_oauth", let token = body["token"] as? String {
-            DispatchQueue.main.async { self.onAppleOAuth?(token) }
+        } else if type == "onelo:native_oauth",
+                  let provider = body["provider"] as? String,
+                  let token = body["token"] as? String {
+            DispatchQueue.main.async { self.onNativeOAuth?(provider, token) }
         }
     }
 
-    func startAppleOAuth(oauthUrl: URL) {
+    func startNativeOAuth(oauthUrl: URL) {
         guard !callbackScheme.isEmpty else { return }
         let session = ASWebAuthenticationSession(
             url: oauthUrl,
@@ -449,14 +451,14 @@ private struct EmbeddedWebAuthView: NSViewRepresentable {
             frame.size.height = newWindowHeight
             window.setFrame(frame, display: true, animate: false)
         }
-        c.onAppleOAuth = { [weak c] token in
+        c.onNativeOAuth = { [weak c] provider, token in
             guard let c else { return }
             var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
-            components?.path = "/api/sdk/auth/oauth/apple"
+            components?.path = "/api/sdk/auth/oauth/\(provider)"
             components?.queryItems = [URLQueryItem(name: "token", value: token)]
             components?.fragment = nil
             guard let oauthUrl = components?.url else { return }
-            c.startAppleOAuth(oauthUrl: oauthUrl)
+            c.startNativeOAuth(oauthUrl: oauthUrl)
         }
         return c
     }
@@ -498,14 +500,14 @@ private struct EmbeddedWebAuthView: UIViewRepresentable {
     func makeCoordinator() -> WebAuthCoordinator {
         let c = WebAuthCoordinator(callbackScheme: callbackScheme, originalHost: url.host, originalPath: url.path, onCode: onCode, onError: onError, onSessionExpired: onSessionExpired)
         c.onExternalNavigation = onExternalNavigation
-        c.onAppleOAuth = { [weak c] token in
+        c.onNativeOAuth = { [weak c] provider, token in
             guard let c else { return }
             var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
-            components?.path = "/api/sdk/auth/oauth/apple"
+            components?.path = "/api/sdk/auth/oauth/\(provider)"
             components?.queryItems = [URLQueryItem(name: "token", value: token)]
             components?.fragment = nil
             guard let oauthUrl = components?.url else { return }
-            c.startAppleOAuth(oauthUrl: oauthUrl)
+            c.startNativeOAuth(oauthUrl: oauthUrl)
         }
         return c
     }
