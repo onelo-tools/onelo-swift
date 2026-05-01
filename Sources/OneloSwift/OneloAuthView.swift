@@ -219,9 +219,16 @@ public struct OneloAuthView<Content: View>: View {
             return
         }
 
-        // Paywall — open hosted store instead of hosted auth
-        if oneloAuth.paywallEnabled, let storeUrl = oneloAuth.storeUrl {
-            hostedUrl = storeUrl
+        // Paywall — open hosted store (plan selection + payment + registration)
+        if oneloAuth.paywallEnabled {
+            isLoadingUrl = true
+            defer { isLoadingUrl = false }
+            do {
+                hostedUrl = try await oneloAuth.initiateStoreFlow()
+            } catch {
+                errorMessage = error.localizedDescription
+                showRetry = true
+            }
             return
         }
 

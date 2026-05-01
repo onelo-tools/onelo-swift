@@ -178,6 +178,32 @@ public final class OneloAuth: ObservableObject {
 
     // MARK: - Hosted flow (WKWebView)
 
+    /// Calls /api/sdk/paywall/store-initiate and returns a tokenized store URL for the WKWebView.
+    /// The store page handles plan selection + payment + registration in one flow.
+    /// After completion, it redirects to callbackScheme://callback?code=... — same as auth.
+    public func initiateStoreFlow(lang: String = "en") async throws -> URL {
+        let scheme = config.callbackScheme
+        var components = URLComponents(url: config.apiUrl.appendingPathComponent("/api/sdk/paywall/store-initiate"), resolvingAgainstBaseURL: false)!
+        components.queryItems = [
+            URLQueryItem(name: "key", value: config.publishableKey),
+            URLQueryItem(name: "callback_scheme", value: scheme),
+            URLQueryItem(name: "lang", value: lang),
+        ]
+        var request = URLRequest(url: components.url!)
+        addStandardHeaders(&request)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw OneloError.serverError("Failed to initiate store flow")
+        }
+        let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        guard let urlStr = json["store_url"] as? String, let url = URL(string: urlStr) else {
+            throw OneloError.serverError("Invalid store-initiate response")
+        }
+        if let name = json["app_name"] as? String { hostedAppName = name }
+        if let logoStr = json["app_logo_url"] as? String { hostedAppLogoUrl = URL(string: logoStr) }
+        return url
+    }
+
     /// Calls /api/sdk/auth/initiate and returns the URL to load in the embedded WKWebView.
     /// Also populates `hostedAppName` and `hostedAppLogoUrl`.
     public func initiateHostedFlow() async throws -> URL {
