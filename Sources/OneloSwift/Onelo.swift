@@ -13,6 +13,8 @@ import Foundation
 @MainActor
 public final class Onelo {
     private let httpClient: _OneloHTTPClient
+    private let baseURL: URL
+    private var heartbeatTimer: Timer?
 
     public let features: OneloFeatures
     public let paywall: OneloPaywall
@@ -29,6 +31,7 @@ public final class Onelo {
     ) {
         let client = _OneloHTTPClient(publishableKey: publishableKey, baseURL: baseURL)
         self.httpClient = client
+        self.baseURL = baseURL
         let monitorInstance = OneloMonitor(publishableKey: publishableKey, apiUrl: baseURL.absoluteString)
         self.monitor = monitorInstance
         let featuresModule = OneloFeatures(client: client, monitor: monitorInstance)
@@ -63,6 +66,11 @@ public final class Onelo {
             guard let self else { return }
             for await session in self.auth.authObject.$currentSession.values {
                 await self.features._load(userId: session?.user.id)
+                if let session {
+                    self.startHeartbeat(accessToken: session.accessToken)
+                } else {
+                    self.stopHeartbeat()
+                }
             }
         }
     }
@@ -71,6 +79,27 @@ public final class Onelo {
     /// Only needed when NOT using Onelo Auth — Onelo Auth sets this automatically.
     public func identify(_ userId: String) async {
         await features._load(userId: userId)
+    }
+
+    // MARK: - Heartbeat
+
+    private func startHeartbeat(accessToken: String) {
+        stopHeartbeat()
+        heartbeatTimer = Timer.scheduledTimer(withTimeInterval: 780, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor in
+                guard let session = self.auth.authObject.currentSession else { return }
+                var request = URLRequest(url: self.baseURL.appendingPathComponent("/api/sdk/presence/heartbeat"))
+                request.httpMethod = "POST"
+                request.setValue("Bearer \(session.accessToken)", forHTTPHeaderField: "Authorization")
+                try? await URLSession.shared.data(for: request)
+            }
+        }
+    }
+
+    private func stopHeartbeat() {
+        heartbeatTimer?.invalidate()
+        heartbeatTimer = nil
     }
 }
 
