@@ -219,19 +219,7 @@ public struct OneloAuthView<Content: View>: View {
             return
         }
 
-        // Paywall — open hosted store (plan selection + payment + registration)
-        if oneloAuth.paywallEnabled {
-            isLoadingUrl = true
-            defer { isLoadingUrl = false }
-            do {
-                hostedUrl = try await oneloAuth.initiateStoreFlow()
-            } catch {
-                errorMessage = error.localizedDescription
-                showRetry = true
-            }
-            return
-        }
-
+        // Always open the auth page (Sign In) — Sign Up → store routing happens inside the hosted auth page
         isLoadingUrl = true
         defer { isLoadingUrl = false }
         do {
