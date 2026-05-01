@@ -204,14 +204,12 @@ public final class OneloAuth: ObservableObject {
         return url
     }
 
-    /// Returns the correct hosted URL based on app config.
-    /// Routes automatically: paywall → store page, waitlist+redirectUrl → redirectUrl, otherwise → auth page.
+    /// Returns the hosted auth URL. Waitlist+redirectUrl opens the redirect URL directly;
+    /// all other cases (including paywall) open the auth page — Sign Up routing to store
+    /// is handled inside the hosted auth page itself.
     public func initiateHostedFlow() async throws -> URL {
         if waitlistMode, let redirectUrl = sdkRedirectUrl {
             return redirectUrl
-        }
-        if paywallEnabled {
-            return try await initiateStoreFlow()
         }
         return try await _initiateAuthFlow()
     }
