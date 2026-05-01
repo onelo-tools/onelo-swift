@@ -208,18 +208,7 @@ public struct OneloAuthView<Content: View>: View {
             return
         }
 
-        // Waitlist redirect — open developer's page in system browser instead of hosted auth
-        if oneloAuth.waitlistMode, let redirectUrl = oneloAuth.sdkRedirectUrl {
-            #if os(macOS)
-            NSWorkspace.shared.open(redirectUrl)
-            #elseif os(iOS)
-            UIApplication.shared.open(redirectUrl)
-            #endif
-            showRetry = true  // show retry button so the user can try again after the page closes
-            return
-        }
-
-        // Always open the auth page (Sign In) — Sign Up → store routing happens inside the hosted auth page
+        // Always open the auth page (Sign In) — Sign Up routing (to store or external URL) happens inside the hosted auth page
         isLoadingUrl = true
         defer { isLoadingUrl = false }
         do {
