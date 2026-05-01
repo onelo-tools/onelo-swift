@@ -88,6 +88,10 @@ public final class Onelo {
         heartbeatTimer = Timer.scheduledTimer(withTimeInterval: 780, repeats: true) { [weak self] _ in
             guard let self else { return }
             Task { @MainActor in
+                // Refresh token if expired so the heartbeat doesn't silently 401
+                if self.auth.authObject.currentSession?.isExpired == true {
+                    _ = try? await self.auth.authObject.refreshSession()
+                }
                 guard let session = self.auth.authObject.currentSession else { return }
                 var request = URLRequest(url: self.baseURL.appendingPathComponent("/api/sdk/presence/heartbeat"))
                 request.httpMethod = "POST"
