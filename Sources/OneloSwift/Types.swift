@@ -62,6 +62,11 @@ struct ResolvedConfig: Decodable {
     let attestRequired: Bool
     let appName: String?
     let appLogoUrl: String?
+    let paywallEnabled: Bool
+    let waitlistMode: Bool
+    let sdkRedirectUrl: String?
+    let storeUrl: String?
+    let manageUrl: String?
 
     enum CodingKeys: String, CodingKey {
         case supabaseUrl = "supabase_url"
@@ -71,6 +76,11 @@ struct ResolvedConfig: Decodable {
         case attestRequired = "attest_required"
         case appName = "app_name"
         case appLogoUrl = "app_logo_url"
+        case paywallEnabled = "paywall_enabled"
+        case waitlistMode = "waitlist_mode"
+        case sdkRedirectUrl = "sdk_redirect_url"
+        case storeUrl = "store_url"
+        case manageUrl = "manage_url"
     }
 
     init(from decoder: Decoder) throws {
@@ -83,6 +93,11 @@ struct ResolvedConfig: Decodable {
         attestRequired = (try? c.decode(Bool.self, forKey: .attestRequired)) ?? false
         appName = try? c.decode(String.self, forKey: .appName)
         appLogoUrl = try? c.decode(String.self, forKey: .appLogoUrl)
+        paywallEnabled = (try? c.decode(Bool.self, forKey: .paywallEnabled)) ?? false
+        waitlistMode = (try? c.decode(Bool.self, forKey: .waitlistMode)) ?? false
+        sdkRedirectUrl = try? c.decode(String.self, forKey: .sdkRedirectUrl)
+        storeUrl = try? c.decode(String.self, forKey: .storeUrl)
+        manageUrl = try? c.decode(String.self, forKey: .manageUrl)
     }
 }
 

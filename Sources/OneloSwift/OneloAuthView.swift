@@ -207,6 +207,24 @@ public struct OneloAuthView<Content: View>: View {
             #endif
             return
         }
+
+        // Waitlist redirect — open developer's page in system browser instead of hosted auth
+        if oneloAuth.waitlistMode, let redirectUrl = oneloAuth.sdkRedirectUrl {
+            #if os(macOS)
+            NSWorkspace.shared.open(redirectUrl)
+            #elseif os(iOS)
+            UIApplication.shared.open(redirectUrl)
+            #endif
+            showRetry = true  // show retry button so the user can try again after the page closes
+            return
+        }
+
+        // Paywall — open hosted store instead of hosted auth
+        if oneloAuth.paywallEnabled, let storeUrl = oneloAuth.storeUrl {
+            hostedUrl = storeUrl
+            return
+        }
+
         isLoadingUrl = true
         defer { isLoadingUrl = false }
         do {

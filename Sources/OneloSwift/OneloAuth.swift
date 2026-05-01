@@ -32,6 +32,16 @@ public final class OneloAuth: ObservableObject {
     @Published public private(set) var hostedAppName: String = "App"
     /// App logo URL returned by /initiate — shown in HostedSignInButton if set, otherwise Onelo logo.
     @Published public private(set) var hostedAppLogoUrl: URL? = nil
+    /// True if SDK gate is active — `OneloAuthView` opens the store instead of sign-in.
+    @Published public private(set) var paywallEnabled: Bool = false
+    /// True if app is in waitlist mode — `OneloAuthView` opens `sdkRedirectUrl` instead of sign-in.
+    @Published public private(set) var waitlistMode: Bool = false
+    /// Developer-configured URL to open when `waitlistMode` is true and `sdkRedirectUrl` is set.
+    @Published public private(set) var sdkRedirectUrl: URL? = nil
+    /// Hosted store URL (plan selection + registration). Non-nil when `paywallEnabled` is true.
+    @Published public private(set) var storeUrl: URL? = nil
+    /// Hosted manage URL (upgrade/cancel). Non-nil when `paywallEnabled` is true.
+    @Published public private(set) var manageUrl: URL? = nil
 
     private var client: AuthClient?
     private let keychain: KeychainStorage
@@ -484,6 +494,11 @@ public final class OneloAuth: ObservableObject {
             attestRequired = resolved.attestRequired
             if let name = resolved.appName, !name.isEmpty { hostedAppName = name }
             if let logoStr = resolved.appLogoUrl { hostedAppLogoUrl = URL(string: logoStr) }
+            paywallEnabled = resolved.paywallEnabled
+            waitlistMode = resolved.waitlistMode
+            if let urlStr = resolved.sdkRedirectUrl { sdkRedirectUrl = URL(string: urlStr) }
+            if let urlStr = resolved.storeUrl { storeUrl = URL(string: urlStr) }
+            if let urlStr = resolved.manageUrl { manageUrl = URL(string: urlStr) }
 
             try? keychain.set(resolved.supabaseUrl, forKey: KeychainKeys.supabaseUrl)
             try? keychain.set(resolved.supabaseAnonKey, forKey: KeychainKeys.supabaseAnonKey)
