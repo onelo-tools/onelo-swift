@@ -377,10 +377,14 @@ private final class WebAuthCoordinator: NSObject, WKNavigationDelegate, WKUIDele
         let isExternal = currentHost != nil && currentHost != originalHost
         DispatchQueue.main.async { self.onExternalNavigation?(isExternal) }
 
-        // Detect landing on the same host but wrong path (e.g. /?error=... after failed OAuth)
-        // — reload the hosted auth page silently instead of showing blank/wrong content
+        // Detect OAuth error redirect to root (e.g. /?error=... after failed OAuth)
+        // — reload the hosted auth page silently instead of showing blank/wrong content.
+        // Only triggers for root redirects; intentional navigation to /store/hosted etc. is allowed.
         if !isExternal, let path = originalPath, !currentURL.path.hasPrefix(path) {
-            DispatchQueue.main.async { self.onSessionExpired() }
+            let isRootRedirect = currentURL.path == "/" || currentURL.path.isEmpty
+            if isRootRedirect {
+                DispatchQueue.main.async { self.onSessionExpired() }
+            }
             return
         }
 
