@@ -48,6 +48,8 @@ public final class OneloAuth: ObservableObject {
     let config: OneloConfig
     private var pkceVerifier: String?
     private var _cachedAttestToken: String?
+    private var _heartbeatTask: Task<Void, Never>?
+    private let _urlSession: URLSession
     #if DEBUG
     private var _skipInitialize: Bool = false
     #endif
@@ -64,8 +66,18 @@ public final class OneloAuth: ObservableObject {
     public init(config: OneloConfig) {
         self.config = config
         self.keychain = KeychainStorage()
+        self._urlSession = .shared
         Task { await self.initialize() }
     }
+
+    #if DEBUG
+    init(config: OneloConfig, urlSession: URLSession, skipInitialize: Bool) {
+        self.config = config
+        self.keychain = KeychainStorage()
+        self._urlSession = urlSession
+        self._skipInitialize = skipInitialize
+    }
+    #endif
 
     // MARK: - Public API
 
@@ -402,6 +414,7 @@ public final class OneloAuth: ObservableObject {
         #endif
         currentSession = nil
         pkceVerifier = nil
+        _stopHeartbeat()
         Task { await self.initialize() }
         #if DEBUG
         _authLog.debug("signOut: done, initialize() spawned")
@@ -709,6 +722,36 @@ public final class OneloAuth: ObservableObject {
         try keychain.set(String(session.expiresAt.timeIntervalSince1970), forKey: KeychainKeys.expiresAt)
         let userJson = try JSONEncoder().encode(session.user)
         try keychain.set(String(data: userJson, encoding: .utf8) ?? "", forKey: KeychainKeys.userJson)
+        _startHeartbeat(session: session)
+    }
+
+    // MARK: - Presence Heartbeat
+
+    private static let heartbeatInterval: TimeInterval = 13 * 60
+
+    func _startHeartbeat(session: OneloSession) {
+        _stopHeartbeat()
+        _heartbeatTask = Task { [weak self] in
+            guard let self else { return }
+            // Fire immediately, then repeat on interval
+            while !Task.isCancelled {
+                await self._sendHeartbeat(accessToken: session.accessToken)
+                try? await Task.sleep(nanoseconds: UInt64(OneloAuth.heartbeatInterval * 1_000_000_000))
+            }
+        }
+    }
+
+    func _stopHeartbeat() {
+        _heartbeatTask?.cancel()
+        _heartbeatTask = nil
+    }
+
+    private func _sendHeartbeat(accessToken: String) async {
+        let url = config.apiUrl.appendingPathComponent("/api/sdk/presence/heartbeat")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        _ = try? await _urlSession.data(for: request)
     }
 
     private func backendPost(path: String, body: [String: String]) async throws -> [String: Any] {
