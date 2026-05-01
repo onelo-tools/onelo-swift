@@ -204,9 +204,20 @@ public final class OneloAuth: ObservableObject {
         return url
     }
 
-    /// Calls /api/sdk/auth/initiate and returns the URL to load in the embedded WKWebView.
-    /// Also populates `hostedAppName` and `hostedAppLogoUrl`.
+    /// Returns the correct hosted URL based on app config.
+    /// Routes automatically: paywall → store page, waitlist+redirectUrl → redirectUrl, otherwise → auth page.
     public func initiateHostedFlow() async throws -> URL {
+        if waitlistMode, let redirectUrl = sdkRedirectUrl {
+            return redirectUrl
+        }
+        if paywallEnabled {
+            return try await initiateStoreFlow()
+        }
+        return try await _initiateAuthFlow()
+    }
+
+    /// Calls /api/sdk/auth/initiate and returns the raw auth URL (no routing).
+    internal func _initiateAuthFlow() async throws -> URL {
         let scheme = config.callbackScheme
         var components = URLComponents(url: config.apiUrl.appendingPathComponent("/api/sdk/auth/initiate"), resolvingAgainstBaseURL: false)!
         components.queryItems = [

@@ -236,15 +236,15 @@ public struct OneloAuthView<Content: View>: View {
         defer { isLoadingUrl = false }
         do {
             #if DEBUG
-            _viewLog.debug("calling initiateHostedFlow()…")
+            _viewLog.debug("calling _initiateAuthFlow()…")
             #endif
-            hostedUrl = try await oneloAuth.initiateHostedFlow()
+            hostedUrl = try await oneloAuth._initiateAuthFlow()
             #if DEBUG
             _viewLog.debug("hostedUrl set OK")
             #endif
         } catch {
             #if DEBUG
-            _viewLog.debug("initiateHostedFlow() error: \(error.localizedDescription)")
+            _viewLog.debug("_initiateAuthFlow() error: \(error.localizedDescription)")
             #endif
             errorMessage = error.localizedDescription
             showRetry = true
