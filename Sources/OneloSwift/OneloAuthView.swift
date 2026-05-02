@@ -1076,6 +1076,7 @@ struct AuthSkeletonView: View {
             Spacer()
         }
         .padding(.horizontal, 56)
+        .frame(maxWidth: 440)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onAppear {
             withAnimation(.linear(duration: 1.6).repeatForever(autoreverses: false)) {
