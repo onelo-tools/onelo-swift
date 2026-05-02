@@ -132,9 +132,8 @@ public struct OneloAuthView<Content: View>: View {
                             .background(oneloOrange)
                             .clipShape(RoundedRectangle(cornerRadius: 10))
                         }
-                    } else if isReady {
-                        ProgressView()
-                            .tint(.white.opacity(0.3))
+                    } else {
+                        AuthSkeletonView()
                     }
                 }
             }
@@ -1012,6 +1011,103 @@ private struct AuthButton: View {
         .buttonStyle(.plain)
         .disabled(isLoading)
     }
+}
+
+// MARK: - Auth Skeleton View
+
+struct AuthSkeletonView: View {
+    @State private var phase: CGFloat = 0
+    private let neutralGradient = LinearGradient(
+        colors: [Color(white: 0.12), Color(white: 0.22), Color(white: 0.12)],
+        startPoint: .leading, endPoint: .trailing
+    )
+    private let tintGradient = LinearGradient(
+        colors: [
+            Color(red: 0.18, green: 0.09, blue: 0.03),
+            Color(red: 0.36, green: 0.16, blue: 0.06),
+            Color(red: 0.18, green: 0.09, blue: 0.03),
+        ],
+        startPoint: .leading, endPoint: .trailing
+    )
+
+    var body: some View {
+        VStack(spacing: 14) {
+            Spacer()
+
+            // Logo placeholder
+            shimmerRect(width: 64, height: 64, radius: 16)
+
+            // App name + subtitle
+            shimmerRect(width: 160, height: 18, radius: 6)
+                .padding(.top, 4)
+            shimmerRect(width: 110, height: 12, radius: 4)
+
+            Spacer().frame(height: 8)
+
+            // Email label + input
+            VStack(alignment: .leading, spacing: 6) {
+                shimmerRect(width: 60, height: 11, radius: 4)
+                shimmerRect(width: .infinity, height: 42, radius: 10)
+            }
+
+            // Password label + input
+            VStack(alignment: .leading, spacing: 6) {
+                shimmerRect(width: 60, height: 11, radius: 4)
+                shimmerRect(width: .infinity, height: 42, radius: 10)
+            }
+
+            // Primary button (warm orange tint)
+            shimmerRect(width: .infinity, height: 44, radius: 10, tint: true)
+                .padding(.top, 4)
+
+            // Forgot password link
+            shimmerRect(width: 140, height: 11, radius: 4)
+
+            // Divider
+            HStack(spacing: 12) {
+                Rectangle().fill(Color(white: 0.15)).frame(height: 1)
+                shimmerRect(width: 24, height: 11, radius: 4)
+                Rectangle().fill(Color(white: 0.15)).frame(height: 1)
+            }
+
+            // Sign up link
+            shimmerRect(width: 140, height: 11, radius: 4)
+
+            Spacer()
+        }
+        .padding(.horizontal, 56)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onAppear {
+            withAnimation(.linear(duration: 1.6).repeatForever(autoreverses: false)) {
+                phase = 1
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func shimmerRect(width: CGFloat, height: CGFloat, radius: CGFloat, tint: Bool = false) -> some View {
+        if width == .infinity {
+            GeometryReader { geo in
+                shimmerShape(width: geo.size.width, height: height, radius: radius, tint: tint)
+            }
+            .frame(height: height)
+        } else {
+            shimmerShape(width: width, height: height, radius: radius, tint: tint)
+        }
+    }
+
+    private func shimmerShape(width: CGFloat, height: CGFloat, radius: CGFloat, tint: Bool) -> some View {
+        RoundedRectangle(cornerRadius: radius)
+            .fill(tint ? Color(red: 0.16, green: 0.08, blue: 0.04) : Color(white: 0.12))
+            .overlay(
+                (tint ? tintGradient : neutralGradient)
+                    .frame(width: width * 3)
+                    .offset(x: width * 3 * phase - width * 1.5)
+                    .mask(RoundedRectangle(cornerRadius: radius))
+            )
+            .frame(width: width, height: height)
+    }
+
 }
 
 // MARK: - Onelo brand color
