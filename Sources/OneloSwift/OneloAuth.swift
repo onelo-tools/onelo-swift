@@ -656,6 +656,11 @@ public final class OneloAuth: ObservableObject {
             let user = try? JSONDecoder().decode(OneloUser.self, from: userJson)
         else { return }
 
+        guard !user.id.isEmpty else {
+            try? keychain.clear()
+            return
+        }
+
         let expiresAt = Date(timeIntervalSince1970: expiresAtInterval)
         let session = OneloSession(accessToken: accessToken, refreshToken: refreshToken, expiresAt: expiresAt, user: user)
 
