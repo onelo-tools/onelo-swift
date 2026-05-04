@@ -27,14 +27,15 @@ public final class Onelo {
     public init(
         publishableKey: String,
         callbackScheme: String = "",
-        baseURL: URL
+        baseURL: URL,
+        suppressIdentifyWarning: Bool = false
     ) {
         let client = _OneloHTTPClient(publishableKey: publishableKey, baseURL: baseURL)
         self.httpClient = client
         self.baseURL = baseURL
         let monitorInstance = OneloMonitor(publishableKey: publishableKey, apiUrl: baseURL.absoluteString)
         self.monitor = monitorInstance
-        let featuresModule = OneloFeatures(client: client, monitor: monitorInstance)
+        let featuresModule = OneloFeatures(client: client, monitor: monitorInstance, suppressIdentifyWarning: suppressIdentifyWarning)
         self.features = featuresModule
         self.paywall = OneloPaywall()
         self.forms = OneloForms(client: client)
@@ -43,7 +44,8 @@ public final class Onelo {
         let oneloAuth = OneloAuth(config: OneloConfig(
             publishableKey: publishableKey,
             apiUrl: baseURL,
-            callbackScheme: callbackScheme
+            callbackScheme: callbackScheme,
+            suppressIdentifyWarning: suppressIdentifyWarning
         ))
         self.auth = OneloAuthModule(auth: oneloAuth)
 

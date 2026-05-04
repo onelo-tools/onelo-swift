@@ -1,7 +1,7 @@
 import Foundation
 
 public enum OneloSDK {
-    public static let sdkVersion = "3.15.1-staging"
+    public static let sdkVersion = "3.16.0-staging"
 }
 
 public enum UserRole: String, Codable, Sendable {
@@ -41,15 +41,21 @@ public struct OneloConfig: Sendable {
     public let apiUrl: URL
     /// Callback scheme for hosted auth flow (e.g., "myapp://")
     public let callbackScheme: String
+    /// Suppresses the "no userId — call onelo.identify()" warning that fires when
+    /// features resolve in anonymous mode while targeted features exist. Set to true
+    /// if your app is intentionally anonymous. Default: false.
+    public let suppressIdentifyWarning: Bool
 
     public init(
         publishableKey: String,
         apiUrl: URL,
-        callbackScheme: String = ""
+        callbackScheme: String = "",
+        suppressIdentifyWarning: Bool = false
     ) {
         self.publishableKey = publishableKey
         self.apiUrl = apiUrl
         self.callbackScheme = callbackScheme
+        self.suppressIdentifyWarning = suppressIdentifyWarning
     }
 }
 

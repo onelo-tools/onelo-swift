@@ -11,12 +11,15 @@ public final class OneloFeatures {
     private var configVersion: Int = 0
     private var pollTask: Task<Void, Never>?
     private var pendingPingTask: Task<Void, Never>?
+    private let suppressIdentifyWarning: Bool
+    private var anonymousWarningLogged: Bool = false
 
     static let pollInterval: TimeInterval = 60
 
-    init(client: _OneloHTTPClient, monitor: OneloMonitor? = nil) {
+    init(client: _OneloHTTPClient, monitor: OneloMonitor? = nil, suppressIdentifyWarning: Bool = false) {
         self.client = client
         self.monitor = monitor
+        self.suppressIdentifyWarning = suppressIdentifyWarning
     }
 
     // MARK: - Public API
@@ -102,9 +105,27 @@ public final class OneloFeatures {
                 }
             }
             if let v = data["config_version"] as? Int { configVersion = v }
+            _maybeWarnAnonymous(data)
         } catch {
             // keep existing cache
         }
+    }
+
+    /// Logs a one-time warning when the backend reports anonymous mode (no userId)
+    /// AND at least one targeted feature was hidden purely because of it. Helps
+    /// developers using their own auth system catch missing identify() calls.
+    /// Suppressed via `OneloConfig.suppressIdentifyWarning`.
+    private func _maybeWarnAnonymous(_ response: [String: Any]) {
+        guard !suppressIdentifyWarning, !anonymousWarningLogged else { return }
+        guard (response["anonymous"] as? Bool) == true else { return }
+        let misses = response["targeting_misses"] as? Int ?? 0
+        guard misses > 0 else { return }
+        anonymousWarningLogged = true
+        print("""
+            [Onelo] \(misses) feature(s) hidden because no user is identified.
+            If you handle auth yourself, call onelo.identify(userId) after login so per-user/per-plan targeting can apply.
+            If your app is intentionally anonymous, pass suppressIdentifyWarning: true in OneloConfig to silence this.
+            """)
     }
 
     private func _poll(userId: String?) async {
