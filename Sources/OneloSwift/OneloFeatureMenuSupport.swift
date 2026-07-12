@@ -24,16 +24,16 @@ public extension FeatureState {
 
     /// Creates a fully configured NSMenuItem that handles all feature statuses automatically:
     /// - hidden    → returns nil (don't add to menu)
-    /// - greyed    → visible but disabled (action = nil so autoenablesItems won't
-    ///               re-enable it), shows a 🔒 padlock badge so the user sees the
-    ///               feature is locked. Never routed through the upsell-clickable branch.
-    /// - coming_soon → visible, disabled, shows "Coming Soon" badge
-    /// - upsell    → visible, shows "Available in <plan>" badge. When the
-    ///               developer enabled the tap-to-upgrade toggle (upgradeCta)
+    /// - greyed / coming_soon / upsell → visible + badged (🔒 / "Coming Soon" /
+    ///               "Available in <plan>"). When the developer enabled tap-to-upgrade
+    ///               (upgradeCta) AND the backend named the unlocking plan (requiredPlan),
     ///               the item is CLICKABLE and opens the upgrade flow
-    ///               (`Onelo.openUpgrade(forPlan:)` via OneloUpgradeRouter:
-    ///               subscribers → hosted "Change plan" with the target plan
-    ///               highlighted; others → hosted store). Otherwise disabled.
+    ///               (`Onelo.openUpgrade(forPlan:)` via OneloUpgradeRouter: subscribers →
+    ///               hosted "Change plan" with the target plan highlighted; others →
+    ///               hosted store). Otherwise it stays visible but disabled. Mirrors the
+    ///               backend's `upgrade_cta`, emitted on ANY plan-gated status — so a
+    ///               greyed feature with the toggle on is tappable too, matching every
+    ///               other Onelo SDK.
     /// - new/beta  → visible, enabled, shows badge
     /// - enabled   → visible, enabled, no badge
     ///
@@ -44,9 +44,13 @@ public extension FeatureState {
     func menuItem(title: String, action: Selector) -> NSMenuItem? {
         guard isVisible else { return nil }
         // Tap-to-upgrade: route the click to the upgrade flow instead of the
-        // feature's own action. Requires the per-feature CTA toggle, a known
-        // unlocking plan and a live Onelo instance (router installed).
-        if isUpsell, upgradeCta, let plan = requiredPlan,
+        // feature's own action. Requires the per-feature CTA toggle (upgradeCta) +
+        // a known unlocking plan (requiredPlan) + a live Onelo instance (router
+        // installed). Applies to ANY plan-gated status (greyed / upsell / coming_soon):
+        // the backend sets upgradeCta only on those, matching every other Onelo SDK's
+        // `upgradeCta && requiredPlan` gate. Previously restricted to `.upsell`, which
+        // silently dropped the dev's "tapping opens upgrade" toggle on greyed/coming_soon.
+        if upgradeCta, let plan = requiredPlan,
            OneloUpgradeRouter.shared.isInstalled {
             let item = NSMenuItem(
                 title: title,
