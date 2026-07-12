@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Skeleton Loading</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0a0a0a; color: #fff; font-family: -apple-system, sans-serif; padding: 32px 24px; }
+  h2 { font-size: 20px; font-weight: 600; margin-bottom: 8px; }
+  .subtitle { color: #888; font-size: 14px; margin-bottom: 32px; }
+
+  .options-row { display: flex; gap: 20px; flex-wrap: wrap; }
+
+  .option-card {
+    flex: 1; min-width: 220px; max-width: 280px;
+    border: 2px solid #2a2a2a; border-radius: 16px;
+    padding: 16px; cursor: pointer; transition: border-color 0.2s;
+    background: #111;
+  }
+  .option-card:hover { border-color: #555; }
+  .option-card.selected { border-color: #ff6b35; }
+  .option-label {
+    font-size: 11px; font-weight: 700; letter-spacing: 1px;
+    color: #888; text-transform: uppercase; margin-bottom: 12px;
+  }
+  .option-card.selected .option-label { color: #ff6b35; }
+  .option-title { font-size: 14px; font-weight: 600; margin-top: 12px; margin-bottom: 4px; }
+  .option-desc { font-size: 12px; color: #666; line-height: 1.5; }
+
+  /* ---- PHONE MOCKUP ---- */
+  .phone {
+    width: 160px; height: 280px; margin: 0 auto;
+    background: #1a1a1a; border-radius: 24px;
+    border: 1.5px solid #2a2a2a;
+    overflow: hidden; position: relative;
+    display: flex; flex-direction: column; align-items: center;
+    padding: 20px 16px 16px;
+    gap: 12px;
+  }
+
+  /* ---- SHIMMER ---- */
+  @keyframes shimmer {
+    0%   { background-position: -400px 0; }
+    100% { background-position:  400px 0; }
+  }
+  .shimmer {
+    background: linear-gradient(90deg, #222 25%, #333 50%, #222 75%);
+    background-size: 800px 100%;
+    animation: shimmer 1.6s infinite linear;
+    border-radius: 6px;
+  }
+
+  /* ---- PULSE ---- */
+  @keyframes pulse {
+    0%, 100% { opacity: 0.3; }
+    50%       { opacity: 0.7; }
+  }
+  .pulse {
+    background: #2a2a2a;
+    border-radius: 6px;
+    animation: pulse 1.8s ease-in-out infinite;
+  }
+
+  /* ---- FADE WAVE ---- */
+  @keyframes fadewave {
+    0%   { opacity: 0.2; }
+    50%  { opacity: 0.55; }
+    100% { opacity: 0.2; }
+  }
+  .fadewave {
+    background: #2a2a2a;
+    border-radius: 6px;
+  }
+  .fadewave:nth-child(1) { animation: fadewave 2s ease-in-out infinite 0s; }
+  .fadewave:nth-child(2) { animation: fadewave 2s ease-in-out infinite 0.2s; }
+  .fadewave:nth-child(3) { animation: fadewave 2s ease-in-out infinite 0.4s; }
+  .fadewave:nth-child(4) { animation: fadewave 2s ease-in-out infinite 0.6s; }
+  .fadewave:nth-child(5) { animation: fadewave 2s ease-in-out infinite 0.8s; }
+
+  /* OPTION A — shimmer skeleton */
+  .phone-a .logo-block { width: 44px; height: 44px; border-radius: 12px; }
+  .phone-a .title-block { width: 100px; height: 14px; }
+  .phone-a .sub-block   { width: 72px; height: 10px; }
+  .phone-a .input-block { width: 100%; height: 38px; border-radius: 10px; }
+  .phone-a .btn-block   { width: 100%; height: 38px; border-radius: 10px; background: linear-gradient(90deg, #3a1a0a 25%, #5a2a10 50%, #3a1a0a 75%); background-size: 800px 100%; animation: shimmer 1.6s infinite linear; }
+  .phone-a .link-block  { width: 80px; height: 10px; }
+  .phone-a .divider     { width: 100%; display: flex; align-items: center; gap: 6px; }
+  .phone-a .divider-line { flex: 1; height: 1px; background: #2a2a2a; }
+  .phone-a .divider-text { font-size: 9px; color: #333; }
+
+  /* OPTION B — pulse */
+  .phone-b .logo-block { width: 44px; height: 44px; border-radius: 50%; }
+  .phone-b .title-block { width: 90px; height: 13px; }
+  .phone-b .sub-block   { width: 60px; height: 10px; }
+  .phone-b .input-block { width: 100%; height: 38px; border-radius: 10px; }
+  .phone-b .btn-block   { width: 100%; height: 38px; border-radius: 10px; }
+  .phone-b .link-block  { width: 75px; height: 10px; }
+
+  /* OPTION C — fade wave staggered */
+  .phone-c .logo-block { width: 44px; height: 44px; border-radius: 12px; }
+  .phone-c .title-block { width: 95px; height: 13px; }
+  .phone-c .sub-block   { width: 65px; height: 10px; }
+  .phone-c .input-block { width: 100%; height: 38px; border-radius: 10px; }
+  .phone-c .btn-block   { width: 100%; height: 38px; border-radius: 10px; }
+  .phone-c .link-block  { width: 78px; height: 10px; }
+
+  .check-hint { font-size: 12px; color: #555; margin-top: 24px; text-align: center; }
+</style>
+</head>
+<body>
+
+<h2>Który styl skeleton loadingu?</h2>
+<p class="subtitle">Jak elementy formularza logowania pojawiają się podczas ładowania. Kliknij wariant żeby wybrać.</p>
+
+<div class="options-row">
+
+  <!-- OPTION A: Shimmer (Netflix-style) -->
+  <div class="option-card" onclick="pick(this,'a')">
+    <div class="option-label">A</div>
+    <div class="phone phone-a">
+      <div class="shimmer logo-block"></div>
+      <div class="shimmer title-block"></div>
+      <div class="shimmer sub-block"></div>
+      <div class="shimmer input-block"></div>
+      <div class="shimmer input-block"></div>
+      <div class="shimmer btn-block"></div>
+      <div class="shimmer link-block"></div>
+    </div>
+    <div class="option-title">Shimmer (Netflix)</div>
+    <div class="option-desc">Świetlna fala przesuwa się przez elementy. Najbardziej "premium".</div>
+  </div>
+
+  <!-- OPTION B: Pulse -->
+  <div class="option-card" onclick="pick(this,'b')">
+    <div class="option-label">B</div>
+    <div class="phone phone-b">
+      <div class="pulse logo-block"></div>
+      <div class="pulse title-block"></div>
+      <div class="pulse sub-block"></div>
+      <div class="pulse input-block"></div>
+      <div class="pulse input-block"></div>
+      <div class="pulse btn-block"></div>
+      <div class="pulse link-block"></div>
+    </div>
+    <div class="option-title">Pulse</div>
+    <div class="option-desc">Elementy pulsują fade in/out. Prostszy, subtelniejszy.</div>
+  </div>
+
+  <!-- OPTION C: Staggered wave -->
+  <div class="option-card" onclick="pick(this,'c')">
+    <div class="option-label">C</div>
+    <div class="phone phone-c">
+      <div class="fadewave logo-block"></div>
+      <div class="fadewave title-block"></div>
+      <div class="fadewave sub-block"></div>
+      <div class="fadewave input-block"></div>
+      <div class="fadewave input-block"></div>
+      <div class="fadewave btn-block"></div>
+      <div class="fadewave link-block"></div>
+    </div>
+    <div class="option-title">Staggered Wave</div>
+    <div class="option-desc">Każdy element fade'uje z opóźnieniem — efekt "fali" od góry do dołu.</div>
+  </div>
+
+</div>
+
+<p class="check-hint">↑ Animacje działają na żywo — obserwuj ruch w mockupach</p>
+
+<script>
+let selected = null;
+function pick(el, choice) {
+  document.querySelectorAll('.option-card').forEach(c => c.classList.remove('selected'));
+  el.classList.add('selected');
+  selected = choice;
+  // try to report to superpowers if available
+  try { window.__reportChoice?.(choice, el.querySelector('.option-title').textContent); } catch(e) {}
+}
+</script>
+
+</body>
+</html>
