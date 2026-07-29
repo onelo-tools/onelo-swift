@@ -61,7 +61,8 @@ final class MonitorTransportHeadersTests: XCTestCase {
     func test_send_includesBundleIdHeader() {
         let monitor = OneloMonitor(
             publishableKey: "pk_live_test",
-            apiUrl: "https://example.invalid"
+            apiUrl: "https://example.invalid",
+            securityContext: _OneloSecurityContext()
         )
         monitor.transport = makeMockSession()
 
@@ -93,13 +94,17 @@ final class MonitorTransportHeadersTests: XCTestCase {
     }
 
     func test_send_includesAttestTokenWhenSet() {
+        // Set the security values on the SHARED context the monitor reads —
+        // the same path OneloAuth (the producer) writes through in production.
+        let ctx = _OneloSecurityContext()
+        ctx.attestToken = "attest-jwt-abc123"
+        ctx.codesignFingerprint = "sha256:deadbeef"
         let monitor = OneloMonitor(
             publishableKey: "pk_live_test",
-            apiUrl: "https://example.invalid"
+            apiUrl: "https://example.invalid",
+            securityContext: ctx
         )
         monitor.transport = makeMockSession()
-        monitor._setAttestToken("attest-jwt-abc123")
-        monitor._setCodesignFingerprint("sha256:deadbeef")
 
         monitor.event("unit-test", options: MonitorEventOptions(ok: true))
         monitor.flush()

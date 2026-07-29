@@ -1,5 +1,35 @@
 import Foundation
 
+/// Single source of truth for the SDK's per-request security headers — the
+/// App Attest bearer (`X-Attest-Token`) and the macOS codesign fingerprint
+/// (`X-Codesign-Fingerprint`).
+///
+/// ONE instance is created by `OneloAuth` (the producer of the attest token)
+/// and shared BY REFERENCE across EVERY transport: the auth URLSession
+/// (`addStandardHeaders`), the shared REST/features client, the SSE stream
+/// client, and the monitor transport. A value written once by the producer is
+/// therefore visible to all readers with no per-transport copy to keep in sync.
+///
+/// This replaces the previous "mirror the token into each transport's own
+/// field" model, where the features/stream SSE transport was silently left
+/// unmirrored and 403'd `attest_invalid` in a permanent loop (#34). Because the
+/// context is a REQUIRED init parameter on every transport, a NEW transport
+/// cannot be constructed without being handed the shared context — the #34
+/// class of bug is now impossible by construction.
+///
+/// `nonisolated(unsafe)` mirrors the transports it feeds: `attestToken` is
+/// written by the producer on `@MainActor` and `codesignFingerprint` is seeded
+/// once at init; reads happen on background URLSession queues at request-build
+/// time. Writes complete before the first request that would observe them.
+/// Public only because it appears in `OneloMonitor`'s public initializer
+/// signature; the `_` prefix marks it as an internal SDK implementation detail,
+/// not a supported API surface — host apps never construct or touch it.
+public final class _OneloSecurityContext: @unchecked Sendable {
+    nonisolated(unsafe) var attestToken: String? = nil
+    nonisolated(unsafe) var codesignFingerprint: String? = nil
+    public init() {}
+}
+
 /// Internal HTTP client for SDK modules (features, forms, waitlist).
 /// Injects X-Bundle-Id and security attestation headers on every request.
 final class _OneloHTTPClient: @unchecked Sendable {
@@ -7,16 +37,27 @@ final class _OneloHTTPClient: @unchecked Sendable {
     let baseURL: URL
     private let bundleId: String
 
-    // Written once at SDK startup, read on every request. Safe as nonisolated(unsafe)
-    // because the write always completes before the first SDK request is made.
-    nonisolated(unsafe) var attestToken: String? = nil
-    nonisolated(unsafe) var codesignFingerprint: String? = nil
-    nonisolated(unsafe) var integrityToken: String? = nil
+    /// Shared security context — the single source of truth for the attest
+    /// bearer + codesign fingerprint. Required (non-optional) so this transport
+    /// can never be constructed without the shared state (#34 class fix). Read
+    /// on every request in `applySecurityHeaders`.
+    let securityContext: _OneloSecurityContext
 
-    init(publishableKey: String, baseURL: URL) {
+    // FAZA 3 (assertion model) — per-request App Attest assertion. Wired by
+    // Onelo.swift to OneloAppAttest.assertionHeaders. Returns the X-Attest-*
+    // headers for THIS request, or nil (no attested key / offline) → the legacy
+    // X-Attest-Token bearer above still applies (backward compatible).
+    nonisolated(unsafe) var assertionProvider: ((_ method: String, _ path: String, _ query: String, _ body: Data) async -> [String: String]?)? = nil
+    // Called with the backend's attest error code on a HARD attestation reject so
+    // the SDK can self-heal (drop the key → re-attest). Never fired for the
+    // retryable counter_stale nor for the session-refresh path (Filar 5).
+    nonisolated(unsafe) var onAttestReject: ((String) -> Void)? = nil
+
+    init(publishableKey: String, baseURL: URL, securityContext: _OneloSecurityContext) {
         self.publishableKey = publishableKey
         self.baseURL = baseURL
         self.bundleId = Bundle.main.bundleIdentifier ?? ""
+        self.securityContext = securityContext
     }
 
     // MARK: - Security headers
@@ -27,14 +68,11 @@ final class _OneloHTTPClient: @unchecked Sendable {
         if !bundleId.isEmpty {
             request.setValue(bundleId, forHTTPHeaderField: "X-Bundle-Id")
         }
-        if let token = attestToken {
+        if let token = securityContext.attestToken {
             request.setValue(token, forHTTPHeaderField: "X-Attest-Token")
         }
-        if let fp = codesignFingerprint {
+        if let fp = securityContext.codesignFingerprint {
             request.setValue(fp, forHTTPHeaderField: "X-Codesign-Fingerprint")
-        }
-        if let it = integrityToken {
-            request.setValue(it, forHTTPHeaderField: "X-Integrity-Token")
         }
     }
 
@@ -50,6 +88,30 @@ final class _OneloHTTPClient: @unchecked Sendable {
         return "HTTP \(statusCode)"
     }
 
+    /// Attach the per-request App Attest assertion headers (FAZA 3), if the
+    /// device can produce them. Called AFTER applySecurityHeaders so the
+    /// assertion sits alongside (and the backend prefers it over) the bearer.
+    private func applyAssertion(to request: inout URLRequest) async {
+        guard let provider = assertionProvider else { return }
+        let headers = await provider(
+            request.httpMethod ?? "GET",
+            request.url?.path ?? "",
+            request.url?.query ?? "",
+            request.httpBody ?? Data()
+        )
+        if let headers { for (k, v) in headers { request.setValue(v, forHTTPHeaderField: k) } }
+    }
+
+    /// On a HARD attestation reject, trigger self-heal (drop key → re-attest).
+    /// counter_stale is retryable (re-sign, not a key problem) and the 503 store
+    /// error is transient, so neither resets the key.
+    private func handleAttestReject(_ json: [String: Any]) {
+        guard let code = (json["detail"] as? [String: Any])?["error"] as? String else { return }
+        if ["attest_key_unknown", "attest_key_revoked", "invalid_assertion"].contains(code) {
+            onAttestReject?(code)
+        }
+    }
+
     func post(path: String, body: [String: Any]) async throws -> [String: Any] {
         let url = baseURL.appendingPathComponent(path)
         var request = URLRequest(url: url)
@@ -58,6 +120,7 @@ final class _OneloHTTPClient: @unchecked Sendable {
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
         request.timeoutInterval = 10
         applySecurityHeaders(to: &request)
+        await applyAssertion(to: &request)
 
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse else {
@@ -65,6 +128,7 @@ final class _OneloHTTPClient: @unchecked Sendable {
         }
         guard (200..<300).contains(http.statusCode) else {
             let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+            handleAttestReject(json)
             throw OneloError.serverError(errorDetail(json, statusCode: http.statusCode))
         }
         if data.isEmpty { return [:] }
@@ -84,12 +148,14 @@ final class _OneloHTTPClient: @unchecked Sendable {
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
         request.timeoutInterval = 10
         applySecurityHeaders(to: &request)
+        await applyAssertion(to: &request)
 
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw OneloError.serverError("No HTTP response")
         }
         let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        if !(200..<300).contains(http.statusCode) { handleAttestReject(json) }
         return (http.statusCode, json)
     }
 
@@ -104,6 +170,7 @@ final class _OneloHTTPClient: @unchecked Sendable {
         request.httpMethod = "GET"
         request.timeoutInterval = 10
         applySecurityHeaders(to: &request)
+        await applyAssertion(to: &request)
         // Caller-supplied headers (e.g. Authorization for user-scoped endpoints)
         // are applied AFTER the security set so they can never be clobbered.
         for (key, value) in headers { request.setValue(value, forHTTPHeaderField: key) }
@@ -114,6 +181,7 @@ final class _OneloHTTPClient: @unchecked Sendable {
         }
         guard (200..<300).contains(http.statusCode) else {
             let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+            handleAttestReject(json)
             throw OneloError.serverError(errorDetail(json, statusCode: http.statusCode))
         }
         if data.isEmpty { return [:] }

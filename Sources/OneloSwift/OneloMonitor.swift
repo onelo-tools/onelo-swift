@@ -123,17 +123,15 @@ public class OneloMonitor {
     // Security headers — must match what `validate_sdk_request_security` on the
     // backend expects, otherwise live mobile/desktop requests get 403
     // `invalid_bundle_id`. `X-Bundle-Id` is captured eagerly at init so it is
-    // always available on the crash path. Attestation/codesign tokens are
-    // mirrored from `OneloAuth` via `_setAttestToken` / `_setCodesignFingerprint`
-    // because they aren't available until App Attest / codesign discovery
-    // completes asynchronously after SDK init.
-    //
-    // `nonisolated(unsafe)` is safe here for the same reason it is on
-    // `_OneloHTTPClient`: writes happen once, before the first event flush
-    // that would observe the value, and reads on the flush path don't race.
+    // always available on the crash path. The attest bearer + codesign
+    // fingerprint are read from the SHARED `_OneloSecurityContext` (produced by
+    // OneloAuth) at request-build time — this transport holds the same context
+    // instance as every other, so there is nothing to mirror in: whatever the
+    // producer wrote is already visible here.
     private let bundleId: String = MonitorAppContext.bundleId
-    nonisolated(unsafe) internal var attestToken: String? = nil
-    nonisolated(unsafe) internal var codesignFingerprint: String? = nil
+    /// Shared source of truth for the attest bearer + codesign fingerprint —
+    /// the SAME instance the other transports read (see `_OneloSecurityContext`).
+    private let securityContext: _OneloSecurityContext
 
     private var flushTimer: Timer?
 
@@ -154,10 +152,11 @@ public class OneloMonitor {
     /// facet by it. Pass via `Onelo(environment:)`.
     private let environment: String?
 
-    public init(publishableKey: String, apiUrl: String, environment: String? = nil) {
+    public init(publishableKey: String, apiUrl: String, environment: String? = nil, securityContext: _OneloSecurityContext) {
         self.publishableKey = publishableKey
         self.apiUrl = apiUrl
         self.environment = environment
+        self.securityContext = securityContext
         self.sessionId = MonitorInstallID.get()
 
         flushTimer = Timer.scheduledTimer(withTimeInterval: 15.0, repeats: true) { [weak self] _ in
@@ -168,22 +167,14 @@ public class OneloMonitor {
 
     // MARK: - Internal: security header wiring
     //
-    // Called by `Onelo` once `OneloAuth` has produced an attestation / codesign
-    // value. Safe to call multiple times — the latest value wins. Without these
-    // tokens, live iOS apps will be rejected with HTTP 403 by the backend
-    // (`validate_sdk_request_security`); macOS apps fall back to bundle ID +
-    // codesign fingerprint.
-    public func _setAttestToken(_ token: String?) {
-        self.attestToken = token
-    }
-
-    public func _setCodesignFingerprint(_ fingerprint: String?) {
-        self.codesignFingerprint = fingerprint
-    }
-
-    /// Apply the same security headers the rest of the SDK uses
-    /// (`_OneloHTTPClient.applySecurityHeaders`). Kept in sync with that helper —
-    /// any new header added there should be added here too.
+    // Apply the same security headers the rest of the SDK uses
+    // (`_OneloHTTPClient.applySecurityHeaders`). The attest bearer + codesign
+    // fingerprint come from the SHARED `securityContext` — no setter to call,
+    // no value to mirror: whatever OneloAuth (the producer) wrote is already
+    // visible here. Without these tokens, live iOS apps are rejected with HTTP
+    // 403 by the backend (`validate_sdk_request_security`); macOS apps fall back
+    // to bundle ID + codesign fingerprint. Any new header added to the
+    // `_OneloHTTPClient` helper should be added here too.
     private func applySecurityHeaders(to request: inout URLRequest) {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("onelo-swift/\(MonitorAppContext.sdkVersion)", forHTTPHeaderField: "User-Agent")
@@ -191,10 +182,10 @@ public class OneloMonitor {
         if !bundleId.isEmpty && bundleId != "unknown" {
             request.setValue(bundleId, forHTTPHeaderField: "X-Bundle-Id")
         }
-        if let token = attestToken {
+        if let token = securityContext.attestToken {
             request.setValue(token, forHTTPHeaderField: "X-Attest-Token")
         }
-        if let fp = codesignFingerprint {
+        if let fp = securityContext.codesignFingerprint {
             request.setValue(fp, forHTTPHeaderField: "X-Codesign-Fingerprint")
         }
     }

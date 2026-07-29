@@ -55,6 +55,12 @@ public struct OneloCustomerPortalView: View {
 
     @State private var hostedUrl: URL? = nil
     @State private var errorMessage: String? = nil
+    /// #40 Phase 2 — true once the hosted portal posts `onelo:ready`; hides the
+    /// native fail-safe ✕ so the hosted page's canonical ✕ owns the affordance.
+    @State private var hostedReady = false
+    /// #44 — armed ~3.5s after appear (see `.task`); the fail-safe ✕ shows only
+    /// after this OR on error, so a normal fast load never flashes it.
+    @State private var failsafeTimedOut = false
 
     /// Convenience init that pulls everything off an OneloAuth instance.
     public init(auth: OneloAuth, onDismiss: @escaping () -> Void) {
@@ -102,7 +108,8 @@ public struct OneloCustomerPortalView: View {
                 },
                 onError: { msg in
                     errorMessage = msg
-                }
+                },
+                onReady: { hostedReady = true }
             )
             .ignoresSafeArea()
 
@@ -117,28 +124,37 @@ public struct OneloCustomerPortalView: View {
                 .padding(24)
             }
 
-            // Unified Onelo close affordance — matches OneloFeedback's `✕`
-            // (SF Symbol `xmark`, neutral, no Onelo branding), pinned TOP-RIGHT.
-            // The portal body is a ZStack (no NavigationStack), so a `.toolbar`
-            // wouldn't render — overlay the control directly and route it through
-            // the EXISTING `onDismiss()`. Respects the safe area.
-            VStack {
-                HStack {
-                    Spacer()
-                    Button {
-                        onDismiss()
-                    } label: {
-                        Image(systemName: "xmark")
-                            .foregroundStyle(.secondary)
+            // Unified Onelo close affordance (`OneloCloseButton`) — identical to
+            // OneloFeedback's `✕`. The portal body is a ZStack (no NavigationStack),
+            // so a `.toolbar` wouldn't render — overlay the SAME control directly and
+            // route it through the EXISTING `onDismiss()`. Respects the safe area.
+            // (#35: this was a bare `Button` without `.buttonStyle(.plain)`, so iOS
+            // tinted the `✕` accent-blue; the shared component carries `.plain`.)
+            // #40 Phase 2 + #44 — native ✕ is a FAIL-SAFE only, and must NOT flash
+            // during a normal fast load. Show it ONLY after a load error OR once a
+            // ~3.5s grace has elapsed without the hosted page mounting. A fast load
+            // posts `onelo:ready` (`hostedReady`) well before the grace, so the ✕
+            // never appears; a stuck/failed load still gets a way out. Once the
+            // hosted page mounts its own canonical ✕ owns the affordance.
+            if !hostedReady && (failsafeTimedOut || errorMessage != nil) {
+                VStack {
+                    HStack {
+                        Spacer()
+                        OneloCloseButton(style: .overlay) { onDismiss() }
+                            .padding(8)
                     }
-                    .accessibilityLabel("Close")
-                    .padding(16)
+                    Spacer()
                 }
-                Spacer()
             }
         }
         .frame(minWidth: 420, minHeight: 640)
         .task { await loadPortal() }
+        .task {
+            // #44 — arm the fail-safe ✕ only after a grace period, so a normal fast
+            // load never flashes it. Cancelled automatically if the view goes away.
+            try? await Task.sleep(nanoseconds: 3_500_000_000)
+            if !hostedReady { failsafeTimedOut = true }
+        }
     }
 
     private func loadPortal() async {
@@ -198,14 +214,18 @@ private struct PortalEmbeddedWebView: NSViewRepresentable {
     let callbackScheme: String
     let onDone: (URL?) -> Void
     let onError: (String) -> Void
+    var onReady: (() -> Void)? = nil
 
     func makeCoordinator() -> PortalWebCoordinator {
-        PortalWebCoordinator(callbackScheme: callbackScheme, onDone: onDone, onError: onError)
+        let c = PortalWebCoordinator(callbackScheme: callbackScheme, onDone: onDone, onError: onError)
+        c.onReady = onReady
+        return c
     }
 
     func makeNSView(context: Context) -> WKWebView {
         let cfg = WKWebViewConfiguration()
         applyPortalWebViewHardening(cfg)
+        cfg.userContentController.addUserScript(PortalWebCoordinator.relayScript)
         let v = WKWebView(frame: .zero, configuration: cfg)
         v.navigationDelegate = context.coordinator
         // uiDelegate: the Receipts list uses target="_blank" links (Stripe
@@ -235,14 +255,18 @@ private struct PortalEmbeddedWebView: UIViewRepresentable {
     let callbackScheme: String
     let onDone: (URL?) -> Void
     let onError: (String) -> Void
+    var onReady: (() -> Void)? = nil
 
     func makeCoordinator() -> PortalWebCoordinator {
-        PortalWebCoordinator(callbackScheme: callbackScheme, onDone: onDone, onError: onError)
+        let c = PortalWebCoordinator(callbackScheme: callbackScheme, onDone: onDone, onError: onError)
+        c.onReady = onReady
+        return c
     }
 
     func makeUIView(context: Context) -> WKWebView {
         let cfg = WKWebViewConfiguration()
         applyPortalWebViewHardening(cfg)
+        cfg.userContentController.addUserScript(PortalWebCoordinator.relayScript)
         let v = WKWebView(frame: .zero, configuration: cfg)
         v.navigationDelegate = context.coordinator
         // uiDelegate: Receipts use target="_blank" links (Stripe PDF / receipt).
@@ -284,10 +308,31 @@ private final class PortalWebCoordinator: NSObject, WKNavigationDelegate, WKUIDe
     private let callbackScheme: String
     private let onDone: (URL?) -> Void
     private let onError: (String) -> Void
+    /// #40 Phase 2 — fired when the hosted portal posts `onelo:ready`, so the
+    /// native fail-safe ✕ hides and the hosted page's canonical ✕ takes over.
+    var onReady: (() -> Void)?
     /// Set true the first time the real hosted URL is loaded, so SwiftUI
     /// re-renders (which re-invoke updateNSView/updateUIView) don't reload the
     /// page and stomp the user's in-portal navigation.
     var didLoadReal = false
+
+    // JS relay: forward the hosted page's `onelo:ready` postMessage → a sentinel
+    // `onelo://ready` navigation this coordinator intercepts. (Portal CLOSE stays
+    // on the existing `<scheme>://callback?source=portal` deep-link that the hosted
+    // ✕'s `returnToApp()` fires — already handled below.)
+    static let relayScript = WKUserScript(
+        source: """
+        (function() {
+          window.addEventListener('message', function(e) {
+            if (e.data && e.data.type === 'onelo:ready') {
+              window.location.href = 'onelo://ready';
+            }
+          });
+        })();
+        """,
+        injectionTime: .atDocumentStart,
+        forMainFrameOnly: false
+    )
 
     init(callbackScheme: String, onDone: @escaping (URL?) -> Void, onError: @escaping (String) -> Void) {
         self.callbackScheme = callbackScheme
@@ -305,8 +350,15 @@ private final class PortalWebCoordinator: NSObject, WKNavigationDelegate, WKUIDe
         // contract OneloAuthView relies on for sign-in completion.
         let url = navigationAction.request.url
         let scheme = url?.scheme
+        let host = url?.host
         let cb = callbackScheme
         Task { @MainActor in
+            // #40 Phase 2 — hosted page mounted → hide the native fail-safe ✕.
+            if scheme == "onelo", host == "ready" {
+                decisionHandler(.cancel)
+                self.onReady?()
+                return
+            }
             if let scheme, !cb.isEmpty, scheme == cb {
                 decisionHandler(.cancel)
                 self.onDone(url)

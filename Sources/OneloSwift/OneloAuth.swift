@@ -41,6 +41,13 @@ public final class OneloAuth: ObservableObject {
     }
     @Published public private(set) var isLoading: Bool = false
     @Published public private(set) var isReady: Bool = false
+    /// True while an auto-login restore of a stored session is in flight (Keychain
+    /// read → backend verify/refresh). Distinguishes "restoring an existing
+    /// session" from "no session, show sign-in" so the UI can paint a branded
+    /// splash on cold-start auto-login instead of flashing the sign-in form (#36).
+    /// Set at the start of `restoreSession()` (true iff a complete stored session
+    /// exists) and cleared on every exit path.
+    @Published public private(set) var isRestoringSession: Bool = false
     /// Set when the publishable key is revoked or the app is deleted.
     @Published public private(set) var isRevoked: Bool = false
     /// Set when the user account has been deleted or suspended by an admin.
@@ -89,7 +96,35 @@ public final class OneloAuth: ObservableObject {
     /// Latest App Attest token, when one has been obtained. Updated asynchronously
     /// after `isReady = true` becomes true; observers can use this to know when
     /// attestation has completed (e.g. to set the same token on a feature HTTP client).
-    @Published public private(set) var attestToken: String?
+    @Published public private(set) var attestToken: String? {
+        didSet {
+            // OneloAuth is the SINGLE PRODUCER of the attest bearer. Publishing it
+            // to the shared `_OneloSecurityContext` here is the ONE write that
+            // reaches EVERY transport at once — the auth URLSession, the shared
+            // REST/features client, the SSE stream client, and the monitor — since
+            // they all read the same context by reference. This replaced the old
+            // "mirror the token into each transport's own field" model, where the
+            // features/stream SSE transport was silently left unmirrored and 403'd
+            // `attest_invalid` in a permanent reconnect loop (#34), while auth
+            // endpoints (which read the token here) passed 200 with the same token.
+            // didSet doesn't fire during init, and `securityContext` is created
+            // before the first (post-init, async) attestToken assignment, so this
+            // is always safe.
+            securityContext.attestToken = attestToken
+        }
+    }
+    #if canImport(DeviceCheck)
+    /// Last App Attest failure, if attestation was attempted and failed. `nil` when
+    /// attestation has not run, is not required, or last succeeded. A security
+    /// mechanism must never fail silently — observe this (and check the unified log,
+    /// subsystem `io.onelo.sdk`, category `attest`) to see why `attestToken` is nil.
+    @Published public private(set) var attestError: OneloAttestError?
+    #endif
+    /// #25 — max time a gated entry point waits (polling) for background App
+    /// Attest to set `attestToken` before proceeding tokenless. Covers a
+    /// slow-but-working handshake (~3-4 round trips) while capping a stalled
+    /// network so the auth flow never hangs.
+    private static let attestWaitCapMs: Int = 5000
     /// App name returned by /initiate — shown in HostedSignInButton before Safari opens.
     @Published public private(set) var hostedAppName: String = "App"
     /// App logo URL returned by /initiate — shown in HostedSignInButton if set, otherwise Onelo logo.
@@ -100,6 +135,11 @@ public final class OneloAuth: ObservableObject {
     @Published public private(set) var isExchangingCode: Bool = false
     /// True if SDK gate is active — `OneloAuthView` opens the store instead of sign-in.
     @Published public private(set) var paywallEnabled: Bool = false
+    /// Branding page background hex (`checkout_bg_color`, default `#111111`) from
+    /// `/api/sdk/config`. `OneloAuthView` parses + paints it so the pre-auth /
+    /// loading frame matches the hosted page instead of flashing a system colour
+    /// (#26). Nil until config resolves (view falls back to the config default).
+    @Published public private(set) var pageBackgroundColorHex: String?
     /// True if app is in waitlist mode — `OneloAuthView` opens `sdkRedirectUrl` instead of sign-in.
     @Published public private(set) var waitlistMode: Bool = false
     /// Developer-configured URL to open when `waitlistMode` is true and `sdkRedirectUrl` is set.
@@ -143,6 +183,14 @@ public final class OneloAuth: ObservableObject {
     private let _httpClient: _OneloHTTPClient
     private let _eventStream: OneloEventStream
 
+    /// Single source of truth for the attest bearer + macOS codesign fingerprint,
+    /// shared BY REFERENCE with every other transport (see `_OneloSecurityContext`).
+    /// OneloAuth is the producer: it writes `attestToken` here via didSet and seeds
+    /// the codesign fingerprint at init. Exposed so the top-level `Onelo` wrapper
+    /// can hand the SAME instance to the shared REST client and the monitor — one
+    /// context, every transport, nothing to keep in sync.
+    let securityContext: _OneloSecurityContext
+
     /// Shared SSE event stream owned by this auth instance. Other Onelo
     /// modules (OneloFeatures, future OneloPaywall realtime) attach their
     /// handlers to this same stream via `eventStream.on(...)`.
@@ -162,13 +210,23 @@ public final class OneloAuth: ObservableObject {
         static let supabaseUrl = "supabase_url"
         static let supabaseAnonKey = "supabase_anon_key"
         static let oauthProviders = "oauth_providers"
+        static let checkoutBgColor = "checkout_bg_color"
     }
 
     public init(config: OneloConfig) {
         self.config = config
         self.keychain = KeychainStorage()
         self._urlSession = .shared
-        let httpClient = _OneloHTTPClient(publishableKey: config.publishableKey, baseURL: config.apiUrl)
+        let ctx = _OneloSecurityContext()
+        #if os(macOS)
+        // Seed the codesign fingerprint eagerly — it's static for the running
+        // binary, so it's available synchronously at init (unlike the attest
+        // token, which arrives async). This makes it ride the FIRST request on
+        // every transport, before attestation completes.
+        ctx.codesignFingerprint = OneloCodesignFallback.codesignFingerprint()
+        #endif
+        self.securityContext = ctx
+        let httpClient = _OneloHTTPClient(publishableKey: config.publishableKey, baseURL: config.apiUrl, securityContext: ctx)
         self._httpClient = httpClient
         self._eventStream = OneloEventStream(httpClient: httpClient)
         // Register the auth-side handler before any session is loaded so we
@@ -190,6 +248,20 @@ public final class OneloAuth: ObservableObject {
         if let cached = try? keychain.get(forKey: KeychainKeys.oauthProviders), !cached.isEmpty {
             oauthProviders = cached.split(separator: ",").map(String.init)
         }
+        // #26 — seed the cached branding background so the auth frame paints the
+        // right colour on the FIRST paint (before resolveConfig lands), not a
+        // system-colour flash.
+        if let cachedBg = try? keychain.get(forKey: KeychainKeys.checkoutBgColor), !cachedBg.isEmpty {
+            pageBackgroundColorHex = cachedBg
+        }
+        // #36 — seed `isRestoringSession` SYNCHRONOUSLY here, BEFORE the async
+        // `initialize()`/`restoreSession()` Task starts and BEFORE `isReady=true`.
+        // Otherwise `OneloAuthView.onReceive(restoringSessionPublisher)` gets the
+        // default @Published value (false) on subscribe and clobbers the view's own
+        // `hasStoredSessionSync()` seed → the sign-in skeleton flashes in the
+        // `isReady=true → restore-done` window. `restoreSession()`'s `defer` still
+        // clears it; the non-restore init paths clear it explicitly (below).
+        isRestoringSession = hasStoredSessionSync()
         Task { await self.initialize() }
     }
 
@@ -314,7 +386,12 @@ public final class OneloAuth: ObservableObject {
         self.keychain = KeychainStorage()
         self._urlSession = urlSession
         self._skipInitialize = skipInitialize
-        let httpClient = _OneloHTTPClient(publishableKey: config.publishableKey, baseURL: config.apiUrl)
+        let ctx = _OneloSecurityContext()
+        #if os(macOS)
+        ctx.codesignFingerprint = OneloCodesignFallback.codesignFingerprint()
+        #endif
+        self.securityContext = ctx
+        let httpClient = _OneloHTTPClient(publishableKey: config.publishableKey, baseURL: config.apiUrl, securityContext: ctx)
         self._httpClient = httpClient
         self._eventStream = OneloEventStream(httpClient: httpClient)
     }
@@ -351,6 +428,27 @@ public final class OneloAuth: ObservableObject {
               !email.isEmpty
         else { return nil }
         return email
+    }
+
+    /// Synchronous check for a restorable stored session — true iff the Keychain
+    /// holds a COMPLETE, decodable session (the same fields `restoreSession()`
+    /// requires). Nonisolated + synchronous, so a view can call it during
+    /// construction to decide, on the FIRST paint, whether a cold start is an
+    /// auto-login (paint a branded splash) or a genuine signed-out start (show
+    /// the sign-in form). Without this the SDK can't tell the two apart until the
+    /// async restore/verify resolves, so it flashes the sign-in skeleton (#36).
+    public nonisolated func hasStoredSessionSync() -> Bool {
+        guard
+            (try? keychain.get(forKey: KeychainKeys.accessToken)) != nil,
+            (try? keychain.get(forKey: KeychainKeys.refreshToken)) != nil,
+            let expiresAtStr = try? keychain.get(forKey: KeychainKeys.expiresAt),
+            TimeInterval(expiresAtStr) != nil,
+            let userJsonStr = try? keychain.get(forKey: KeychainKeys.userJson),
+            let userJson = userJsonStr.data(using: .utf8),
+            let user = try? JSONDecoder().decode(OneloUser.self, from: userJson),
+            !user.id.isEmpty
+        else { return false }
+        return true
     }
 
     /// Convenience: returns true when the current user has an active paid grant for this app.
@@ -464,6 +562,8 @@ public final class OneloAuth: ObservableObject {
         isLoading = true
         defer { isLoading = false }
 
+        await _awaitAttestReady()  // #25: same gated /auth/initiate as _initiateAuthFlow — wait for the token
+
         // 1. Get one-time token + hosted URL
         var components = URLComponents(url: config.apiUrl.appendingPathComponent("/api/sdk/auth/initiate"), resolvingAgainstBaseURL: false)!
         components.queryItems = [
@@ -529,8 +629,11 @@ public final class OneloAuth: ObservableObject {
         var request = URLRequest(url: exchangeUrl)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONSerialization.data(withJSONObject: exchangeBody)
+        let exchangeData0 = try JSONSerialization.data(withJSONObject: exchangeBody)
+        request.httpBody = exchangeData0
         addStandardHeaders(&request)
+        // #38 — hosted-callback is replay-guarded → attach the assertion.
+        await applyAuthAssertion(to: &request, body: exchangeData0)
 
         let (exchangeData, exchangeResponse) = try await URLSession.shared.data(for: request)
         guard let exchangeHttp = exchangeResponse as? HTTPURLResponse, exchangeHttp.statusCode == 200 else {
@@ -572,6 +675,7 @@ public final class OneloAuth: ObservableObject {
     /// The store page handles plan selection + payment + registration in one flow.
     /// After completion, it redirects to callbackScheme://callback?code=... — same as auth.
     public func initiateStoreFlow(lang: String = "en") async throws -> URL {
+        await _awaitAttestReady()  // #25: /store-initiate is attestation-gated too (sdk_paywall.py)
         let scheme = config.callbackScheme
         var components = URLComponents(url: config.apiUrl.appendingPathComponent("/api/sdk/paywall/store-initiate"), resolvingAgainstBaseURL: false)!
         components.queryItems = [
@@ -629,6 +733,7 @@ public final class OneloAuth: ObservableObject {
 
     /// Calls /api/sdk/auth/initiate and returns the raw auth URL (no routing).
     internal func _initiateAuthFlow() async throws -> URL {
+        await _awaitAttestReady()  // #25: wait for the attest token before the gated initiate call
         let scheme = config.callbackScheme
         var components = URLComponents(url: config.apiUrl.appendingPathComponent("/api/sdk/auth/initiate"), resolvingAgainstBaseURL: false)!
         components.queryItems = [
@@ -665,6 +770,7 @@ public final class OneloAuth: ObservableObject {
     /// `OneloAuthView` uses this internally; accessory apps that present their
     /// own WebView can call it directly to get the same decision.
     public func resolveFlow(lang: String = "en") async throws -> FlowDecision {
+        await _awaitAttestReady()  // #25: don't race the gated flow/init ahead of the attest token
         var components = URLComponents(url: config.apiUrl.appendingPathComponent("/api/sdk/flow/init"), resolvingAgainstBaseURL: false)!
         components.queryItems = [
             URLQueryItem(name: "key", value: config.publishableKey),
@@ -966,8 +1072,11 @@ public final class OneloAuth: ObservableObject {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         var body: [String: String] = ["code": code, "publishableKey": config.publishableKey]
         if let verifier = pkceVerifier { body["code_verifier"] = verifier }
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let bodyData = try JSONSerialization.data(withJSONObject: body)
+        request.httpBody = bodyData
         addStandardHeaders(&request)
+        // #38 — hosted-callback is replay-guarded → attach the assertion.
+        await applyAuthAssertion(to: &request, body: bodyData)
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
@@ -1009,6 +1118,7 @@ public final class OneloAuth: ObservableObject {
     }
 
     private func _signInAttempt(email: String, password: String, isRetry: Bool) async throws -> OneloSession {
+        if !isRetry { await _awaitAttestReady() }  // #25: gated POST — wait for the attest token (retry already has it)
         if pkceVerifier == nil {
             guard !isRetry else { throw OneloError.serverError("SDK not ready — call after isReady") }
             try await refreshPKCE()
@@ -1071,6 +1181,7 @@ public final class OneloAuth: ObservableObject {
     }
 
     private func _signUpAttempt(email: String, password: String, isRetry: Bool) async throws -> Bool {
+        if !isRetry { await _awaitAttestReady() }  // #25: gated POST — wait for the attest token (retry already has it)
         if pkceVerifier == nil {
             guard !isRetry else { throw OneloError.serverError("SDK not ready — call after isReady") }
             try await refreshPKCE()
@@ -1316,6 +1427,11 @@ public final class OneloAuth: ObservableObject {
             if let name = resolved.appName, !name.isEmpty { hostedAppName = name }
             if let logoStr = resolved.appLogoUrl { hostedAppLogoUrl = URL(string: logoStr) }
             paywallEnabled = resolved.paywallEnabled
+            // #26 — MUST be set before `isReady = true` below: the view re-renders
+            // on the `readyPublisher` (not on this property directly), so it reads
+            // the already-populated hex when it flips ready. Keep this assignment
+            // above the `isReady = true` line.
+            pageBackgroundColorHex = resolved.checkoutBgColor
             waitlistMode = resolved.waitlistMode
             if let urlStr = resolved.sdkRedirectUrl { sdkRedirectUrl = URL(string: urlStr) }
             if let urlStr = resolved.storeUrl { storeUrl = URL(string: urlStr) }
@@ -1324,6 +1440,10 @@ public final class OneloAuth: ObservableObject {
             // Cache so the loading skeleton can draw the right social-pill count on
             // the NEXT launch's first paint, before this resolveConfig completes.
             try? keychain.set(oauthProviders.joined(separator: ","), forKey: KeychainKeys.oauthProviders)
+            // #26 — cache the branding background for the NEXT launch's first paint.
+            if let bg = resolved.checkoutBgColor, !bg.isEmpty {
+                try? keychain.set(bg, forKey: KeychainKeys.checkoutBgColor)
+            }
 
             try? keychain.set(resolved.supabaseUrl, forKey: KeychainKeys.supabaseUrl)
             try? keychain.set(resolved.supabaseAnonKey, forKey: KeychainKeys.supabaseAnonKey)
@@ -1350,6 +1470,7 @@ public final class OneloAuth: ObservableObject {
             //     returns attest_token_required and the caller can retry.
             isReady = true
             if allowRestore { await restoreSession() }
+            else { isRestoringSession = false }  // #36 — no restore → don't leave the splash stuck on
             if resolved.attestRequired {
                 Task { [weak self] in
                     await self?._refreshAttestToken()
@@ -1373,6 +1494,7 @@ public final class OneloAuth: ObservableObject {
                 )
                 isReady = true
                 if allowRestore { await restoreSession() }
+            else { isRestoringSession = false }  // #36 — no restore → don't leave the splash stuck on
             }
         }
     }
@@ -1396,7 +1518,21 @@ public final class OneloAuth: ObservableObject {
         addStandardHeaders(&configRequest)
         let (data, response) = try await URLSession.shared.data(for: configRequest)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-            throw OneloError.invalidPublishableKey("Server rejected the key")
+            // #45 — only a DEFINITIVE key rejection means the key is actually bad
+            // and the app should show "Invalid publishable key" (→ isRevoked). The
+            // backend `/api/sdk/config` returns 400 "Invalid key format" / 404
+            // "Invalid key" for that. ANY OTHER non-200 (5xx, 429, 403, a network
+            // blip during the cold-start request burst) is TRANSIENT and must NOT
+            // be misread as an invalid key — else a perfectly valid key flashes
+            // "Invalid publishable key" whenever /config transiently fails (e.g.
+            // racing a feedback/portal open at cold start). Throw a transient
+            // serverError so the caller's generic catch keeps the key and falls
+            // back to the cached config instead of flagging isRevoked.
+            let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+            if status == 400 || status == 404 {
+                throw OneloError.invalidPublishableKey("Server rejected the key")
+            }
+            throw OneloError.serverError("Config request failed transiently (HTTP \(status))")
         }
 
         return try JSONDecoder().decode(ResolvedConfig.self, from: data)
@@ -1410,15 +1546,21 @@ public final class OneloAuth: ObservableObject {
     }
 
     /// Adds standard SDK headers (X-Publishable-Key, X-Bundle-Id, X-Attest-Token,
-    /// X-Onelo-Instance-Id) to a request.
+    /// X-Codesign-Fingerprint on macOS, X-Onelo-Instance-Id) to a request.
     private func addStandardHeaders(_ request: inout URLRequest) {
         request.setValue(config.publishableKey, forHTTPHeaderField: "X-Publishable-Key")
         request.setValue(OneloInstanceId.current(), forHTTPHeaderField: "X-Onelo-Instance-Id")
         if let bundleId = Bundle.main.bundleIdentifier {
             request.setValue(bundleId, forHTTPHeaderField: "X-Bundle-Id")
         }
-        if let token = attestToken {
+        // Read the shared context — the same source every other transport reads.
+        // codesignFingerprint is only ever seeded on macOS (nil elsewhere), so no
+        // platform guard is needed here.
+        if let token = securityContext.attestToken {
             request.setValue(token, forHTTPHeaderField: "X-Attest-Token")
+        }
+        if let fp = securityContext.codesignFingerprint {
+            request.setValue(fp, forHTTPHeaderField: "X-Codesign-Fingerprint")
         }
     }
 
@@ -1426,15 +1568,96 @@ public final class OneloAuth: ObservableObject {
     /// Safe to call from a detached Task — internally hops to the cooperative pool
     /// for DCAppAttestService / network / keychain work, then writes back to
     /// `self.attestToken` on the main actor.
+    // FAZA 3 — a SINGLE OneloAppAttest reused across the SDK's lifetime, so its
+    // attested key + stateless-challenge cache persist between requests (a fresh
+    // instance per call would re-fetch a challenge every time and lose the key
+    // handle needed for generateAssertion). Boxed as AnyObject because the type
+    // is availability-gated. Populated on first _refreshAttestToken.
+    private var _sharedAppAttestBox: AnyObject?
+
+    /// Per-request App Attest assertion headers for the transport (FAZA 3).
+    /// Returns nil before attestation is set up or on unsupported platforms —
+    /// the caller then falls back to the legacy X-Attest-Token bearer.
+    func assertionHeaders(method: String, path: String, query: String, body: Data) async -> [String: String]? {
+        #if canImport(DeviceCheck)
+        if #available(iOS 14.0, macOS 11.0, *), let attest = _sharedAppAttestBox as? OneloAppAttest {
+            return await attest.assertionHeaders(method: method, path: path, query: query, body: body)
+        }
+        #endif
+        return nil
+    }
+
+    /// Self-heal after a HARD attestation reject (#24 P4): drop the attested key
+    /// and re-attest so the next request carries a fresh key + assertion. NOT
+    /// called on counter_stale (retryable) nor on the refresh path (Filar 5).
+    /// Single-flight guard (@MainActor → race-free). A storm of gated 403s (or a
+    /// systematic invalid_assertion) must trigger exactly ONE re-attest, not N —
+    /// Apple heavily rate-limits attestKey, so an un-debounced storm would BRICK
+    /// attestation instead of healing it (D1).
+    private var _isReattesting = false
+    /// Windowed loop guard (#34): even single-flighted, self-heal can loop
+    /// SEQUENTIALLY (403 → re-attest → 403 → …). If a systematic reject persists,
+    /// cap re-attests per window and then STOP — a further storm can't fix a
+    /// server-side reject and only DDoSes Apple + our backend and floods
+    /// sdk_security_events. Recovery after the cap is the next app launch (init
+    /// re-attests via _refreshAttestToken); there is no periodic attest refresh.
+    /// In monitor mode (shipped) self-heal is dormant anyway — a failed assertion
+    /// degrades to the bearer server-side, so the cap is only relevant post-flip.
+    private var _selfHealCount = 0
+    private var _selfHealWindowStart = Date.distantPast
+    private let selfHealMaxPerWindow = 3
+    private let selfHealWindow: TimeInterval = 300  // 5 min
+
+    func resetAttestedKeyForSelfHeal() {
+        #if canImport(DeviceCheck)
+        if #available(iOS 14.0, macOS 11.0, *), let attest = _sharedAppAttestBox as? OneloAppAttest {
+            guard !_isReattesting else { return }
+            let now = Date()
+            if now.timeIntervalSince(_selfHealWindowStart) > selfHealWindow {
+                _selfHealWindowStart = now
+                _selfHealCount = 0
+            }
+            guard _selfHealCount < selfHealMaxPerWindow else {
+                OneloAttestLog.error("self-heal cap reached (\(selfHealMaxPerWindow)/window) — a persistent assertion reject won't be fixed by re-attesting; backing off.")
+                return
+            }
+            _selfHealCount += 1
+            _isReattesting = true
+            attest.resetAttestedKey()
+            self.attestToken = nil
+            Task {
+                await self._refreshAttestToken()
+                self._isReattesting = false
+            }
+        }
+        #endif
+    }
+
     func _refreshAttestToken() async {
         #if canImport(DeviceCheck)
         if #available(iOS 14.0, macOS 11.0, *) {
-            let attest = OneloAppAttest(
-                baseURL: config.apiUrl.absoluteString,
-                publishableKey: config.publishableKey
-            )
-            if let token = try? await attest.getAttestToken() {
+            let attest: OneloAppAttest
+            if let existing = _sharedAppAttestBox as? OneloAppAttest {
+                attest = existing
+            } else {
+                attest = OneloAppAttest(
+                    baseURL: config.apiUrl.absoluteString,
+                    publishableKey: config.publishableKey
+                )
+                _sharedAppAttestBox = attest
+            }
+            do {
+                let token = try await attest.getAttestToken()
                 self.attestToken = token
+                self.attestError = nil
+            } catch {
+                // Never swallow a security failure silently: the developer must be
+                // able to tell "App Attest failed (and why)" apart from "the SDK
+                // never attested". Log the concrete cause and surface it via
+                // `attestError` so the app can react.
+                let mapped = (error as? OneloAttestError) ?? .deviceCheckFailed("\(error)")
+                OneloAttestLog.error("App Attest failed — \(mapped.diagnosticDescription)")
+                self.attestError = mapped
             }
         }
         #endif
@@ -1444,7 +1667,53 @@ public final class OneloAuth: ObservableObject {
     /// to the features HTTP client after initialization completes.
     func cachedAttestToken() -> String? { attestToken }
 
+    /// #25 — wait (bounded) for background App Attest to produce `attestToken`
+    /// before the first gated request, so a cold-start hosted flow / sign-in
+    /// doesn't race AHEAD of the ~1s attestation and get rejected with
+    /// `attest_token_required` (403) — which then "works" a second later once the
+    /// token exists. Called at the top of the gated entry points; the token is
+    /// attached by `addStandardHeaders`.
+    ///
+    /// iOS-only by design: on macOS the backend accepts requests WITHOUT
+    /// X-Attest-Token (codesign fallback) and `DCAppAttestService` can hang on
+    /// Apple's servers when the App Attest entitlement is missing — waiting there
+    /// would risk freezing the flow for no gain. Best-effort + bounded: polls
+    /// until the token (or a terminal `attestError`) appears, or `attestWaitCapMs`
+    /// elapses, then proceeds tokenless. The background `_refreshAttestToken`
+    /// keeps running so its token rides later requests.
+    func _awaitAttestReady() async {
+        #if os(iOS)
+        guard attestRequired, attestToken == nil, attestError == nil else { return }
+        let deadline = Date().addingTimeInterval(TimeInterval(Self.attestWaitCapMs) / 1000.0)
+        while attestToken == nil && attestError == nil && Date() < deadline {
+            try? await Task.sleep(nanoseconds: 50_000_000) // 50 ms
+        }
+        #endif
+    }
+
+    /// #37 — may the NON-interactive discovery batch-ping go out? True when
+    /// attestation isn't required, the token has arrived, or attestation
+    /// terminally failed (an error means it will never arrive — don't wait
+    /// forever). False means "still pending" so the caller SKIPS the tokenless
+    /// send and defers to the token-arrival re-ping. macOS has no App Attest →
+    /// always ready (codesign path).
+    func _discoveryAttestReady() -> Bool {
+        #if os(iOS)
+        return !attestRequired || attestToken != nil || attestError != nil
+        #else
+        return true
+        #endif
+    }
+
     private func restoreSession() async {
+        // #36 — publish that an auto-login restore is in flight BEFORE the first
+        // `await`, so the view paints a branded splash (not the sign-in skeleton)
+        // for the whole verify/refresh window. `hasStoredSessionSync()` mirrors the
+        // guard below, so this is true iff we're actually about to restore; `defer`
+        // clears it on EVERY exit path (no stored session, corrupt data, verify
+        // done — success or revoked).
+        isRestoringSession = hasStoredSessionSync()
+        defer { isRestoringSession = false }
         let epoch = _signOutEpoch
         guard
             let accessToken = try? keychain.get(forKey: KeychainKeys.accessToken),
@@ -1628,13 +1897,40 @@ public final class OneloAuth: ObservableObject {
         }
     }
 
+    /// #38 — attach the per-request App Attest assertion (FAZA 3) to an
+    /// auth-completer request. The completers (signin / signup / hosted-callback)
+    /// hit REPLAY-GUARDED backend paths, but they build requests on `_urlSession`
+    /// + `addStandardHeaders` — NOT the shared `_OneloHTTPClient` that applies the
+    /// assertion for features/paywall/forms — so without this they'd send ONLY the
+    /// legacy bearer and the assertion model would never be exercised on exactly
+    /// the paths it most protects ("built, not called"). `assertionHeaders`
+    /// returns nil when the device can't produce one (no attested key / offline /
+    /// non-iOS) → bearer-only, fully backward compatible (monitor mode degrades).
+    /// The signed clientDataHash binds METHOD + path?query + challenge + THIS body,
+    /// so pass the EXACT bytes set as `httpBody`. Path/query are read from the
+    /// request URL (`request.url?.path`) — NOT a literal — so it matches the shared
+    /// `_OneloHTTPClient.applyAssertion` AND the backend's `request.url.path`
+    /// byte-for-byte even if `apiUrl` ever carries a path prefix.
+    private func applyAuthAssertion(to request: inout URLRequest, body: Data) async {
+        guard let headers = await assertionHeaders(
+            method: request.httpMethod ?? "POST",
+            path: request.url?.path ?? "",
+            query: request.url?.query ?? "",
+            body: body
+        ) else { return }
+        for (k, v) in headers { request.setValue(v, forHTTPHeaderField: k) }
+    }
+
     private func backendPost(path: String, body: [String: String]) async throws -> [String: Any] {
         let url = config.apiUrl.appendingPathComponent(path)
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let bodyData = try JSONSerialization.data(withJSONObject: body)
+        request.httpBody = bodyData
         addStandardHeaders(&request)
+        // #38 — signin/signup go through here; both are replay-guarded → assert.
+        await applyAuthAssertion(to: &request, body: bodyData)
 
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse else {

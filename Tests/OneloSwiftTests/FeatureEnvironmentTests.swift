@@ -88,7 +88,8 @@ final class FeatureEnvironmentTests: XCTestCase {
     private func makeFeatures(featureEnvironment: String?) -> OneloFeatures {
         let client = _OneloHTTPClient(
             publishableKey: "pk_test",
-            baseURL: URL(string: "https://example.invalid")!
+            baseURL: URL(string: "https://example.invalid")!,
+            securityContext: _OneloSecurityContext()
         )
         return OneloFeatures(client: client, featureEnvironment: featureEnvironment)
     }

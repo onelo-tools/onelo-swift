@@ -10,7 +10,8 @@ final class OneloFeaturesReadyTests: XCTestCase {
     private func makeFeatures() -> OneloFeatures {
         let client = _OneloHTTPClient(
             publishableKey: "pk_test",
-            baseURL: URL(string: "https://example.com")!
+            baseURL: URL(string: "https://example.com")!,
+            securityContext: _OneloSecurityContext()
         )
         return OneloFeatures(client: client)
     }

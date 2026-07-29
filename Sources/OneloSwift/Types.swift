@@ -1,7 +1,7 @@
 import Foundation
 
 public enum OneloSDK {
-    public static let sdkVersion = "3.68.0"
+    public static let sdkVersion = "3.72.0"
 }
 
 public enum UserRole: String, Codable, Sendable {
@@ -110,6 +110,10 @@ struct ResolvedConfig: Decodable {
     /// plan or the developer disables social. Drives whether the loading skeleton
     /// draws social pills so it matches what the hosted form will render.
     let oauthProviders: [String]
+    /// Branding page background (`checkout_bg_color`, default `#111111` server-side
+    /// when no custom branding). The auth view paints it so the pre-auth / loading
+    /// frame matches the hosted page instead of flashing a system colour (#26).
+    let checkoutBgColor: String?
 
     enum CodingKeys: String, CodingKey {
         case supabaseUrl = "supabase_url"
@@ -125,6 +129,7 @@ struct ResolvedConfig: Decodable {
         case storeUrl = "store_url"
         case manageUrl = "manage_url"
         case oauthProviders = "oauth_providers"
+        case checkoutBgColor = "checkout_bg_color"
     }
 
     init(from decoder: Decoder) throws {
@@ -143,6 +148,7 @@ struct ResolvedConfig: Decodable {
         storeUrl = try? c.decode(String.self, forKey: .storeUrl)
         manageUrl = try? c.decode(String.self, forKey: .manageUrl)
         oauthProviders = (try? c.decode([String].self, forKey: .oauthProviders)) ?? []
+        checkoutBgColor = try? c.decode(String.self, forKey: .checkoutBgColor)
     }
 }
 

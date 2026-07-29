@@ -5,6 +5,23 @@ import UIKit
 import AppKit
 #endif
 
+extension Color {
+    /// Parse a CSS-style hex string ("#RRGGBB", "RRGGBB", or "#RGB"). Returns nil
+    /// on malformed input so callers can fall back to a default. Used to paint the
+    /// auth view with the branding `checkout_bg_color` from `/api/sdk/config` (#26).
+    init?(oneloHex: String) {
+        var s = oneloHex.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.hasPrefix("#") { s.removeFirst() }
+        if s.count == 3 { s = s.map { "\($0)\($0)" }.joined() } // #RGB → #RRGGBB
+        guard s.count == 6, let v = UInt64(s, radix: 16) else { return nil }
+        self = Color(
+            red: Double((v >> 16) & 0xFF) / 255.0,
+            green: Double((v >> 8) & 0xFF) / 255.0,
+            blue: Double(v & 0xFF) / 255.0
+        )
+    }
+}
+
 /// Visual configuration for OneloAuthView.
 /// Pass a customised instance to match your app's design system.
 public struct OneloAuthConfig {

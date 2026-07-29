@@ -118,8 +118,15 @@ public struct OneloAuthView<Content: View>: View {
     /// skeleton with no retry. On the true→false edge with still no session, we
     /// re-run `loadHostedUrl` to present the correct surface (sign-in / retry).
     private let exchangingPublisher: AnyPublisher<Bool, Never>
+    /// #36 — mirrors `OneloAuth.isRestoringSession`. True while a stored session
+    /// is being restored/verified on cold-start auto-login, so the pre-auth frame
+    /// shows a branded splash instead of the sign-in skeleton.
+    private let restoringSessionPublisher: AnyPublisher<Bool, Never>
     @State private var isAuthenticated: Bool = false
     @State private var isReady: Bool = false
+    /// Seeded synchronously at init from `hasStoredSessionSync()` so the FIRST
+    /// paint of an auto-login already suppresses the sign-in skeleton (#36).
+    @State private var isRestoringSession: Bool = false
     /// True when the user is signed in but `paywall_enabled=true` and their
     /// entitlement is not active. Drives a switch from showing `content()`
     /// to opening the hosted store inside the same WKWebView.
@@ -178,7 +185,17 @@ public struct OneloAuthView<Content: View>: View {
     /// re-render). Seeded from OneloAuth's cached value for a correct first paint.
     @State private var oauthProviderCount: Int = 0
 
-    private var effectiveConfig: OneloAuthConfig { requestedConfig }
+    private var effectiveConfig: OneloAuthConfig {
+        // #26 — paint the branding page background (checkout_bg_color) so the
+        // pre-auth / loading frame matches the hosted page instead of flashing a
+        // system colour. Falls back to the developer's config (default
+        // .systemBackground) until config resolves or if the value is malformed.
+        guard let hex = (auth as? OneloAuth)?.pageBackgroundColorHex,
+              let color = Color(oneloHex: hex) else { return requestedConfig }
+        var c = requestedConfig
+        c.backgroundColor = color
+        return c
+    }
 
     /// True once sign-in (and any paywall) is satisfied — the point at which a
     /// blocking legal consent must be resolved before `content()` is shown.
@@ -207,6 +224,11 @@ public struct OneloAuthView<Content: View>: View {
             consentGateOwnerPublisher = oneloAuth.$consentGateOwner.eraseToAnyPublisher()
             oauthProvidersPublisher = oneloAuth.$oauthProviders.eraseToAnyPublisher()
             exchangingPublisher = oneloAuth.$isExchangingCode.eraseToAnyPublisher()
+            restoringSessionPublisher = oneloAuth.$isRestoringSession.eraseToAnyPublisher()
+            // Seed the flag synchronously so the FIRST paint of an auto-login
+            // already suppresses the sign-in skeleton (#36) — before the
+            // publisher has had a chance to deliver.
+            _isRestoringSession = State(initialValue: oneloAuth.hasStoredSessionSync())
         } else {
             sessionPublisher = Just(Optional<OneloSession>.none).eraseToAnyPublisher()
             readyPublisher = Just(false).eraseToAnyPublisher()
@@ -214,6 +236,7 @@ public struct OneloAuthView<Content: View>: View {
             consentGateOwnerPublisher = Just(nil).eraseToAnyPublisher()
             oauthProvidersPublisher = Just([String]()).eraseToAnyPublisher()
             exchangingPublisher = Just(false).eraseToAnyPublisher()
+            restoringSessionPublisher = Just(false).eraseToAnyPublisher()
         }
     }
 
@@ -242,15 +265,27 @@ public struct OneloAuthView<Content: View>: View {
                     .frame(minWidth: 440)
                     .ignoresSafeArea()
                     #endif
+                    #if os(iOS)
+                    // #32 — Same branding backing as the sign-in WebView: the
+                    // consent gate shares the now-transparent iOS WKWebView, so
+                    // without this it would flash the system background during its
+                    // load. Keep the branded color continuous here too.
+                    .background(effectiveConfig.backgroundColor.ignoresSafeArea())
+                    #endif
                 } else if consentResolved {
                     content()
                 } else {
-                    // Brief consent check before revealing the app — never
-                    // flash protected content while a blocking gate may apply.
-                    ZStack {
-                        effectiveConfig.backgroundColor.ignoresSafeArea()
-                        AuthSkeletonView(providerCount: oauthProviderCount)
-                    }
+                    // #46 — POST-auth consent check (inApp==true, session already
+                    // restored, awaiting the async consent gate). This was the LAST
+                    // AuthSkeletonView firing on cold-start AUTO-LOGIN: #36 killed
+                    // the pre-auth ones, but a returning user still hit THIS branch
+                    // and saw a SIGN-IN skeleton — wrong, they're already signed in.
+                    // Show ONLY the neutral branded splash while consent resolves;
+                    // content() reveals immediately after. (Rule: the sign-in
+                    // skeleton belongs solely to the signed-OUT loading state —
+                    // isReady && !isAuthenticated && !needsPaywall &&
+                    // !isRestoringSession && hostedUrl==nil — never post-auth.)
+                    effectiveConfig.backgroundColor.ignoresSafeArea()
                 }
             } else if let url = hostedUrl, !showRetry {
                 // Hosted page embedded in the app window via WKWebView
@@ -300,6 +335,13 @@ public struct OneloAuthView<Content: View>: View {
                     #if os(macOS)
                     .frame(minWidth: 440)
                     .ignoresSafeArea()
+                    #endif
+                    #if os(iOS)
+                    // #32 — Paint the branding color BEHIND the (now transparent)
+                    // WebView so the branded color is continuous from the skeleton
+                    // through the load, with no white/system flash. macOS gets this
+                    // from its NSWindow background; iOS has none, so it's explicit.
+                    .background(effectiveConfig.backgroundColor.ignoresSafeArea())
                     #endif
 
                     // Transition skeleton — full-bounds overlay, painted
@@ -360,6 +402,15 @@ public struct OneloAuthView<Content: View>: View {
                             .background(oneloOrange)
                             .clipShape(RoundedRectangle(cornerRadius: 10))
                         }
+                    } else if isRestoringSession {
+                        // #36 — auto-login in flight: a stored session is being
+                        // restored/verified. Show ONLY the branded background (the
+                        // ZStack above already paints it) — NO sign-in skeleton — so
+                        // a returning user sees "opening, already signed in", not a
+                        // flash of the login form. Falls through to the skeleton via
+                        // `restoringSessionPublisher` if restore resolves with no
+                        // valid session.
+                        EmptyView()
                     } else if isReady {
                         // Only paint the skeleton AFTER config has resolved — at
                         // that point `oauthProviderCount` is the fresh, plan-gated
@@ -369,7 +420,17 @@ public struct OneloAuthView<Content: View>: View {
                         // show the wrong social shape and visibly flip once config
                         // lands. The plain background above is the only pre-resolve
                         // state — matches the "no branded pre-auth screen" rule.
-                        AuthSkeletonView(providerCount: oauthProviderCount)
+                        //
+                        // #B — the skeleton is now Onelo-authored HTML rendered in a
+                        // bare WebView (single-source across SDKs, pixel-identical to
+                        // the hosted page's own SSR skeleton), not a native SwiftUI
+                        // reimplementation. Transparent → the ZStack's branded base
+                        // shows through, continuous into the loaded hosted page.
+                        AuthSkeletonWebView(socialCount: oauthProviderCount)
+                            #if os(macOS)
+                            .frame(minWidth: 440)
+                            #endif
+                            .ignoresSafeArea()
                     }
                 }
             }
@@ -430,9 +491,23 @@ public struct OneloAuthView<Content: View>: View {
             #if DEBUG
             _viewLog.debug("readyPublisher: ready=\(ready), isAuthenticated=\(isAuthenticated), hostedUrl=\(hostedUrl != nil ? "set" : "nil")")
             #endif
-            if ready && (!isAuthenticated || needsPaywall) && hostedUrl == nil && !showRetry {
+            if ready && (!isAuthenticated || needsPaywall) && hostedUrl == nil && !showRetry && !isRestoringSession {
                 #if DEBUG
                 _viewLog.debug("readyPublisher trigger → loadHostedUrl()")
+                #endif
+                Task { await loadHostedUrl() }
+            }
+        }
+        .onReceive(restoringSessionPublisher) { restoring in
+            // #36 — auto-login gate. While a stored session is being verified we
+            // hold the branded splash and DON'T load the hosted sign-in page. On
+            // the true→false edge with STILL no session (restore found nothing /
+            // the session was revoked), present the sign-in surface now.
+            let settled = isRestoringSession && !restoring
+            isRestoringSession = restoring
+            if settled && isReady && !isAuthenticated && hostedUrl == nil && !showRetry {
+                #if DEBUG
+                _viewLog.debug("restore settled without session → loadHostedUrl()")
                 #endif
                 Task { await loadHostedUrl() }
             }
@@ -585,7 +660,9 @@ public struct OneloAuthView<Content: View>: View {
             #if os(macOS)
             NSWorkspace.shared.open(redirect)
             #elseif os(iOS)
-            UIApplication.shared.open(redirect)
+            // async context (loadHostedUrl) → open(_:) resolves to the async
+            // overload on Swift 6 / Xcode 26 and must be awaited.
+            await UIApplication.shared.open(redirect)
             #endif
             return
         }
@@ -1129,6 +1206,160 @@ private let sessionExpiredRelayScript = WKUserScript(
     forMainFrameOnly: true
 )
 
+// MARK: - Pre-auth loading skeleton (HTML, single-source)
+//
+// Rendered inside a bare WKWebView via `loadHTMLString` the instant the
+// pre-auth state appears — while `loadHostedUrl()` fetches the hosted-page URL
+// from the backend — then torn down when the real hosted WebView mounts.
+//
+// This is the auth twin of `portalSkeletonHTML` (OneloCustomerPortalView) and
+// OneloFeedback's `skeletonHTML`: the skeleton is Onelo-authored HTML, not a
+// per-SDK native reimplementation, so it looks identical across every Onelo SDK
+// and — critically — is pixel-for-pixel identical to the hosted page's OWN SSR
+// skeleton (`frontend/app/auth/hosted/HostedAuthSkeleton.tsx`). Because the
+// hosted page re-renders the same skeleton on load, the sequence is
+// `Swift-skel → hosted-skel (identical) → form`, so the WebView swap is
+// invisible even though two WebView instances are involved.
+//
+// Body is TRANSPARENT (the branded `checkout_bg_color` is painted BEHIND by the
+// container — macOS window background / iOS `.background(...)`), mirroring both
+// the real hosted page and `EmbeddedWebAuthView`'s #32 transparency so the
+// branded colour is continuous from the skeleton through the loaded page with
+// no white/system flash. Layout mirrors HostedAuthSkeleton.tsx EXACTLY
+// (top-aligned `48px 24px 0`, 300px column) — the native `AuthSkeletonView`
+// centred vertically, which drifted from the hosted skeleton; this removes that
+// mismatch. Shimmer uses the same CSS-keyframe sweep as `portalSkeletonHTML`
+// (`background-attachment: fixed` is safe here — a bare loadHTMLString WebView
+// has no transformed ancestors to re-anchor it).
+private func authSkeletonHTML(socialCount: Int) -> String {
+    // Social pills + "or" divider are drawn ONLY when the caller knows social
+    // will appear (socialCount = plan-gated provider count). Default 0 → none,
+    // matching apps where social is disabled (developer OR plan) instead of
+    // flashing pills that never load. Mirrors HostedAuthSkeleton's socialCount.
+    let socialBlock: String
+    if socialCount > 0 {
+        let pills = String(repeating: "<div class=\"strong pill\"></div>", count: socialCount)
+        socialBlock = pills + "<div class=\"divider\"><div class=\"sk ln\"></div><div class=\"sk wd\"></div><div class=\"sk ln\"></div></div>"
+    } else {
+        socialBlock = ""
+    }
+    return """
+    <!DOCTYPE html><html><head>
+    <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+    <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    html,body{background:transparent;font-family:-apple-system,sans-serif;overflow:hidden}
+    @keyframes onelo-shimmer{0%{background-position:-60vw 0}100%{background-position:100vw 0}}
+    .wrap{display:flex;flex-direction:column;align-items:center;width:100%;padding:48px 24px 0}
+    .col{width:100%;max-width:300px;display:flex;flex-direction:column;gap:10px}
+    .sk{background-color:rgba(255,255,255,0.04);background-image:linear-gradient(90deg,rgba(255,255,255,0) 0%,rgba(255,255,255,0.12) 50%,rgba(255,255,255,0) 100%);background-size:60vw 100%;background-repeat:no-repeat;background-attachment:fixed;animation:onelo-shimmer 2.4s linear infinite;border-radius:8px}
+    .strong{background-color:rgba(255,255,255,0.08);background-image:linear-gradient(90deg,rgba(255,255,255,0) 0%,rgba(255,255,255,0.18) 50%,rgba(255,255,255,0) 100%);background-size:60vw 100%;background-repeat:no-repeat;background-attachment:fixed;animation:onelo-shimmer 2.4s linear infinite;border-radius:9px}
+    .logo{width:64px;height:64px;border-radius:14px;background:rgba(255,255,255,0.06);border:1.5px solid rgba(255,255,255,0.1);margin-bottom:14px}
+    .head{width:200px;height:22px;margin-bottom:10px;border-radius:6px}
+    .sub{width:140px;height:13px;opacity:0.7;margin-bottom:28px;border-radius:4px}
+    .pill{height:44px;border-radius:9px}
+    .divider{display:flex;align-items:center;gap:12px;margin:16px 0 4px}
+    .divider .ln{flex:1;height:1px;opacity:0.5;border-radius:0}
+    .divider .wd{width:14px;height:11px;opacity:0.5}
+    .lbl-e{width:38px;height:11px}
+    .input{height:44px}
+    .pwrow{display:flex;justify-content:space-between;align-items:center}
+    .lbl-p{width:58px;height:11px}
+    .forgot{width:90px;height:11px;opacity:0.7}
+    .cta{height:48px;margin-top:6px;border-radius:10px}
+    .signup{width:200px;height:12px;opacity:0.6;margin-top:6px;align-self:center}
+    </style></head><body>
+    <div class="wrap">
+    <div class="sk logo"></div>
+    <div class="sk head"></div>
+    <div class="sk sub"></div>
+    <div class="col">
+    \(socialBlock)
+    <div class="sk lbl-e"></div>
+    <div class="strong input" style="margin-bottom:2px"></div>
+    <div class="pwrow"><div class="sk lbl-p"></div><div class="sk forgot"></div></div>
+    <div class="strong input"></div>
+    <div class="strong cta"></div>
+    <div class="sk signup"></div>
+    </div>
+    </div>
+    </body></html>
+    """
+}
+
+// Bare, read-only WebView that renders `authSkeletonHTML` and nothing else — no
+// coordinator, no message handlers, no navigation delegate. Deliberately
+// isolated from the rich `EmbeddedWebAuthView`/`WebAuthCoordinator` so the
+// pre-auth skeleton can never trip that machinery. Transparent so the branded
+// backing shows through (mirrors EmbeddedWebAuthView's #32 setup).
+// Tracks the social-pill count last rendered into the WebView so a live change
+// to `oauthProviderCount` (if `readyPublisher` flips `isReady` BEFORE
+// `oauthProvidersPublisher` emits the plan-gated list) reloads the skeleton with
+// the right pill shape instead of freezing on a stale count. Mirrors Flutter's
+// `_skeletonSocials` guard (auth_view.dart) — restores the reactivity the native
+// `AuthSkeletonView` had for free.
+private final class AuthSkeletonCoordinator {
+    var loadedCount: Int = -1
+}
+
+#if os(macOS)
+private struct AuthSkeletonWebView: NSViewRepresentable {
+    let socialCount: Int
+
+    func makeCoordinator() -> AuthSkeletonCoordinator { AuthSkeletonCoordinator() }
+
+    func makeNSView(context: Context) -> WKWebView {
+        let config = WKWebViewConfiguration()
+        applyOneloWebViewHardening(config)
+        let webView = WKWebView(frame: .zero, configuration: config)
+        webView.setValue(false, forKey: "drawsBackground")
+        webView.enclosingScrollView?.hasVerticalScroller = false
+        webView.enclosingScrollView?.verticalScrollElasticity = .none
+        context.coordinator.loadedCount = socialCount
+        webView.loadHTMLString(authSkeletonHTML(socialCount: socialCount), baseURL: nil)
+        return webView
+    }
+
+    func updateNSView(_ nsView: WKWebView, context: Context) {
+        // Reload ONLY when the count actually changed — a no-op on identical
+        // re-renders keeps the shimmer from restarting.
+        guard context.coordinator.loadedCount != socialCount else { return }
+        context.coordinator.loadedCount = socialCount
+        nsView.loadHTMLString(authSkeletonHTML(socialCount: socialCount), baseURL: nil)
+    }
+}
+#elseif os(iOS)
+private struct AuthSkeletonWebView: UIViewRepresentable {
+    let socialCount: Int
+
+    func makeCoordinator() -> AuthSkeletonCoordinator { AuthSkeletonCoordinator() }
+
+    func makeUIView(context: Context) -> WKWebView {
+        let config = WKWebViewConfiguration()
+        applyOneloWebViewHardening(config)
+        let webView = WKWebView(frame: .zero, configuration: config)
+        // #32 transparency trio — branded backing shows through (painted behind
+        // by the container's `.background(...)`); without it iOS flashes white.
+        webView.isOpaque = false
+        webView.backgroundColor = .clear
+        webView.scrollView.backgroundColor = .clear
+        if #available(iOS 15.0, *) { webView.underPageBackgroundColor = .clear }
+        webView.scrollView.isScrollEnabled = false
+        webView.scrollView.showsVerticalScrollIndicator = false
+        context.coordinator.loadedCount = socialCount
+        webView.loadHTMLString(authSkeletonHTML(socialCount: socialCount), baseURL: nil)
+        return webView
+    }
+
+    func updateUIView(_ uiView: WKWebView, context: Context) {
+        // Reload ONLY when the count actually changed — see makeNSView twin.
+        guard context.coordinator.loadedCount != socialCount else { return }
+        context.coordinator.loadedCount = socialCount
+        uiView.loadHTMLString(authSkeletonHTML(socialCount: socialCount), baseURL: nil)
+    }
+}
+#endif
+
 #if os(macOS)
 private struct EmbeddedWebAuthView: NSViewRepresentable {
     let url: URL
@@ -1309,6 +1540,26 @@ private struct EmbeddedWebAuthView: UIViewRepresentable {
         )
         config.userContentController.addUserScript(noZoomScript)
         let webView = WKWebView(frame: .zero, configuration: config)
+        // #32 — Transparent background so the branded container color shows
+        // through WHILE the hosted page is still loading. This is the iOS mirror
+        // of macOS makeNSView's `drawsBackground=false`: without it the iOS
+        // WKWebView paints its default WHITE, flashing a white panel between the
+        // branded skeleton and the loaded sign-in page. On iOS `isOpaque=false`
+        // is REQUIRED for `backgroundColor` to take effect, and the underlying
+        // scrollView paints its own background so it must be cleared too — all
+        // three are needed. The branding color itself is painted BEHIND the
+        // WebView by the container (see body: `.background(effectiveConfig
+        // .backgroundColor)` on the iOS EmbeddedWebAuthView) — unlike macOS,
+        // iOS has no window background to fall back on, so transparency alone
+        // would otherwise reveal the system (white/black) background.
+        webView.isOpaque = false
+        webView.backgroundColor = .clear
+        webView.scrollView.backgroundColor = .clear
+        // Belt-and-suspenders for the overscroll/rubber-band region (iOS 15+):
+        // `underPageBackgroundColor` defaults to the page background and can
+        // momentarily surface the system color during a bounce. Clearing it keeps
+        // the branded container color continuous to the very edges.
+        if #available(iOS 15.0, *) { webView.underPageBackgroundColor = .clear }
         webView.navigationDelegate = context.coordinator
         webView.uiDelegate = context.coordinator
         webView.scrollView.showsHorizontalScrollIndicator = false

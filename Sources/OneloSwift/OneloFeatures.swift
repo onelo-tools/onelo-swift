@@ -5,6 +5,21 @@ import Observation
 @Observable
 public final class OneloFeatures {
     private let client: _OneloHTTPClient
+    /// #37 — bounded "wait until the App Attest token is ready" gate, wired by
+    /// `Onelo` to `OneloAuth._awaitAttestReady` + a readiness check. Awaited before
+    /// the discovery batch-ping so the gated endpoint isn't hit tokenless during
+    /// cold-start (which 403s on iOS → retry noise + delayed discovery). Returns
+    /// `true` when the ping may proceed (token present / attestation not required /
+    /// macOS / terminal attest error), `false` when the token is STILL pending
+    /// after the wait (fresh-install attestation can exceed the 5s cap) — in which
+    /// case `_batchPing` skips the tokenless send and defers to the token-arrival
+    /// re-ping wired in `Onelo`. `nil` (unwired / standalone) → treated as ready.
+    var _attestReadyGate: (() async -> Bool)? = nil
+    /// #37 — set when `_batchPing` SKIPPED a send because the attest token wasn't
+    /// ready yet. The token-arrival watcher (wired in `Onelo`) re-fires the ping
+    /// ONLY when this is true, so a normal (token-ready) cold/warm start pings
+    /// exactly once — no double-ping from the watcher replaying `$attestToken`.
+    private var _pendingTokenPing = false
     @ObservationIgnored private weak var monitor: OneloMonitor?
     /// The only observable property: SwiftUI reads `cache[name]` via `feature(_:)`
     /// and must re-render when SSE pushes a new snapshot. Everything else below is
@@ -493,6 +508,16 @@ public final class OneloFeatures {
     private func _batchPing() async {
         let names = Array(discoveredNames)
         guard !names.isEmpty else { return }
+        // #37 — wait (bounded) for the App Attest token; if it's STILL pending
+        // after the wait (fresh-install attestation can exceed the 5s cap), SKIP
+        // the tokenless send (it would 403) and mark it pending — the token-arrival
+        // watcher wired in `Onelo` re-fires this ping once the token lands. An
+        // unwired/standalone gate is nil → `nil == false` is false → still sends.
+        if await _attestReadyGate?() == false {
+            _pendingTokenPing = true
+            return
+        }
+        _pendingTokenPing = false
         var body: [String: Any] = [
             "publishableKey": client.publishableKey,
             "features": names,
@@ -512,6 +537,15 @@ public final class OneloFeatures {
             // Deploy access → Unbind.
             print("[Onelo] features batch-ping rejected: \(error)")
         }
+    }
+
+    /// #37 — re-fire a discovery batch-ping that was SKIPPED because the attest
+    /// token wasn't ready yet. Called by `Onelo`'s token-arrival watcher. No-op
+    /// unless a send was actually skipped, so a normal token-ready start (which
+    /// already pinged) is NOT double-pinged when the watcher replays `$attestToken`.
+    func _retryPendingDiscoveryPing() async {
+        guard _pendingTokenPing else { return }
+        await _batchPing()
     }
 
     /// Logs a one-time warning when the backend reports anonymous mode (no userId)

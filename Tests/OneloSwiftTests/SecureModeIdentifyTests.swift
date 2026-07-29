@@ -110,7 +110,8 @@ final class SecureModeIdentifyTests: XCTestCase {
     private func makeFeatures() -> OneloFeatures {
         let client = _OneloHTTPClient(
             publishableKey: "pk_test",
-            baseURL: URL(string: "https://example.invalid")!
+            baseURL: URL(string: "https://example.invalid")!,
+            securityContext: _OneloSecurityContext()
         )
         return OneloFeatures(client: client)
     }

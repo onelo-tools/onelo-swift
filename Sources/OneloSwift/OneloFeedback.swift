@@ -27,6 +27,12 @@ public final class OneloFeedback: NSObject, ObservableObject {
     private let features: OneloFeatures
 
     @Published public var isPresented = false
+    /// #40 Phase 2 — true once the hosted feedback page posts `onelo:ready`. While
+    /// false (pre-load / load-error) the native toolbar ✕ shows as a fail-safe;
+    /// once true the hosted page's own canonical ✕ owns the affordance and the
+    /// native one is hidden (so there's never a double ✕, and it's identical to
+    /// every other SDK).
+    @Published var hostedReady = false
     /// The resolved hosted URL — available after `open()` resolves.
     /// AppKit apps can read this directly instead of using `.feedbackSheet()`.
     public private(set) var hostedURL: URL?
@@ -81,14 +87,21 @@ public final class OneloFeedback: NSObject, ObservableObject {
     /// Use with `.feedbackSheet(onelo.feedback)` in SwiftUI apps.
     public func open(options: OpenFeedbackOptions = OpenFeedbackOptions()) async throws {
         hostedURL   = try await fetchHostedURL(options: options)
+        hostedReady = false   // fail-safe ✕ visible until the hosted page mounts
         isPresented = true
     }
 
     func makeWebView() -> OneloBrowserFeedbackView? {
         guard let url = hostedURL else { return nil }
-        return OneloBrowserFeedbackView(url: url) { [weak self] in
-            Task { @MainActor [weak self] in self?.isPresented = false }
-        }
+        return OneloBrowserFeedbackView(
+            url: url,
+            onDismiss: { [weak self] in
+                Task { @MainActor [weak self] in self?.isPresented = false }
+            },
+            onHostedReady: { [weak self] in
+                Task { @MainActor [weak self] in self?.hostedReady = true }
+            }
+        )
     }
 
 #if os(macOS)
@@ -277,17 +290,29 @@ public final class OneloFeedback: NSObject, ObservableObject {
 
 final class FeedbackWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
     let onDismiss: () -> Void
+    /// #40 Phase 2 — fired when the hosted page posts `onelo:ready`, so the host
+    /// can hide its native fail-safe ✕ (the hosted ✕ takes over). No-op until wired.
+    var onHostedReady: (() -> Void)?
     /// Invoked when the in-window error screen's Retry button fires.
     var onRetry: (() -> Void)?
     init(onDismiss: @escaping () -> Void) { self.onDismiss = onDismiss }
 
-    // JS relay: forward onelo:feedback_submitted postMessage → sentinel navigation.
+    // JS relay: forward the hosted page's postMessages → sentinel navigations the
+    // coordinator intercepts. `onelo:feedback_submitted` (done) and — from the
+    // canonical hosted ✕ (Phase 2) — `onelo:feedback_close` (user cancelled) both
+    // dismiss; `onelo:ready` tells the native side the hosted page mounted (so it
+    // hides its fail-safe ✕, shown only during the pre-load/error window).
     static let relayScript = WKUserScript(
         source: """
         (function() {
           window.addEventListener('message', function(e) {
-            if (e.data && e.data.type === 'onelo:feedback_submitted') {
+            if (!e.data || !e.data.type) return;
+            if (e.data.type === 'onelo:feedback_submitted') {
               window.location.href = 'onelo://feedback_submitted';
+            } else if (e.data.type === 'onelo:feedback_close') {
+              window.location.href = 'onelo://feedback_close';
+            } else if (e.data.type === 'onelo:ready') {
+              window.location.href = 'onelo://ready';
             }
           });
         })();
@@ -303,9 +328,17 @@ final class FeedbackWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate
     ) {
         if let url = navigationAction.request.url, url.scheme == "onelo" {
             switch url.host {
-            case "feedback_submitted":
+            case "feedback_submitted", "feedback_close":
+                // Both dismiss: submit auto-closes; the canonical hosted ✕ (#40
+                // Phase 2) cancels. Same native teardown.
                 decisionHandler(.cancel)
                 Task { @MainActor in self.onDismiss() }
+                return
+            case "ready":
+                // Hosted page mounted → hide the native fail-safe ✕ (the hosted ✕
+                // now owns the affordance). No-op if the host didn't wire it.
+                decisionHandler(.cancel)
+                Task { @MainActor in self.onHostedReady?() }
                 return
             case "feedback_retry":
                 decisionHandler(.cancel)
@@ -342,6 +375,7 @@ final class FeedbackWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate
 struct OneloBrowserFeedbackView {
     let url: URL
     let onDismiss: () -> Void
+    var onHostedReady: (() -> Void)? = nil
 
     func makeWebView(coordinator: FeedbackWebCoordinator) -> WKWebView {
         let config = WKWebViewConfiguration()
@@ -354,7 +388,9 @@ struct OneloBrowserFeedbackView {
     }
 
     func makeCoordinator() -> FeedbackWebCoordinator {
-        FeedbackWebCoordinator(onDismiss: onDismiss)
+        let c = FeedbackWebCoordinator(onDismiss: onDismiss)
+        c.onHostedReady = onHostedReady
+        return c
     }
 }
 
@@ -385,36 +421,47 @@ extension OneloBrowserFeedbackView: UIViewRepresentable {
 
 private struct FeedbackSheetView: View {
     @ObservedObject var feedback: OneloFeedback
+    /// #44 — armed ~3.5s after appear; the fail-safe ✕ shows only after this, so a
+    /// normal fast load never flashes it.
+    @State private var failsafeTimedOut = false
 
     var body: some View {
-        NavigationStack {
-            Group {
-                if let webView = feedback.makeWebView() {
-                    webView.ignoresSafeArea()
-                } else {
-                    ProgressView()
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                }
+        // #42 — full-bleed ZStack, IDENTICAL to OneloCustomerPortalView. The old
+        // `NavigationStack { … }.toolbar` reserved a nav bar whose top edge became
+        // the origin for the hosted page's CSS `position:fixed` ✕ — so the hosted
+        // ✕ hung well BELOW the corner (fine while the native toolbar ✕ was still
+        // shown, but once #40 Phase 2 hides the native one the mis-placed hosted ✕
+        // was the only affordance, inconsistent with the flush-corner portal ✕).
+        // A bare ZStack + `.ignoresSafeArea()` webview makes the webview top =
+        // surface top, so the hosted ✕ is flush top-right in feedback AND portal.
+        ZStack(alignment: .topLeading) {
+            if let webView = feedback.makeWebView() {
+                webView.ignoresSafeArea()
+            } else {
+                ProgressView()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            #if os(iOS)
-            .navigationBarTitleDisplayMode(.inline)
-            #endif
-            .toolbar {
-                // Unified Onelo close affordance: an `✕` (SF Symbol `xmark`)
-                // pinned TOP-RIGHT, neutral/system-colored, no Onelo branding —
-                // identical across every Onelo modal on every SDK. `.confirmationAction`
-                // renders TRAILING on both iOS and macOS (cross-platform-safe;
-                // `.topBarTrailing` is iOS-only). Same close action as before.
-                ToolbarItem(placement: .confirmationAction) {
-                    Button {
-                        feedback.isPresented = false
-                    } label: {
-                        Image(systemName: "xmark")
-                            .foregroundStyle(.secondary)
+            // #40 Phase 2 + #44 — native ✕ is a FAIL-SAFE only, and must NOT flash
+            // during a normal fast load: it appears only after a ~3.5s grace
+            // without the hosted page mounting. A fast load posts `onelo:ready`
+            // (`hostedReady`) first, so the ✕ never shows; a stuck load still gets
+            // a way out. Once the hosted page mounts its own canonical ✕ takes over.
+            if !feedback.hostedReady && failsafeTimedOut {
+                VStack {
+                    HStack {
+                        Spacer()
+                        OneloCloseButton(style: .overlay) { feedback.isPresented = false }
+                            .padding(8)
                     }
-                    .accessibilityLabel("Close")
+                    Spacer()
                 }
             }
+        }
+        .task {
+            // #44 — arm the fail-safe ✕ only after the grace period (auto-cancels
+            // when the sheet dismisses).
+            try? await Task.sleep(nanoseconds: 3_500_000_000)
+            if !feedback.hostedReady { failsafeTimedOut = true }
         }
     }
 }

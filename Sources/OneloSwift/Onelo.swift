@@ -84,21 +84,26 @@ public final class Onelo: ObservableObject {
             ?? (Bundle.main.object(forInfoDictionaryKey: "OneloFeatureEnvironment") as? String)
             ?? ProcessInfo.processInfo.environment["ONELO_FEATURE_ENVIRONMENT"]
         let resolvedFeatureEnv: String? = (rawFeatureEnv == "test" || rawFeatureEnv == "live") ? rawFeatureEnv : nil
-        let client = _OneloHTTPClient(publishableKey: publishableKey, baseURL: baseURL)
-        self.httpClient = client
         self.baseURL = baseURL
         self.callbackScheme = callbackScheme
-        let monitorInstance = OneloMonitor(publishableKey: publishableKey, apiUrl: baseURL.absoluteString, environment: environment)
-        self.monitor = monitorInstance
-        // Auth is constructed FIRST so its OneloEventStream can be injected
-        // into OneloFeatures below — single SSE connection per app, shared
-        // between auth-event listeners and feature-deploy listeners.
+        // Auth is constructed FIRST: it owns BOTH the shared OneloEventStream
+        // (single SSE connection per app, shared between auth-event and
+        // feature-deploy listeners) AND the shared `_OneloSecurityContext` — the
+        // single source of truth for the attest bearer + codesign fingerprint.
+        // Both are injected into the sibling transports below so the entire SDK
+        // reads ONE security context: a token written once by the producer
+        // (OneloAuth) is visible to every transport with nothing to mirror.
         let oneloAuth = OneloAuth(config: OneloConfig(
             publishableKey: publishableKey,
             apiUrl: baseURL,
             callbackScheme: callbackScheme,
             suppressIdentifyWarning: suppressIdentifyWarning
         ))
+        let securityContext = oneloAuth.securityContext
+        let client = _OneloHTTPClient(publishableKey: publishableKey, baseURL: baseURL, securityContext: securityContext)
+        self.httpClient = client
+        let monitorInstance = OneloMonitor(publishableKey: publishableKey, apiUrl: baseURL.absoluteString, environment: environment, securityContext: securityContext)
+        self.monitor = monitorInstance
         let featuresModule = OneloFeatures(
             client: client,
             eventStream: oneloAuth.eventStream,
@@ -109,6 +114,27 @@ public final class Onelo: ObservableObject {
             featureEnvironment: resolvedFeatureEnv
         )
         self.features = featuresModule
+        // #37 — gate the discovery batch-ping on the App Attest token being ready
+        // so cold-start pings don't 403 tokenless (bounded wait; no-op on macOS /
+        // once the token lands). Returns whether the ping may proceed: false =
+        // token still pending after the wait → _batchPing skips + defers to the
+        // re-ping below. Weak-captures OneloAuth to avoid a retain cycle.
+        featuresModule._attestReadyGate = { [weak oneloAuth] in
+            await oneloAuth?._awaitAttestReady()
+            return oneloAuth?._discoveryAttestReady() ?? true
+        }
+        // #37 — when the attest token arrives after a cold-start skip (fresh-install
+        // attestation can exceed the 5s wait cap), re-fire the deferred discovery
+        // ping. `_retryPendingDiscoveryPing` is a no-op unless a send was skipped,
+        // so a normal token-ready start (which already pinged) is NOT double-pinged
+        // when `$attestToken` replays. Same signal that feeds securityContext.
+        Task { [weak featuresModule, weak oneloAuth] in
+            guard let auth = oneloAuth else { return }
+            for await token in auth.$attestToken.values where token != nil {
+                await featuresModule?._retryPendingDiscoveryPing()
+                break
+            }
+        }
         self.paywall = OneloPaywall(client: client)
         self.forms = OneloForms(client: client)
         self.waitlist = OneloWaitlist(client: client)
@@ -123,41 +149,37 @@ public final class Onelo: ObservableObject {
             Task { await self?.openUpgrade(forPlan: plan) }
         }
 
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            // OneloAuth marks isReady=true as soon as the AuthClient is wired; attestation
-            // (when required) runs in the background. Don't block features on the attest
-            // token — kick off the initial features load once isReady, regardless of
-            // whether the attest token has arrived. The token is mirrored to the features
-            // HTTP client by a separate observer below as soon as it appears.
-            for await ready in self.auth.authObject.$isReady.values {
-                guard ready else { continue }
-                if let token = self.auth.authObject.attestToken {
-                    self.httpClient.attestToken = token
-                    self.monitor._setAttestToken(token)
-                }
-                await self.features._load(userId: nil)
-                break
-            }
+        // FAZA 3 — wire per-request App Attest assertions + self-heal into the
+        // features/paywall transport. The provider forwards to OneloAuth's shared
+        // OneloAppAttest and returns nil until attestation is set up (→ the legacy
+        // X-Attest-Token bearer still applies), so ordering is not a concern.
+        self.httpClient.assertionProvider = { [weak authObject = self.auth.authObject] m, p, q, b in
+            await authObject?.assertionHeaders(method: m, path: p, query: q, body: b)
+        }
+        self.httpClient.onAttestReject = { [weak authObject = self.auth.authObject] _ in
+            Task { @MainActor in authObject?.resetAttestedKeyForSelfHeal() }
         }
 
-        // Mirror the attest token from OneloAuth to the features HTTP client AND
-        // the monitor transport whenever it changes. This decouples feature/monitor
-        // requests from initialization order: requests issued before attestation
-        // completes go without a token (the macOS backend path is soft); once
-        // attestation finishes, subsequent requests carry it.
-        //
-        // Monitor needs this because it has its own URLSession (separate transport
-        // for tight timeouts + crash-path semaphore) and the backend's
-        // `validate_sdk_request_security` requires X-Bundle-Id + X-Attest-Token on
-        // every live mobile/desktop request.
         Task { @MainActor [weak self] in
             guard let self else { return }
-            for await token in self.auth.authObject.$attestToken.values {
-                if let token {
-                    self.httpClient.attestToken = token
-                    self.monitor._setAttestToken(token)
-                }
+            // OneloAuth marks isReady=true as soon as the AuthClient is wired;
+            // attestation (when required) runs in the background. Don't block
+            // features on the attest token — kick off the initial features load
+            // once isReady, regardless of whether the token has arrived.
+            //
+            // Nothing is mirrored here: the attest bearer + codesign fingerprint
+            // reach EVERY transport (shared REST client, SSE, monitor, auth
+            // URLSession) through the shared `securityContext` — the bearer via
+            // OneloAuth's `attestToken` didSet whenever attestation completes, the
+            // macOS codesign fingerprint seeded eagerly at OneloAuth init. A
+            // request issued before the token lands simply goes without it (the
+            // macOS backend path is soft; iOS reconnects) and the next one carries
+            // it. This replaced the old per-transport mirror that silently missed
+            // the SSE client and 403'd features/stream in a loop (#34).
+            for await ready in self.auth.authObject.$isReady.values {
+                guard ready else { continue }
+                await self.features._load(userId: nil)
+                break
             }
         }
 
@@ -331,7 +353,9 @@ public final class Onelo: ObservableObject {
             #if canImport(AppKit) && !targetEnvironment(macCatalyst)
             NSWorkspace.shared.open(url)
             #elseif canImport(UIKit)
-            UIApplication.shared.open(url)
+            // Swift 6 / Xcode 26 resolves open(_:) to the async overload in this
+            // async context — must be awaited (matches openCustomerPortalInBrowser).
+            await UIApplication.shared.open(url)
             #endif
         } catch {
             print("[Onelo] openUpgrade failed: \(error)")
