@@ -407,21 +407,22 @@ public final class OneloFeatures {
         eventStream._isStartedForTesting
     }
 
+    /// Test-only reconnect counters, delegated to the underlying event stream
+    /// — see `OneloEventStream._startCallCountForTesting` / `_stopCallCountForTesting`.
+    var _eventStreamStartCallCountForTesting: Int { eventStream._startCallCountForTesting }
+    var _eventStreamStopCallCountForTesting: Int { eventStream._stopCallCountForTesting }
+
     var _lastRefreshAtForTesting: Date { lastRefreshAt }
 
     func _setLastEventReceivedForTesting(_ date: Date) {
         lastEventReceived = date
     }
 
-    /// Test helper retained as a no-op shim — pre-3.51 it injected a
-    /// fabricated task into OneloFeatures' private streamTask so the zombie
-    /// detector could be exercised in isolation. The zombie detector now
-    /// drives reconnects via `eventStream.start()`, which is itself unit-
-    /// tested in OneloEventStream's own suite, so this helper has no work
-    /// to do anymore. Kept (Sendable Task argument accepted, then dropped)
-    /// only so the existing OneloFeaturesTests file compiles unchanged.
-    func _installFakeStreamTaskForTesting(_ task: Task<Void, Never>) {
-        task.cancel()
+    /// Test helper — puts the underlying event stream into the "started"
+    /// state (post-3.51 unification, `_checkSSEHealth` / `_resyncOnLifecycle`
+    /// gate on `eventStream._isStartedForTesting`, not a private streamTask).
+    func _startEventStreamForTesting(userId: String? = nil) {
+        eventStream.start(userId: userId)
     }
 
     /// Bootstrap: restore cached snapshot, register discovered names, then open the

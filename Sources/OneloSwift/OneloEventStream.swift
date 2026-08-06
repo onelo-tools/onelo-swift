@@ -129,6 +129,7 @@ public final class OneloEventStream {
         currentSinceVersion = sinceVersion
         currentAppVersion = appVersion
         isStarted = true
+        _startCallCountForTesting += 1
         _spawnConnectLoop()
     }
 
@@ -144,6 +145,7 @@ public final class OneloEventStream {
     /// `start(...)` again resumes delivery.
     public func stop() {
         isStarted = false
+        _stopCallCountForTesting += 1
         streamTask?.cancel()
         streamTask = nil
     }
@@ -152,6 +154,14 @@ public final class OneloEventStream {
     /// Mirrors the pre-3.51 `streamTask != nil` check that OneloFeaturesTests
     /// asserted to make sure `ready()` doesn't open a second connection.
     var _isStartedForTesting: Bool { isStarted }
+
+    /// Test-only call counters — let a caller-side zombie-detector test
+    /// (OneloFeatures' `_checkSSEHealth` / `_resyncOnLifecycle`) verify that a
+    /// stop()+start() reconnect cycle actually happened, not just that the
+    /// stream ends up `isStarted == true` (which is also true when nothing
+    /// happened at all, since `start()` is idempotent while already started).
+    private(set) var _startCallCountForTesting = 0
+    private(set) var _stopCallCountForTesting = 0
 
     // MARK: - Internals
 

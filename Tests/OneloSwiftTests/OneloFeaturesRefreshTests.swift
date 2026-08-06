@@ -85,25 +85,24 @@ final class OneloFeaturesRefreshTests: XCTestCase {
         XCTAssertFalse(features._sseTaskActive())
     }
 
-    func testCheckSSEHealthDetectsStaleAndReconnects() async {
+    func testCheckSSEHealthDetectsStaleAndReconnects() {
         let features = makeFeatures()
-        // Start a fake stream task we can observe for replacement.
-        let sentinel = Task<Void, Never> {
-            try? await Task.sleep(nanoseconds: 60_000_000_000)
-        }
-        features._installFakeStreamTaskForTesting(sentinel)
+        features._startEventStreamForTesting()
         XCTAssertTrue(features._sseTaskActive())
+        let stopsBefore = features._eventStreamStopCallCountForTesting
+        let startsBefore = features._eventStreamStartCallCountForTesting
 
         features._sseStaleThreshold = 0.001
         features._setLastEventReceivedForTesting(.distantPast)
         features._checkSSEHealth()
 
-        // After detection, _connectSSE replaces streamTask. The sentinel must
-        // be cancelled (since _connectSSE calls streamTask?.cancel()).
-        // Give the runtime a beat to process cancellation.
-        try? await Task.sleep(nanoseconds: 50_000_000)
-        XCTAssertTrue(sentinel.isCancelled,
-                      "Stale SSE detection must cancel the previous stream task")
+        // `start()` is idempotent while already-started with the same params,
+        // so `_sseTaskActive()` alone can't distinguish "reconnected" from
+        // "did nothing" — assert the stop+start cycle actually fired.
+        XCTAssertEqual(features._eventStreamStopCallCountForTesting, stopsBefore + 1,
+                       "Stale SSE detection must stop the previous stream")
+        XCTAssertEqual(features._eventStreamStartCallCountForTesting, startsBefore + 1,
+                       "Stale SSE detection must start a new stream")
         XCTAssertTrue(features._sseTaskActive(),
                       "A new stream task must be installed after reconnect")
     }
@@ -127,35 +126,36 @@ final class OneloFeaturesRefreshTests: XCTestCase {
 
     func testResyncOnLifecycleReconnectsZombieSSE() async {
         let features = makeFeatures()
-        let sentinel = Task<Void, Never> {
-            try? await Task.sleep(nanoseconds: 60_000_000_000)
-        }
-        features._installFakeStreamTaskForTesting(sentinel)
+        features._startEventStreamForTesting()
+        let stopsBefore = features._eventStreamStopCallCountForTesting
+        let startsBefore = features._eventStreamStartCallCountForTesting
         features._sseLifecycleStaleThreshold = 0.001
         features._setLastEventReceivedForTesting(.distantPast)
 
         features._resyncOnLifecycle()
+        // resync's REST refresh runs in a spawned Task; the SSE stop+start
+        // branch above it runs synchronously, but yield once for parity with
+        // the rest of this suite's async lifecycle tests.
         try? await Task.sleep(nanoseconds: 50_000_000)
 
-        XCTAssertTrue(sentinel.isCancelled,
-                      "Lifecycle resync must tear down stale SSE so the next dashboard Deploy propagates")
-        XCTAssertTrue(features._sseTaskActive(),
-                      "Lifecycle resync must install a fresh SSE task")
+        XCTAssertEqual(features._eventStreamStopCallCountForTesting, stopsBefore + 1,
+                       "Lifecycle resync must tear down stale SSE so the next dashboard Deploy propagates")
+        XCTAssertEqual(features._eventStreamStartCallCountForTesting, startsBefore + 1,
+                       "Lifecycle resync must install a fresh SSE task")
+        XCTAssertTrue(features._sseTaskActive())
     }
 
     func testResyncOnLifecycleLeavesFreshSSEAlone() async {
         let features = makeFeatures()
-        let sentinel = Task<Void, Never> {
-            try? await Task.sleep(nanoseconds: 60_000_000_000)
-        }
-        features._installFakeStreamTaskForTesting(sentinel)
+        features._startEventStreamForTesting()
+        let stopsBefore = features._eventStreamStopCallCountForTesting
         features._sseLifecycleStaleThreshold = 60
         features._setLastEventReceivedForTesting(Date())
 
         features._resyncOnLifecycle()
         try? await Task.sleep(nanoseconds: 50_000_000)
 
-        XCTAssertFalse(sentinel.isCancelled,
+        XCTAssertEqual(features._eventStreamStopCallCountForTesting, stopsBefore,
                        "Fresh SSE must not be torn down when last event is recent")
     }
 
@@ -183,14 +183,12 @@ final class OneloFeaturesRefreshTests: XCTestCase {
 
     func testCheckSSEHealthLeavesFreshStreamAlone() {
         let features = makeFeatures()
-        let sentinel = Task<Void, Never> {
-            try? await Task.sleep(nanoseconds: 60_000_000_000)
-        }
-        features._installFakeStreamTaskForTesting(sentinel)
+        features._startEventStreamForTesting()
+        let stopsBefore = features._eventStreamStopCallCountForTesting
         features._sseStaleThreshold = 60
         features._setLastEventReceivedForTesting(Date()) // just received an event
         features._checkSSEHealth()
-        XCTAssertFalse(sentinel.isCancelled,
+        XCTAssertEqual(features._eventStreamStopCallCountForTesting, stopsBefore,
                        "Fresh SSE must not be torn down by the healthcheck")
     }
 }

@@ -1,4 +1,69 @@
 import Foundation
+import os
+
+private let _monitorLog = Logger(subsystem: "com.onelo.sdk", category: "monitor")
+
+// Delivery policy — 1:1 with @onelo/js's monitor transport: ONE attempt per
+// flush. A batch the server did not accept goes back in the buffer and rides
+// the next 15s tick — the flush timer IS the retry. An in-flight retry loop
+// tripled inbound request volume during a backend outage (the worst possible
+// moment) and made every "bounded" teardown path aspirational rather than real:
+// with one attempt a drain is a single request, so `flush(timeout:)`'s deadline
+// is achievable instead of a hope.
+private let _maxRetryAfter: TimeInterval = 3600
+
+/// What ONE delivery attempt means for the batch.
+///
+/// - `.done`    — the server ACCEPTED it. Settled; never send again.
+/// - `.requeue` — the server did NOT take it (429, 5xx, network, timeout). Put
+///                it back and let the next flush carry it.
+/// - `.drop`    — permanently rejected (4xx other than 429: bad key, malformed
+///                payload). Re-sending would fail identically forever, so we
+///                discard it — but LOUDLY, never silently.
+private enum _SendOutcome {
+    case done
+    case requeue
+    case drop
+}
+
+/// Classify one URLSession result. Never throws — a `503` must be
+/// distinguishable from success, which is exactly what the old
+/// `{ _, _, _ in }` completion handler made impossible.
+/// Returns the outcome, the 429 `Retry-After` hold-off in seconds, and the HTTP
+/// status (0 when there was no response) so a drop can be logged with its cause.
+private func _classify(response: URLResponse?, error: Error?) -> (_SendOutcome, TimeInterval, Int) {
+    if error != nil { return (.requeue, 0, 0) } // network / DNS / TLS / timeout
+    guard let http = response as? HTTPURLResponse else { return (.requeue, 0, 0) }
+    let status = http.statusCode
+    if (200..<300).contains(status) { return (.done, 0, status) }
+    if status == 429 {
+        // Rate limited — hammering it now only makes it worse. But the server
+        // did NOT accept these events, so they must be re-queued and go out
+        // after the hold-off.
+        let raw = http.value(forHTTPHeaderField: "Retry-After")
+        let seconds = raw.flatMap { Double($0.trimmingCharacters(in: .whitespaces)) } ?? 0
+        guard seconds.isFinite, seconds > 0 else { return (.requeue, 0, status) }
+        return (.requeue, min(seconds, _maxRetryAfter), status)
+    }
+    // 401 bad key / 403 forbidden / 422 malformed — identical every time, so
+    // re-queueing would wedge the buffer forever. Drop, but say so.
+    if (400..<500).contains(status) { return (.drop, 0, status) }
+    return (.requeue, 0, status) // 5xx and anything unrecognised — try next flush
+}
+
+/// ISO-8601 UTC stamp for an event's `ts`. Built once — `ISO8601DateFormatter`
+/// is expensive to construct and this is on the hot event path.
+private let _eventTsFormatter: ISO8601DateFormatter = {
+    let f = ISO8601DateFormatter()
+    f.formatOptions = [.withInternetDateTime]
+    f.timeZone = TimeZone(secondsFromGMT: 0)
+    return f
+}()
+
+/// ISO-8601 UTC for "right now" — the moment an event HAPPENED.
+internal func _monitorEventTs(_ date: Date = Date()) -> String {
+    _eventTsFormatter.string(from: date)
+}
 
 public struct MonitorEventOptions {
     public let ok: Bool
@@ -61,6 +126,16 @@ private struct AnyEncodable: Encodable {
 }
 
 private struct BufferedEvent: Encodable {
+    /// ISO-8601 UTC, stamped when the event HAPPENED — not when it is sent.
+    ///
+    /// The backend clamps this to a 1h staleness window and falls back to ingest
+    /// time when it is absent (`_resolve_event_ts` in sdk_monitor.py), so without
+    /// it a batch that waited out an outage is recorded as having happened the
+    /// moment the outage ENDED — calm during the failure, phantom spike after.
+    /// Parity with onelo-python / node / php, which have always sent it.
+    ///
+    /// NOTE: unrelated to the `ts` on a BREADCRUMB (unix seconds, inside meta).
+    let ts: String
     let featureName: String
     let ok: Bool
     let durationMs: Int?
@@ -92,6 +167,19 @@ public class OneloMonitor {
     private var buffer: [BufferedEvent] = []
     private let maxBufferSize = 200
 
+    /// Number of events evicted because the buffer was full. Bounded dropping
+    /// is fine; silence is not — we log the running total (see `_noteDrop`).
+    private var droppedEventCount = 0
+
+    /// While a drain is in flight no second drain may start: two overlapping
+    /// drains would interleave batches, and the second would observe an empty
+    /// buffer and report success. Honoured by the async drain AND `_flushSync`.
+    private var isDraining = false
+
+    /// Server told us to back off (429 `Retry-After`). Until this instant,
+    /// flushes leave the events buffered instead of sending.
+    private var retryAfterUntil: Date = .distantPast
+
     // Summary buffer for `_trackFeatureCall` — every `feature("name")`
     // lookup goes through that path, and on a busy app that's hundreds
     // of identical ok=true events per minute, each consuming a row in
@@ -105,7 +193,12 @@ public class OneloMonitor {
     // Errors / explicit `event()` calls / `track()` durations are NOT
     // aggregated — they still go through the regular per-event buffer
     // because each carries unique data (error text, duration, meta).
-    private var summaryBuffer: [String: Int] = [:]
+    //
+    // `firstTs` is the moment the FIRST call in the current window happened, so
+    // the summary event carries an event time from when the calls actually
+    // occurred rather than from the drain that shipped them — the same reason
+    // per-event `ts` exists.
+    private var summaryBuffer: [String: (count: Int, firstTs: String)] = [:]
 
     // Dedicated URLSession with a tight timeout. Monitoring must never hold
     // network resources hostage if the API is slow / offline. Default 5s for
@@ -163,6 +256,15 @@ public class OneloMonitor {
             self?.flush()
         }
         _registerGlobalHandlers()
+
+        // Auto-emit one unconditional event per construction. An app that gates
+        // every instrumented operation behind sign-in/paywall/consent would
+        // otherwise emit NOTHING on a cold start — the dashboard would look
+        // "not integrated" even though every line of the snippet was followed
+        // correctly. This event needs no gate to exist: it fires the moment the
+        // SDK is constructed, so Feature Health always has at least one row.
+        // Mirrors @onelo/js's `session_opened` (monitor.ts).
+        _push(featureName: "session_opened", ok: true, durationMs: nil, error: nil, source: "event")
     }
 
     // MARK: - Internal: security header wiring
@@ -210,6 +312,35 @@ public class OneloMonitor {
         return result
     }
 
+    /// Test-only: number of events currently buffered (including any batch
+    /// handed back by `_requeue`). Drains the serial queue first so pending
+    /// writes are visible. Internal — exposed via `@testable import`.
+    internal func _bufferedCountForTesting() -> Int {
+        var result = 0
+        queue.sync { result = self.buffer.count }
+        return result
+    }
+
+    /// Test-only: running total of events evicted because the buffer was full.
+    internal func _droppedCountForTesting() -> Int {
+        var result = 0
+        queue.sync { result = self.droppedEventCount }
+        return result
+    }
+
+    /// Test-only: discard whatever is currently buffered (including the
+    /// auto-emitted `session_opened` event from construction) so tests can
+    /// assert on exact counts/payloads for events THEY push, without the
+    /// unconditional cold-start event throwing off the numbers. Drains the
+    /// serial queue first so the init-time push (dispatched via `queue.async`)
+    /// is guaranteed to have landed before it is cleared.
+    internal func _clearBufferForTesting() {
+        queue.sync {
+            self.buffer.removeAll()
+            self.summaryBuffer.removeAll()
+        }
+    }
+
     // MARK: - Public API: events
 
     public func event(_ featureName: String, options: MonitorEventOptions) {
@@ -230,9 +361,16 @@ public class OneloMonitor {
     /// time. Server-side aggregation gets the full N via `meta.calls`,
     /// only one row lands in `monitor_events`.
     public func _trackFeatureCall(_ featureName: String) {
+        // Stamp NOW, on the caller's side of the hop — this is when the call
+        // happened. Only the first call of a window sets it.
+        let now = _monitorEventTs()
         queue.async { [weak self] in
             guard let self else { return }
-            self.summaryBuffer[featureName, default: 0] += 1
+            if let existing = self.summaryBuffer[featureName] {
+                self.summaryBuffer[featureName] = (existing.count + 1, existing.firstTs)
+            } else {
+                self.summaryBuffer[featureName] = (1, now)
+            }
         }
     }
 
@@ -322,15 +460,23 @@ public class OneloMonitor {
         // queue for performance.
         let isCrashPath = source == "global_error"
 
+        // Stamp the event time HERE, on the caller's thread, before the hop onto
+        // `queue` and long before the flush that ships it.
+        let ts = _monitorEventTs()
+
         let work: () -> Void = { [weak self] in
             guard let self else { return }
             if self.buffer.count >= self.maxBufferSize {
+                // Newest events win — evict the oldest (same policy as
+                // `_requeue`). Drops are counted and logged, never silent.
                 self.buffer.removeFirst()
+                self._noteDrop(1)
             }
             let encodableMeta: [String: AnyEncodable]? = scrubbedMeta.map { dict in
                 Dictionary(uniqueKeysWithValues: dict.map { ($0.key, AnyEncodable(value: $0.value)) })
             }
             self.buffer.append(BufferedEvent(
+                ts: ts,
                 featureName: featureName,
                 ok: ok,
                 durationMs: durationMs,
@@ -494,6 +640,14 @@ public class OneloMonitor {
     }
 
     // MARK: - Transport
+    //
+    // ONE attempt per flush. A batch the server did not accept (429, 5xx,
+    // network, timeout) is re-queued (capped, newest-wins) and the NEXT flush
+    // carries it — the 15s timer IS the retry, so an outage never multiplies
+    // inbound request volume. Every drop is logged.
+    // Still deferred: persisting the queue to disk + retrying on the NEXT
+    // LAUNCH (BGTaskScheduler). Events buffered when the process dies are
+    // therefore still lost — that is a separate, larger piece of work.
 
     /// Blocking flush: drains the buffer on the caller's thread and waits up to
     /// `timeout` seconds for the HTTP send to complete. Use this before a
@@ -507,104 +661,205 @@ public class OneloMonitor {
 
     public func flush() {
         queue.async { [weak self] in
-            guard let self else { return }
-            var events = self.buffer
-            self.buffer.removeAll()
-            // Drain summary counters into the outgoing batch as one
-            // BufferedEvent per feature. After flush the counters reset
-            // to zero — next window starts fresh. If the network send
-            // fails we lose the aggregated count (no retry queue today,
-            // same fate as the rest of the buffer).
-            for (featureName, count) in self.summaryBuffer where count > 0 {
-                events.append(BufferedEvent(
-                    featureName: featureName,
-                    ok: true,
-                    durationMs: nil,
-                    error: nil,
-                    source: "feature_call_summary",
-                    platform: "swift",
-                    sessionId: self.sessionId,
-                    userId: self.currentUserId,
-                    meta: ["calls": AnyEncodable(value: count)]
-                ))
-            }
-            self.summaryBuffer.removeAll()
-            guard !events.isEmpty else { return }
-            self._send(events: events)
+            self?._drain()
         }
     }
 
-    /// Synchronous best-effort flush for crash path. Drains the buffer on the
-    /// caller's thread and blocks up to `timeout` waiting for the HTTP response.
-    /// Process may still die before semaphore signals — disk-persisted queue
-    /// (TODO v2) would eliminate that residual loss. For now this maximises
-    /// the chance of crash payloads arriving before terminate.
+    // MARK: - Internal: buffer drain (must run on `queue`)
+
+    /// Take everything pending — buffered events plus the feature-call summary
+    /// counters — out of the buffers and return it as one batch.
+    ///
+    /// The caller owns the batch from here on: if delivery fails it MUST hand
+    /// the events back via `_requeue`. Nothing is discarded on the way out.
+    private func _takePendingBatch() -> [BufferedEvent] {
+        var events = self.buffer
+        self.buffer.removeAll()
+        // Drain summary counters into the outgoing batch as one BufferedEvent
+        // per feature. After the drain the counters reset — next window starts
+        // fresh. The aggregated events travel with the batch, so a failed send
+        // re-queues them like any other event instead of losing the count.
+        for (featureName, entry) in self.summaryBuffer where entry.count > 0 {
+            events.append(BufferedEvent(
+                // When the first call of this window happened — NOT drain time.
+                ts: entry.firstTs,
+                featureName: featureName,
+                ok: true,
+                durationMs: nil,
+                error: nil,
+                source: "feature_call_summary",
+                platform: "swift",
+                sessionId: self.sessionId,
+                userId: self.currentUserId,
+                meta: ["calls": AnyEncodable(value: entry.count)]
+            ))
+        }
+        self.summaryBuffer.removeAll()
+        return events
+    }
+
+    /// Async drain: serialised, non-blocking, ONE attempt. Runs on `queue`.
+    private func _drain() {
+        // Never let the 15s timer, an error auto-flush and an explicit flush()
+        // overlap: two drains would interleave batches and the second would see
+        // an empty buffer and report success.
+        guard !isDraining else { return }
+        // Honour a 429 hold-off: leave the events buffered, they go out on the
+        // next flush after the hold-off expires.
+        guard Date() >= retryAfterUntil else { return }
+
+        let events = _takePendingBatch()
+        guard !events.isEmpty else { return }
+        guard let request = _makeRequest(events: events) else {
+            // Serialisation failed. The batch is already OUT of the buffer, so
+            // returning here would annihilate it silently — hand it back.
+            _requeue(events)
+            return
+        }
+
+        isDraining = true
+        // ONE attempt. Anything the server did not accept goes straight back in
+        // the buffer and rides the next 15s tick — the flush timer IS the retry.
+        _sendOnce(request: request) { [weak self] outcome in
+            // Back on `queue` (see `_sendOnce`).
+            guard let self else { return }
+            self.isDraining = false
+            if outcome == .requeue { self._requeue(events) }
+        }
+    }
+
+    /// One POST, fully asynchronous: no caller's thread is ever blocked.
+    /// `completion` is invoked on `queue`.
+    private func _sendOnce(request: URLRequest, completion: @escaping (_SendOutcome) -> Void) {
+        transport.dataTask(with: request) { [weak self] _, response, error in
+            guard let self else { return }
+            let (outcome, holdOff, status) = _classify(response: response, error: error)
+            self.queue.async {
+                if holdOff > 0 {
+                    self.retryAfterUntil = max(self.retryAfterUntil, Date().addingTimeInterval(holdOff))
+                    _monitorLog.warning("event quota exhausted; holding off ~\(Int(holdOff))s before the next flush")
+                }
+                if outcome == .drop {
+                    _monitorLog.warning("batch rejected with HTTP \(status) — dropping it (retrying would fail identically)")
+                }
+                completion(outcome)
+            }
+        }.resume()
+    }
+
+    /// Put an undelivered batch back at the FRONT of the buffer so the next
+    /// flush retries it, then re-apply the cap. Runs on `queue`.
+    ///
+    /// Priority policy under a sustained outage: NEWEST EVENTS WIN. The buffer
+    /// is trimmed from the front, so the oldest re-queued events go first. That
+    /// matches `_push`'s eviction, keeps memory bounded at `maxBufferSize`
+    /// however long the backend is down, and stops a stuck batch from starving
+    /// live telemetry.
+    private func _requeue(_ events: [BufferedEvent]) {
+        buffer.insert(contentsOf: events, at: 0)
+        var dropped = 0
+        while buffer.count > maxBufferSize {
+            buffer.removeFirst()
+            dropped += 1
+        }
+        _monitorLog.warning(
+            "batch not delivered — \(events.count) event(s) re-queued\(dropped > 0 ? ", \(dropped) oldest dropped (buffer cap \(self.maxBufferSize))" : "")"
+        )
+        if dropped > 0 { _noteDrop(dropped) }
+    }
+
+    /// Count a dropped event and log the running total. Logging is throttled
+    /// (first drop, then every 50th) so a sustained outage cannot turn the
+    /// device log into a firehose — but a drop is never silent.
+    private func _noteDrop(_ count: Int) {
+        let before = droppedEventCount
+        droppedEventCount += count
+        if before == 0 || (droppedEventCount / 50) > (before / 50) {
+            _monitorLog.warning("buffer full (cap \(self.maxBufferSize)) — \(self.droppedEventCount) event(s) dropped so far")
+        }
+    }
+
+    private func _makeRequest(events: [BufferedEvent]) -> URLRequest? {
+        struct Payload: Encodable {
+            let publishableKey: String
+            let events: [BufferedEvent]
+        }
+        guard let url = URL(string: "\(apiUrl)/api/sdk/monitor/events/batch"),
+              let body = try? JSONEncoder().encode(Payload(publishableKey: publishableKey, events: events)) else {
+            return nil
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        applySecurityHeaders(to: &request)
+        request.httpBody = body
+        return request
+    }
+
+    /// Synchronous best-effort flush for the crash path. Drains the buffer on the
+    /// caller's thread and blocks up to `timeout` waiting for ONE HTTP response.
+    /// The process may still die before the semaphore signals — a disk-persisted
+    /// queue (TODO v2) would eliminate that residual loss.
+    ///
+    /// ONE attempt, so `timeout` is a genuine ceiling on how long a terminating
+    /// app is delayed rather than a budget a retry loop tries to fit inside.
+    ///
+    /// Unlike before, this respects BOTH the `isDraining` guard (so it cannot run
+    /// alongside an async drain and interleave batches) and the `retryAfterUntil`
+    /// hold-off (so a crash cannot bypass the rate limit the server asked for).
+    /// An undelivered batch is handed back to the buffer, so if the process
+    /// survives (a non-fatal `flush(timeout:)` call) the events go out on the
+    /// next flush instead of being destroyed.
     private func _flushSync(timeout: TimeInterval = 2.0) {
         var events: [BufferedEvent] = []
+        var proceed = false
         queue.sync {
-            events = self.buffer
-            self.buffer.removeAll()
-            // Drain feature_call summary counters too — crash should not
-            // discard accumulated call counts. Same shape as flush().
-            for (featureName, count) in self.summaryBuffer where count > 0 {
-                events.append(BufferedEvent(
-                    featureName: featureName,
-                    ok: true,
-                    durationMs: nil,
-                    error: nil,
-                    source: "feature_call_summary",
-                    platform: "swift",
-                    sessionId: self.sessionId,
-                    userId: self.currentUserId,
-                    meta: ["calls": AnyEncodable(value: count)]
-                ))
+            // Same two gates the async drain honours.
+            guard !self.isDraining, Date() >= self.retryAfterUntil else { return }
+            // A crash should not discard accumulated call counts either.
+            events = self._takePendingBatch()
+            guard !events.isEmpty else { return }
+            self.isDraining = true
+            proceed = true
+        }
+        guard proceed else { return }
+
+        // From here the batch is OUT of the buffer and we own it: every exit
+        // path below must either deliver it or hand it back.
+        func settle(_ delivered: Bool) {
+            queue.async {
+                self.isDraining = false
+                if !delivered { self._requeue(events) }
             }
-            self.summaryBuffer.removeAll()
-        }
-        guard !events.isEmpty else { return }
-
-        struct Payload: Encodable {
-            let publishableKey: String
-            let events: [BufferedEvent]
         }
 
-        guard let url = URL(string: "\(apiUrl)/api/sdk/monitor/events/batch"),
-              let body = try? JSONEncoder().encode(Payload(publishableKey: publishableKey, events: events)) else {
+        guard let request = _makeRequest(events: events) else {
+            _monitorLog.warning("crash-path batch could not be serialised — \(events.count) event(s) re-queued")
+            settle(false)
             return
         }
 
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        applySecurityHeaders(to: &request)
-        request.httpBody = body
-
+        var outcome: _SendOutcome = .requeue
+        var holdOff: TimeInterval = 0
+        var status = 0
         let semaphore = DispatchSemaphore(value: 0)
-        transport.dataTask(with: request) { _, _, _ in
+        transport.dataTask(with: request) { _, response, error in
+            (outcome, holdOff, status) = _classify(response: response, error: error)
             semaphore.signal()
         }.resume()
-        _ = semaphore.wait(timeout: .now() + timeout)
-    }
-
-    private func _send(events: [BufferedEvent]) {
-        struct Payload: Encodable {
-            let publishableKey: String
-            let events: [BufferedEvent]
-        }
-
-        guard let url = URL(string: "\(apiUrl)/api/sdk/monitor/events/batch"),
-              let body = try? JSONEncoder().encode(Payload(publishableKey: publishableKey, events: events)) else {
+        if semaphore.wait(timeout: .now() + timeout) == .timedOut {
+            // No answer inside the budget — treat it as undelivered and let the
+            // next flush carry the batch.
+            settle(false)
             return
         }
 
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        applySecurityHeaders(to: &request)
-        request.httpBody = body
-
-        transport.dataTask(with: request) { _, _, _ in
-            // Silently drop — monitoring must never crash the app.
-            // Future: persist to disk + retry on next launch (BGTaskScheduler).
-        }.resume()
+        if holdOff > 0 {
+            queue.async { self.retryAfterUntil = max(self.retryAfterUntil, Date().addingTimeInterval(holdOff)) }
+        }
+        if outcome == .drop {
+            _monitorLog.warning("batch rejected with HTTP \(status) — dropping it (retrying would fail identically)")
+        }
+        settle(outcome != .requeue)
     }
 
     public func destroy() {
