@@ -887,7 +887,26 @@ private final class WebAuthCoordinator: NSObject, WKNavigationDelegate, WKUIDele
         ) { [weak self] callbackURL, error in
             guard let self else { return }
             self._appleAuthSession = nil
-            guard error == nil, let callbackURL else { return }
+            if let error {
+                // Swallowing every error here (including real failures, not just
+                // user cancellation) left the presenting window stuck blank with
+                // no way forward — the user had to force-close it. Only the
+                // explicit user-cancel case stays silent (matches the "keep the
+                // gate up, let the user retry" pattern used elsewhere in this
+                // file); anything else surfaces via onError so the retry screen
+                // replaces the dead window.
+                let nsError = error as NSError
+                let isUserCancel = nsError.domain == ASWebAuthenticationSessionErrorDomain
+                    && nsError.code == ASWebAuthenticationSessionError.canceledLogin.rawValue
+                if !isUserCancel {
+                    DispatchQueue.main.async { self.onError(error.localizedDescription) }
+                }
+                return
+            }
+            guard let callbackURL else {
+                DispatchQueue.main.async { self.onError("Sign in with Apple did not complete. Please try again.") }
+                return
+            }
             let items = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false)?.queryItems
             if let code = items?.first(where: { $0.name == "code" })?.value {
                 DispatchQueue.main.async { self.onCode(code) }
