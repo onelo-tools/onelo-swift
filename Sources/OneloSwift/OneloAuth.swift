@@ -135,6 +135,12 @@ public final class OneloAuth: ObservableObject {
     @Published public private(set) var isExchangingCode: Bool = false
     /// True if SDK gate is active — `OneloAuthView` opens the store instead of sign-in.
     @Published public private(set) var paywallEnabled: Bool = false
+    /// False on an Apple-store build whose app has not opted into showing the
+    /// store in-app (App Review guideline 3.1.1). `paywallEnabled` stays true —
+    /// the plan requirement is real, it simply cannot be satisfied here, so the
+    /// sign-up affordance is hidden and the buyer purchases on the web.
+    /// Defaults true so an older backend behaves exactly as before.
+    @Published public private(set) var inAppStoreAllowed: Bool = true
     /// Branding page background hex (`checkout_bg_color`, default `#111111`) from
     /// `/api/sdk/config`. `OneloAuthView` parses + paints it so the pre-auth /
     /// loading frame matches the hosted page instead of flashing a system colour
@@ -1427,6 +1433,7 @@ public final class OneloAuth: ObservableObject {
             if let name = resolved.appName, !name.isEmpty { hostedAppName = name }
             if let logoStr = resolved.appLogoUrl { hostedAppLogoUrl = URL(string: logoStr) }
             paywallEnabled = resolved.paywallEnabled
+            inAppStoreAllowed = resolved.inAppStoreAllowed
             // #26 — MUST be set before `isReady = true` below: the view re-renders
             // on the `readyPublisher` (not on this property directly), so it reads
             // the already-populated hex when it flips ready. Keep this assignment

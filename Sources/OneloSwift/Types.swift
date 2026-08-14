@@ -1,7 +1,7 @@
 import Foundation
 
 public enum OneloSDK {
-    public static let sdkVersion = "3.75.0"
+    public static let sdkVersion = "3.76.0"
 }
 
 public enum UserRole: String, Codable, Sendable {
@@ -102,6 +102,15 @@ struct ResolvedConfig: Decodable {
     let appName: String?
     let appLogoUrl: String?
     let paywallEnabled: Bool
+    /// False when this build runs on an Apple-store platform and the developer
+    /// has NOT opted into showing the store in-app. `paywallEnabled` stays TRUE
+    /// — the gate exists, it just cannot be satisfied inside the app, because
+    /// App Review guideline 3.1.1 requires digital purchases to go through
+    /// Apple's own in-app purchase. The buyer purchases on the developer's
+    /// website and signs in here.
+    ///
+    /// Absent on older backends → defaults to `true`, i.e. previous behaviour.
+    let inAppStoreAllowed: Bool
     let waitlistMode: Bool
     let sdkRedirectUrl: String?
     let storeUrl: String?
@@ -124,6 +133,7 @@ struct ResolvedConfig: Decodable {
         case appName = "app_name"
         case appLogoUrl = "app_logo_url"
         case paywallEnabled = "paywall_enabled"
+        case inAppStoreAllowed = "in_app_store_allowed"
         case waitlistMode = "waitlist_mode"
         case sdkRedirectUrl = "sdk_redirect_url"
         case storeUrl = "store_url"
@@ -143,6 +153,9 @@ struct ResolvedConfig: Decodable {
         appName = try? c.decode(String.self, forKey: .appName)
         appLogoUrl = try? c.decode(String.self, forKey: .appLogoUrl)
         paywallEnabled = (try? c.decode(Bool.self, forKey: .paywallEnabled)) ?? false
+        // Absent on a backend that predates the Apple in-app-store constraint →
+        // true, i.e. behave exactly as before. Never fail decoding over it.
+        inAppStoreAllowed = (try? c.decode(Bool.self, forKey: .inAppStoreAllowed)) ?? true
         waitlistMode = (try? c.decode(Bool.self, forKey: .waitlistMode)) ?? false
         sdkRedirectUrl = try? c.decode(String.self, forKey: .sdkRedirectUrl)
         storeUrl = try? c.decode(String.self, forKey: .storeUrl)

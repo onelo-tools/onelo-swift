@@ -1697,13 +1697,17 @@ private struct InlineSignInForm: View {
             }
             .padding(.top, 4)
 
-            HStack(spacing: 4) {
-                Text("Don't have an account?").foregroundStyle(config.subtitleColor)
-                Button("Sign up") { vm.showSignUp() }
-                    .buttonStyle(.plain).foregroundStyle(config.accentColor)
+            // Hidden when a plan is required but cannot be bought in-app —
+            // see OneloAuthViewModel.canSignUp.
+            if vm.canSignUp {
+                HStack(spacing: 4) {
+                    Text("Don't have an account?").foregroundStyle(config.subtitleColor)
+                    Button("Sign up") { vm.showSignUp() }
+                        .buttonStyle(.plain).foregroundStyle(config.accentColor)
+                }
+                .font(.subheadline)
+                .padding(.top, 4)
             }
-            .font(.subheadline)
-            .padding(.top, 4)
         }
     }
 }
@@ -1832,14 +1836,18 @@ private struct SignInScreen: View {
                     .font(.subheadline)
                     .foregroundStyle(config.accentColor)
 
-                HStack(spacing: 4) {
-                    Text("Don't have an account?")
-                        .foregroundStyle(config.subtitleColor)
-                    Button("Sign up") { vm.showSignUp() }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(config.accentColor)
+                // Hidden when a plan is required but cannot be bought in-app —
+                // see OneloAuthViewModel.canSignUp.
+                if vm.canSignUp {
+                    HStack(spacing: 4) {
+                        Text("Don't have an account?")
+                            .foregroundStyle(config.subtitleColor)
+                        Button("Sign up") { vm.showSignUp() }
+                            .buttonStyle(.plain)
+                            .foregroundStyle(config.accentColor)
+                    }
+                    .font(.subheadline)
                 }
-                .font(.subheadline)
             }
             .padding(.top, config.itemSpacing + 4)
         }

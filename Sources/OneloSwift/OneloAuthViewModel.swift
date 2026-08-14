@@ -48,6 +48,22 @@ public final class OneloAuthViewModel: ObservableObject {
 
     public func showSignIn() { screen = .signIn; clearErrors() }
     public func showSignUp() { screen = .signUp; clearErrors() }
+
+    /// Whether the "Don't have an account? Sign up" affordance may be shown.
+    ///
+    /// False when a plan is required but this build cannot satisfy it in-app:
+    /// an Apple-store platform whose developer has NOT opted into showing the
+    /// store inside the app (App Review guideline 3.1.1). Signing up there
+    /// would create an account with no plan and walk straight past the very
+    /// gate the developer switched on, so the affordance is removed rather
+    /// than left to fail.
+    ///
+    /// Both flags come from /api/sdk/config; `inAppStoreAllowed` defaults to
+    /// true, so an older backend behaves exactly as before.
+    public var canSignUp: Bool {
+        guard let onelo = auth as? OneloAuth else { return true }
+        return !(onelo.paywallEnabled && !onelo.inAppStoreAllowed)
+    }
     public func showForgotPassword() { screen = .forgotPassword; clearErrors() }
 
     // MARK: - Actions
