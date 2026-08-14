@@ -60,10 +60,43 @@ final class _OneloHTTPClient: @unchecked Sendable {
         self.securityContext = securityContext
     }
 
+    // MARK: - Platform
+
+    /// Which Apple platform this build is running on.
+    ///
+    /// The backend cannot infer it: every Swift build sends the same
+    /// `onelo-swift/<version>` User-Agent, so iOS and macOS were
+    /// indistinguishable. They are not the same situation at all — App Review
+    /// guideline 3.1.1 governs iOS and the Mac App Store, while a macOS app
+    /// shipped as a DMG is outside Apple's reach entirely. `/api/sdk/config`
+    /// uses this to decide whether the "Require plan on sign-up" gate applies
+    /// (see applications.paywall_gate_on_apple, migration 20260814000001).
+    ///
+    /// Deliberately NOT a Mac-App-Store detection: a receipt check would tell
+    /// us more, but it is unreliable across sandbox/TestFlight/notarised builds
+    /// and getting it wrong silently changes a money flow. The developer's own
+    /// setting is the authority; this header only says which platform is asking.
+    static let osHeader: String = {
+        #if os(iOS)
+        return "ios"
+        #elseif os(tvOS)
+        return "tvos"
+        #elseif os(watchOS)
+        return "watchos"
+        #elseif os(visionOS)
+        return "visionos"
+        #elseif os(macOS)
+        return "macos"
+        #else
+        return "unknown"
+        #endif
+    }()
+
     // MARK: - Security headers
 
     private func applySecurityHeaders(to request: inout URLRequest) {
         request.setValue("onelo-swift/\(OneloSDK.sdkVersion)", forHTTPHeaderField: "User-Agent")
+        request.setValue(Self.osHeader, forHTTPHeaderField: "X-Onelo-OS")
         request.setValue(OneloInstanceId.current(), forHTTPHeaderField: "X-Onelo-Instance-Id")
         if !bundleId.isEmpty {
             request.setValue(bundleId, forHTTPHeaderField: "X-Bundle-Id")
