@@ -333,6 +333,17 @@ public final class Onelo: ObservableObject {
             print("[Onelo] openUpgrade: no signed-in user — upgrade flow requires a session")
             return
         }
+        // App Review guideline 3.1.1 — nothing to open on an Apple platform.
+        // A silent no-op with a log rather than a thrown error: this is wired
+        // to upsell badges via OneloUpgradeRouter, and a tap that throws would
+        // have to be handled in every host app. The backend 409 is the real
+        // enforcement; this makes the reason visible while building.
+        guard auth.authObject.inAppStoreAllowed else {
+            print("[Onelo] openUpgrade: the in-app store is closed on Apple platforms "
+                  + "(App Review 3.1.1). Buyers purchase on your website and sign in here. "
+                  + "To take compliance on yourself, switch Paywall → Store → Access Gate.")
+            return
+        }
         var query: [URLQueryItem] = [
             URLQueryItem(name: "key", value: httpClient.publishableKey),
             URLQueryItem(name: "plan", value: plan),

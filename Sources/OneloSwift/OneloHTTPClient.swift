@@ -139,7 +139,7 @@ final class _OneloHTTPClient: @unchecked Sendable {
     /// counter_stale is retryable (re-sign, not a key problem) and the 503 store
     /// error is transient, so neither resets the key.
     private func handleAttestReject(_ json: [String: Any]) {
-        guard let code = (json["detail"] as? [String: Any])?["error"] as? String else { return }
+        guard let code = oneloErrorCode(from: json) else { return }
         if ["attest_key_unknown", "attest_key_revoked", "invalid_assertion"].contains(code) {
             onAttestReject?(code)
         }
@@ -162,6 +162,12 @@ final class _OneloHTTPClient: @unchecked Sendable {
         guard (200..<300).contains(http.statusCode) else {
             let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
             handleAttestReject(json)
+            // Typed rather than collapsed into serverError: every caller that
+            // can open a store (openUpgrade, the upgrade router) goes through
+            // here, so mapping it once means none of them has to parse a body.
+            if oneloErrorCode(from: json) == "in_app_store_not_allowed" {
+                throw OneloError.inAppStoreNotAllowed
+            }
             throw OneloError.serverError(errorDetail(json, statusCode: http.statusCode))
         }
         if data.isEmpty { return [:] }
@@ -215,6 +221,12 @@ final class _OneloHTTPClient: @unchecked Sendable {
         guard (200..<300).contains(http.statusCode) else {
             let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
             handleAttestReject(json)
+            // Typed rather than collapsed into serverError: every caller that
+            // can open a store (openUpgrade, the upgrade router) goes through
+            // here, so mapping it once means none of them has to parse a body.
+            if oneloErrorCode(from: json) == "in_app_store_not_allowed" {
+                throw OneloError.inAppStoreNotAllowed
+            }
             throw OneloError.serverError(errorDetail(json, statusCode: http.statusCode))
         }
         if data.isEmpty { return [:] }

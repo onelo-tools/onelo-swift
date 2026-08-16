@@ -1598,6 +1598,35 @@ private struct EmbeddedWebAuthView: UIViewRepresentable {
 
 // MARK: - Inline auth view (paid plan) — matches hosted page design
 
+/// ⚠️ DEAD CODE — nothing constructs this view. Verified 2026-08-14.
+///
+/// `InlineAuthView` and everything it renders (`InlineSignInForm`,
+/// `InlineSignUpForm`, `InlineForgotPasswordForm`, and the orphaned
+/// `SignInScreen` further down) are a native SwiftUI sign-in screen that is
+/// never reached: `OneloAuthView` loads the Onelo-hosted page in a `WKWebView`
+/// on every path. A repo-wide search finds exactly one mention of
+/// `InlineAuthView` — this declaration.
+///
+/// It is the remnant of a planned "custom inline login" that was not shipped
+/// and, per the product decision of 2026-08-14, will not be. What "Custom UI"
+/// actually means is in CLAUDE.md: on paid plans the DEVELOPER builds their own
+/// screen and calls `signIn()` / `signUp()` directly — Onelo renders nothing.
+/// A second Onelo-rendered form was never the intent.
+///
+/// ── Why this is flagged rather than deleted ────────────────────────────
+/// It reads as live code. Two people (including an assistant tracing a bug on
+/// 2026-08-14) concluded from `grep Button("Sign up")` that THIS was the screen
+/// users see, and changed the wrong file twice on that basis. The
+/// `vm.canSignUp` guards inside it are inert for the same reason — they were
+/// added in 3.76.0 under that mistaken reading.
+///
+/// If you are here to change how sign-in looks: the real surface is
+/// `frontend/app/auth/hosted/` (page + HostedAuthForm). Changing anything below
+/// has no visible effect.
+///
+/// Kept rather than removed because deleting a whole screen from a published
+/// SDK is a bigger, separate decision — but it must not grow, and nothing new
+/// should be wired to it.
 private struct InlineAuthView: View {
     @ObservedObject var vm: OneloAuthViewModel
     let config: OneloAuthConfig

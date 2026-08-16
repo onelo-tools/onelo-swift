@@ -1,7 +1,7 @@
 import Foundation
 
 public enum OneloSDK {
-    public static let sdkVersion = "3.76.0"
+    public static let sdkVersion = "3.77.0"
 }
 
 public enum UserRole: String, Codable, Sendable {
@@ -218,6 +218,16 @@ public enum OneloError: LocalizedError, Sendable {
     /// this case so the buyer never sees an empty store. Host apps
     /// should surface this as a "store not configured" message.
     case storeNotConfigured
+    /// The app runs on an Apple platform and the developer has not taken on
+    /// App Store compliance themselves, so the in-app store is closed
+    /// (App Review guideline 3.1.1 — a purchase of content used inside an
+    /// iOS or Mac App Store app has to go through Apple's own in-app
+    /// purchase, and Onelo sells on the developer's Stripe).
+    ///
+    /// Buyers purchase on the developer's website and sign in here. The switch
+    /// is Paywall → Store → Access Gate in the Onelo dashboard, on the app
+    /// itself (it is per platform, never on a parent).
+    case inAppStoreNotAllowed
 
     public var errorDescription: String? {
         switch self {
@@ -231,8 +241,23 @@ public enum OneloError: LocalizedError, Sendable {
         case .requiresHostedFlow: return "This app requires the hosted sign-in flow. Use presentHostedSignIn()."
         case .timeout(let msg): return "Timed out: \(msg)"
         case .storeNotConfigured: return "The store hasn't been configured for this app yet."
+        case .inAppStoreNotAllowed:
+            return "Plans can't be purchased inside this app. Buyers purchase on the web and sign in here."
         }
     }
+}
+
+/// Pull Onelo's error code out of a FastAPI error body.
+///
+/// The backend raises `HTTPException(detail={"error": …, "message": …})`, so the
+/// code sits INSIDE `detail` — while a few older endpoints send `detail` as a
+/// bare string. Both shapes have to work, and a body with neither must yield
+/// nil rather than a guess, so callers keep their generic handling.
+func oneloErrorCode(from json: [String: Any]) -> String? {
+    if let code = json["error"] as? String { return code }
+    if let code = (json["detail"] as? [String: Any])?["error"] as? String { return code }
+    if let code = json["detail"] as? String { return code }
+    return nil
 }
 
 /// Why the resolver assigned this status.

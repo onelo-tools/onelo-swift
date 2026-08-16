@@ -681,6 +681,19 @@ public final class OneloAuth: ObservableObject {
     /// The store page handles plan selection + payment + registration in one flow.
     /// After completion, it redirects to callbackScheme://callback?code=... — same as auth.
     public func initiateStoreFlow(lang: String = "en") async throws -> URL {
+        // Fail here rather than at the server: the developer calling this from
+        // their own UI on iOS gets the answer while building, not from an App
+        // Review rejection weeks later. The backend 409 is still the real
+        // enforcement — this only saves a round trip and reads better.
+        guard inAppStoreAllowed else {
+            _authLog.warning("""
+                initiateStoreFlow: the in-app store is closed on Apple platforms \
+                (App Review 3.1.1). Buyers purchase on your website and sign in \
+                here. To take compliance on yourself, switch Paywall → Store → \
+                Access Gate in the Onelo dashboard.
+                """)
+            throw OneloError.inAppStoreNotAllowed
+        }
         await _awaitAttestReady()  // #25: /store-initiate is attestation-gated too (sdk_paywall.py)
         let scheme = config.callbackScheme
         var components = URLComponents(url: config.apiUrl.appendingPathComponent("/api/sdk/paywall/store-initiate"), resolvingAgainstBaseURL: false)!
@@ -709,7 +722,12 @@ public final class OneloAuth: ObservableObject {
         // visible paywall_store_options — we must NOT open a WebView.
         if let http, http.statusCode != 200 {
             let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
-            let code = (json["error"] as? String) ?? (json["detail"] as? String) ?? "store_initiate_failed"
+            // Shared unwrapper: this endpoint's codes arrive nested inside
+            // `detail`, which the flat lookup here used to miss entirely.
+            let code = oneloErrorCode(from: json) ?? "store_initiate_failed"
+            if code == "in_app_store_not_allowed" {
+                throw OneloError.inAppStoreNotAllowed
+            }
             if code == "store_not_configured" {
                 throw OneloError.storeNotConfigured
             }
