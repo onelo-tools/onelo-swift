@@ -1,133 +1,119 @@
-# onelo-swift
+# OneloSwift
 
-Swift SDK for [Onelo](https://onelo.tools) — features, paywall, forms, waitlist, and authentication.
+The Onelo SDK for iOS and macOS, written in Swift.
 
-Supports iOS 17+ and macOS 14+.
+Part of [Onelo](https://onelo.tools): hosted sign-in, a paywall on **your own Stripe** account, plan-gated feature flags, uptime monitoring, in-app feedback, a public roadmap and a waitlist — one SDK, wired together.
 
-## Installation
+## Install
 
-Add via Xcode: **File → Add Package Dependencies** → paste:
+In Xcode: **File → Add Package Dependencies…**, then paste:
 
 ```
 https://github.com/onelo-tools/onelo-swift
 ```
 
-Or in `Package.swift`:
-```swift
-.package(url: "https://github.com/onelo-tools/onelo-swift", from: "2.2.0")
-```
-
-## Quick Start
+## Quick start
 
 ```swift
+import SwiftUI
 import OneloSwift
 
-let onelo = Onelo(publishableKey: "pk_live_...")
+@main
+struct MyApp: App {
+    @StateObject var auth = OneloAuth(config: .init(
+        publishableKey: "onelo_pk_live_YOUR_KEY",
+        apiUrl: URL(string: "https://api.onelo.tools")!,
+        callbackScheme: "myapp"
+    ))
 
-// Set user context after login
-await onelo.identify(currentUser.id, plan: "pro")
-
-// Features
-if onelo.features.isEnabled("export-button") {
-    showExportButton()
+    var body: some Scene {
+        WindowGroup {
+            OneloAuthView(auth: auth) {
+                ContentView().environmentObject(auth)
+            }
+            .onOpenURL { url in
+                Task { try? await auth.handleAuthCallback(url) }
+            }
+        }
+    }
 }
-
-// Forms
-let result = await onelo.forms.submit("feedback", data: ["message": "Great app!"])
-
-// Waitlist
-let joined = await onelo.waitlist.join("beta", email: "user@example.com")
 ```
+
+`OneloAuthView` must be your **root view** — it presents sign-in when needed and renders your content once the user is in.
+
+Read the signed-in user anywhere below it:
+
+```swift
+@EnvironmentObject var auth: OneloAuth
+
+Text(auth.currentSession?.user.email ?? "")
+```
+
+If you present your own windows and need to react to entitlement changes, observe `auth.$isAllowedIn`.
+
+## Sign-in is always hosted
+
+`OneloAuthView` always loads the centrally-hosted sign-in page in a `WKWebView` — on both Free and Paid plans. Social providers (Google, GitHub, Apple, on paid plans) are handed off to `ASWebAuthenticationSession` automatically.
+
+**Branding is configured in the Onelo dashboard** — colours, logo and copy are applied to the hosted page there, not in Swift code.
 
 ## Modules
 
-| Module | Access | Description |
-|--------|--------|-------------|
-| `onelo.features` | `OneloFeatures` | Feature flags — `isEnabled()`, `status()` |
-| `onelo.paywall` | `OneloPaywall` | Subscription management — `cancelSubscription()` |
-| `onelo.forms` | `OneloForms` | Form submission — `submit()` |
-| `onelo.waitlist` | `OneloWaitlist` | Waitlist signup — `join()` |
-| `OneloAuth` | (standalone) | PKCE authentication flow |
-
-## Authentication
-
-`OneloAuth` handles the full PKCE authentication flow and is available separately:
+Create the full client when you need the non-auth modules:
 
 ```swift
-import OneloSwift
-
-let auth = OneloAuth(config: OneloConfig(...))
-await auth.signIn()
+let onelo = Onelo(
+    publishableKey: "onelo_pk_live_YOUR_KEY",
+    baseURL: URL(string: "https://api.onelo.tools")!
+)
 ```
 
-## Auth UI
+| Accessor | What it does | Key methods |
+|---|---|---|
+| `onelo.auth` | Hosted sign-in and sessions | `currentSession`, `awaitReady()`, `handleAuthCallback()`, `show(from:)` |
+| `onelo.features` | Plan-gated feature flags | `declare()`, `feature()`, `ready()`, `refresh()` |
+| `onelo.monitor` | Error and event reporting | `event()`, `track()`, `capture()`, `breadcrumb()`, `setUserId()` |
+| `onelo.paywall` | Subscription cancellation | `cancelSubscription()` |
+| `onelo.feedback` | In-app bug reports and feature requests | `open()`, `openAsWindow()` |
+| `onelo.forms` | Form submissions | `submit()` |
+| `onelo.waitlist` | Pre-launch signups | `join()` |
 
-Drop in a ready-made login screen:
+Two surfaces are SwiftUI views rather than accessors:
+
+- **`OneloCustomerPortalView(auth:onDismiss:)`** — cancel, change plan, refunds and invoices.
+- **Consent** — the versioned terms / privacy gate is presented automatically by `OneloAuthView`. To drive it yourself, use `auth.requiredConsents()`.
+
+### Feature status
+
+A flag is more than on/off — `FeatureStatus` carries the state your UI should render: `.enabled`, `.disabled`, `.greyed`, `.hidden`, `.upsell`, `.new`, `.beta`, `.coming_soon`.
 
 ```swift
-import OneloSwift
-import SwiftUI
-
-// SwiftUI embed
-OneloAuthView(
-    auth: onelo.auth.authObject,
-    config: OneloAuthConfig(
-        accentColor: .purple,
-        appName: "My App",
-        appLogo: Image("AppLogo")
-    )
-) { session in
-    print("Signed in:", session.user.email ?? "")
-}
-
-// UIKit / AppKit (programmatic)
-onelo.auth.show(from: self) { session in
-    print("Signed in:", session.user.email ?? "")
+switch onelo.features.feature("export-button").status {
+case .enabled:      showExportButton()
+case .upsell:       showUpgradePrompt()
+case .coming_soon:  showComingSoonBadge()
+default:            break
 }
 ```
 
-### Customization & Plan Gating
+## Platform notes
 
-`OneloAuthConfig` exposes full visual control:
+- **Tokens are stored in the Keychain** — never `UserDefaults`.
+- **App Attest** proves requests come from a genuine build of your app. It runs automatically when your Onelo app is configured to require it, and is skipped on the Simulator.
+- **External links open in the system browser**, not inside the auth WebView.
+- **On macOS**, the auth window has a minimum width of 440pt.
 
-| Property | Type | Default | Description |
-|----------|------|---------|-------------|
-| `accentColor` | `Color` | Onelo indigo | Buttons, links, focus rings |
-| `backgroundColor` | `Color` | System bg | Main sheet background |
-| `surfaceColor` | `Color` | System secondary bg | Input field background |
-| `textColor` | `Color` | `.primary` | Primary text |
-| `subtitleColor` | `Color` | `.secondary` | Subtitles, placeholders |
-| `buttonForegroundColor` | `Color` | `.white` | Text/icon color inside buttons |
-| `inputBorderColor` | `Color` | `primary.opacity(0.1)` | Input field border color |
-| `inputBorderWidth` | `CGFloat` | `1` | Input field border width (0 to hide) |
-| `appLogo` | `Image?` | `nil` | Logo shown at top |
-| `appName` | `String` | `""` | App name shown below logo |
-| `cornerRadius` | `CGFloat` | `10` | Buttons and input fields |
-| `buttonHeight` | `CGFloat` | `48` | Primary action button height |
-| `inputHeight` | `CGFloat` | `48` | Input field height |
+## Requirements
 
-**Plan gating:** On the free plan, `OneloAuthConfig` is ignored — the auth UI always renders with Onelo's default brand (indigo accent, system colors). On paid plans, developers get full control.
+- **iOS 17+**, **macOS 14+**
+- Swift Package Manager
 
-```swift
-// Free plan — config is silently ignored, Onelo brand is used
-OneloAuthView(auth: auth, config: OneloAuthConfig(accentColor: .purple)) { ... }
+## Links
 
-// Paid plan — full customization honoured
-OneloAuthView(auth: auth, config: OneloAuthConfig(
-    accentColor: .purple,
-    buttonForegroundColor: .white,
-    inputBorderColor: Color.purple.opacity(0.3),
-    inputBorderWidth: 1.5
-)) { ... }
-```
+- **Docs:** [onelo.tools/docs](https://onelo.tools/docs)
+- **Dashboard:** [onelo.tools](https://onelo.tools) — your app's snippet comes pre-filled with your keys
+- **Issues:** please report them on this repository
 
-All screens include hardcoded "Powered by Onelo" branding.
+## License
 
-## Feature Status Values
-
-| Status | Meaning |
-|--------|---------|
-| `.enabled` | Feature is on |
-| `.greyed` | Visible but disabled |
-| `.hidden` | Not shown |
-| `.upsell` | Show upgrade prompt |
+MIT

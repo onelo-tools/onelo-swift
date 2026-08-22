@@ -40,6 +40,38 @@ public final class OneloAuthModule {
         try await authObject.awaitReady(timeout: timeout)
     }
 
+    /// Complete a hosted sign-in from a deep link the OS handed your app.
+    ///
+    /// Needed for any flow that finishes OUTSIDE the SDK's WebView — a magic-link
+    /// email is why it exists: the link opens in the browser, the hosted page
+    /// hands the one-time code back over your registered scheme, and the app may
+    /// not even have been running.
+    ///
+    /// ```swift
+    /// // SwiftUI
+    /// .onOpenURL { url in Task { try? await onelo.auth.handleAuthCallback(url) } }
+    ///
+    /// // AppKit delegate
+    /// func application(_ application: NSApplication, open urls: [URL]) {
+    ///     for url in urls {
+    ///         Task { @MainActor in try? await onelo?.auth.handleAuthCallback(url) }
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// Returns the session on success and `nil` for URLs that are not ours, so
+    /// every incoming URL can be passed through without pre-filtering.
+    ///
+    /// Proxied here deliberately: `Onelo` exposes auth as this module, so a method
+    /// that lives only on `OneloAuth` is unreachable for anyone using the facade —
+    /// which is every developer following the dashboard snippet. Adding it to
+    /// OneloAuth alone (2026-08-17) produced exactly that: a documented call that
+    /// did not compile.
+    @discardableResult
+    public func handleAuthCallback(_ url: URL) async throws -> OneloSession? {
+        try await authObject.handleAuthCallback(url)
+    }
+
     // MARK: - Programmatic presentation
 
     #if os(iOS)

@@ -24,6 +24,10 @@ private let _authLog = Logger(subsystem: "com.onelo.sdk", category: "auth")
 public final class OneloAuth: ObservableObject {
     @Published public private(set) var currentSession: OneloSession? {
         didSet {
+            // "Allowed in" depends on the session AND on the entitlement carried
+            // inside it, so it has to be recomputed on every republish — not only
+            // when the session appears or disappears.
+            _recomputeAllowedIn()
             rescheduleRefresh()
             // Heartbeat + SSE session listener follow the same lifecycle as
             // `currentSession`. Previously these lived inside `saveSession()`,
@@ -40,7 +44,56 @@ public final class OneloAuth: ObservableObject {
         }
     }
     @Published public private(set) var isLoading: Bool = false
-    @Published public private(set) var isReady: Bool = false
+    @Published public private(set) var isReady: Bool = false { didSet { _recomputeAllowedIn() } }
+
+    /// **Should this user see your app?** — the one question a host app actually
+    /// needs, published so you can drive your own windows from it.
+    ///
+    /// `true` only when the session is restored (`isReady`), a session exists, and
+    /// either the app has no paywall or the user holds active access.
+    ///
+    /// This exists because the two signals next to it answer DIFFERENT questions
+    /// and were being used for this one:
+    ///   • `currentSession != nil` means SIGNED IN. A user with no plan on a
+    ///     paywalled app is signed in and must still NOT reach your app —
+    ///     `OneloAuthView` sends them to the store or to "no active plan".
+    ///     Turingo shipped that mistake on 2026-08-17 and let plan-less users in.
+    ///   • `hasActiveAccess` means HAS A PAID GRANT. On an app with no paywall it
+    ///     is false for everyone, so gating on it locks out every legitimate user.
+    ///
+    /// `isReady` is part of the condition on purpose: `paywallEnabled` arrives with
+    /// the remote config, and before it lands it is `false` — so a check written
+    /// without it says "allowed in" to everyone for the first moments after launch.
+    ///
+    /// ```swift
+    /// auth.$isAllowedIn.sink { allowed in if allowed { self.showApp() } }
+    /// ```
+    @Published public private(set) var isAllowedIn: Bool = false
+
+    /// The SERVER'S answer when it gave one; the legacy derivation only when it
+    /// did not.
+    ///
+    /// `!paywallEnabled || hasActiveAccess` lived here, in the JS SDK and in
+    /// Flutter — three copies of one rule, and each was found wrong on a
+    /// different day (the JS one answered "allowed" while its config was still
+    /// loading, letting a plan-less user into a paid app). Onelo computes it now
+    /// in `app/lib/access_gate.user_access_payload` and ships it with the user.
+    ///
+    /// `isReady` and the session check stay local: they are facts about THIS
+    /// client, not policy. A stored session says who someone is; only the server
+    /// says whether they may be here.
+    private func _recomputeAllowedIn() {
+        guard isReady, let session = currentSession else {
+            if isAllowedIn { isAllowedIn = false }
+            return
+        }
+        // Older backend: no `allowed_in` in the payload. Falling back keeps an
+        // SDK released ahead of the server from locking every user out. It is a
+        // COMPATIBILITY path, not a second source of truth, and goes away once
+        // the field is everywhere.
+        let next = session.user.allowedIn ?? (!paywallEnabled || hasActiveAccess)
+        if next != isAllowedIn { isAllowedIn = next }
+    }
     /// True while an auto-login restore of a stored session is in flight (Keychain
     /// read → backend verify/refresh). Distinguishes "restoring an existing
     /// session" from "no session, show sign-in" so the UI can paint a branded
@@ -133,8 +186,20 @@ public final class OneloAuth: ObservableObject {
     /// in-app WebView OR an external-browser deep-link). `OneloAuthView` reads it
     /// to avoid flashing a fresh sign-in WebView while a login is completing.
     @Published public private(set) var isExchangingCode: Bool = false
+
+    /// A hosted surface the app must show because the Access Gate refused a
+    /// sign-in that finished OUTSIDE the WebView — today, a magic link.
+    ///
+    /// `OneloAuthView` observes this and loads it. Nothing here interprets the
+    /// URL: which screen it is, and what it says, is settled server-side.
+    /// Cleared by `clearPendingGate()` once presented, so a later re-resolve
+    /// does not reopen a screen the user already dismissed.
+    @Published public private(set) var pendingGateUrl: URL? = nil
+
+    /// Called by the view once it has presented `pendingGateUrl`.
+    public func clearPendingGate() { pendingGateUrl = nil }
     /// True if SDK gate is active — `OneloAuthView` opens the store instead of sign-in.
-    @Published public private(set) var paywallEnabled: Bool = false
+    @Published public private(set) var paywallEnabled: Bool = false { didSet { _recomputeAllowedIn() } }
     /// False on an Apple-store build whose app has not opted into showing the
     /// store in-app (App Review guideline 3.1.1). `paywallEnabled` stays true —
     /// the plan requirement is real, it simply cannot be satisfied here, so the
@@ -168,6 +233,11 @@ public final class OneloAuth: ObservableObject {
     /// know which scheme to watch the embedded WKWebView for.
     public var callbackScheme: String { config.callbackScheme }
     private var pkceVerifier: String?
+
+    /// Verifier bound to the CURRENT hosted flow (`/auth/initiate`, `/flow/init`).
+    /// Mirrored into the Keychain so a deep link that relaunches the app can still
+    /// complete the exchange. See `KeychainKeys.flowVerifier`.
+    private var flowVerifier: String?
     private var _heartbeatTask: Task<Void, Never>?
     private var _refreshTask: Task<Void, Never>?
     /// Monotonic counter bumped at the start of every `signOut()`. Async writers
@@ -217,6 +287,26 @@ public final class OneloAuth: ObservableObject {
         static let supabaseAnonKey = "supabase_anon_key"
         static let oauthProviders = "oauth_providers"
         static let checkoutBgColor = "checkout_bg_color"
+        /// PKCE verifier for a hosted flow that may OUTLIVE this process.
+        ///
+        /// Deliberately a separate slot from the in-memory `pkceVerifier`, which
+        /// `resolveConfig()` regenerates on every launch. A magic link can relaunch
+        /// a killed app minutes later; if the exchange used the rotating verifier
+        /// it would never match the challenge bound when the link was requested,
+        /// and every cold-start sign-in would fail. Two slots, no clobbering.
+        static let flowVerifier = "flow_code_verifier"
+        /// Origin (`https://host`) where Onelo hosts this app's surfaces.
+        ///
+        /// Persisted for the same reason as `flowVerifier` directly above: a
+        /// magic link can relaunch a process that was killed, and the deep link
+        /// arrives before anything has spoken to the backend. Without a stored
+        /// value there is nothing to check an incoming gate URL against, and the
+        /// only safe answer would be to refuse it.
+        static let hostedOrigin = "hosted_origin"
+        /// When `flowVerifier` was issued, as epoch seconds. Persisted beside it
+        /// so a relaunch can still tell whether the outstanding verifier is
+        /// inside its reuse window — see `_beginFlowPKCE`.
+        static let flowVerifierIssuedAt = "flow_code_verifier_issued_at"
     }
 
     public init(config: OneloConfig) {
@@ -486,10 +576,17 @@ public final class OneloAuth: ObservableObject {
             let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
         else { return session.user.entitlement }
         let ent = OneloEntitlement(rawValue: (json["entitlement"] as? String) ?? "") ?? .none
-        if ent != session.user.entitlement {
+        // Refresh the SERVER'S ANSWER too, not just the ingredient. This call is
+        // what runs right after a purchase, and `isAllowedIn` now reads
+        // `allowedIn` — so updating only the entitlement would leave the stored
+        // answer saying "no" for someone who had just paid, locked out by the
+        // very refresh meant to let them in. Absent in the response keeps the
+        // previous value rather than erasing it (older backend).
+        let allowed = (json["allowed_in"] as? Bool) ?? session.user.allowedIn
+        if ent != session.user.entitlement || allowed != session.user.allowedIn {
             let updatedUser = OneloUser(
                 id: session.user.id, email: session.user.email, role: session.user.role,
-                tenantId: session.user.tenantId, entitlement: ent
+                tenantId: session.user.tenantId, entitlement: ent, allowedIn: allowed
             )
             let updated = OneloSession(
                 accessToken: session.accessToken, refreshToken: session.refreshToken,
@@ -544,15 +641,56 @@ public final class OneloAuth: ObservableObject {
         }
     }
 
+    /// Wait until the SDK has finished `initialize()`, or throw
+    /// `OneloError.timeout` after `timeout` seconds.
+    ///
+    /// ── The timeout used to be decorative (fixed 2026-08-17) ────────────────
+    /// The previous version checked the deadline INSIDE `for await ready in
+    /// $isReady.values`, so the check only ran when the publisher emitted. A
+    /// `@Published` publisher emits its current value on subscribe and then only
+    /// on change — so when `isReady` never flips, the loop saw `false` once (0 s
+    /// elapsed, deadline not passed) and then awaited an emission that never
+    /// came. **It waited forever.** The 5 s only ever fired if something else
+    /// was already republishing.
+    ///
+    /// That was not academic. It hung:
+    ///   - `handleAuthCallback(_:)`, which awaits this before exchanging a code —
+    ///     i.e. the magic-link / deep-link return, precisely the cold-start path
+    ///     where `initialize()` may not have settled or may have failed;
+    ///   - `OneloAuthModule.awaitReady(timeout:)`, the public facade the Monitor
+    ///     snippet tells developers to call at startup ("default 5s timeout").
+    ///     A tenant whose network was down got a permanently hung launch.
+    /// It also hung `HandleAuthCallbackTests`, which builds an `OneloAuth` with
+    /// `skipInitialize: true` — a process was found still running after 5 h 15 m,
+    /// and the same hang on `macos-latest` ran to the 6-hour job limit and burned
+    /// the month's Actions allowance. See docs/ci-cost-controls.md.
+    ///
+    /// The deadline now runs as its own task, so it fires whether or not the
+    /// publisher ever emits again. Returning normally still means "ready".
     public func awaitReady(timeout: TimeInterval = 5) async throws {
         if isReady { return }
-        let deadlineNs = UInt64(timeout * 1_000_000_000)
-        let started = DispatchTime.now()
-        for await ready in $isReady.values {
-            if ready { return }
-            if DispatchTime.now().uptimeNanoseconds - started.uptimeNanoseconds > deadlineNs {
-                throw OneloError.timeout("awaitReady exceeded \(timeout)s")
+
+        let becameReady = await withTaskGroup(of: Bool.self) { group -> Bool in
+            // Waiter: completes true the moment `isReady` turns true. Returns
+            // false if the publisher finishes without that ever happening.
+            group.addTask { @MainActor [weak self] in
+                guard let self else { return false }
+                for await ready in self.$isReady.values where ready { return true }
+                return false
             }
+            // Deadline: independent of the publisher. This is the whole fix.
+            group.addTask {
+                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                return false
+            }
+            // First finisher wins; cancel the loser so neither task outlives us.
+            let first = await group.next() ?? false
+            group.cancelAll()
+            return first
+        }
+
+        if !becameReady {
+            throw OneloError.timeout("awaitReady exceeded \(timeout)s")
         }
     }
 
@@ -575,6 +713,11 @@ public final class OneloAuth: ObservableObject {
         components.queryItems = [
             URLQueryItem(name: "key", value: config.publishableKey),
             URLQueryItem(name: "callback_scheme", value: scheme),
+            // Binds the resulting code to THIS client. Optional server-side, so an
+            // older backend simply ignores it. Also what makes a magic link
+            // requested from this session same-device only: the hosted page reads
+            // this challenge off the token row and passes it to /magic-link.
+            URLQueryItem(name: "code_challenge", value: _beginFlowPKCE()),
         ]
         var initRequest = URLRequest(url: components.url!)
         addStandardHeaders(&initRequest)
@@ -667,7 +810,9 @@ public final class OneloAuth: ObservableObject {
                 email: userEmail,
                 role: .member,
                 tenantId: nil,
-                entitlement: OneloEntitlement(rawValue: (userData["entitlement"] as? String) ?? "") ?? .none
+                entitlement: OneloEntitlement(rawValue: (userData["entitlement"] as? String) ?? "") ?? .none,
+                // The gate answer arrives with the session it belongs to.
+                allowedIn: userData["allowed_in"] as? Bool
             )
         let session = OneloSession(accessToken: accessToken, refreshToken: refreshToken, expiresAt: expiresAt, user: user)
         try saveSession(session)
@@ -755,6 +900,90 @@ public final class OneloAuth: ObservableObject {
         return try await _initiateAuthFlow()
     }
 
+
+    /// How long an issued flow verifier stays valid for REUSE.
+    ///
+    /// Matches the magic-link token TTL (`/magic-link`, 15 minutes): that is the
+    /// longest a challenge minted here can still be waiting to come back.
+    private static let flowVerifierLifetime: TimeInterval = 15 * 60
+
+    /// The PKCE challenge for the flow being started, reusing the outstanding
+    /// verifier when there still is one.
+    ///
+    /// ── Why this does not always mint a fresh pair (fixed 2026-08-19) ────────
+    /// It used to, unconditionally — and every call OVERWROTE the persisted
+    /// verifier. `OneloAuthView` calls `resolveFlow()` from 24 places (appear,
+    /// ready, session change, retry, a settled exchange…), so a second flow
+    /// resolving for any reason destroyed the verifier an OUTSTANDING magic link
+    /// was bound to.
+    ///
+    /// That is not a rare race, it is the normal path: the link is requested,
+    /// the user leaves for their inbox, the app re-resolves or is relaunched, and
+    /// by the time they click the link the only verifier left cannot match the
+    /// challenge. `/hosted-callback` correctly refuses, the app swallows it and
+    /// waits on "Check your inbox" forever — exactly what Adrian hit on Turingo,
+    /// with the deep link arriving and nothing happening after it.
+    ///
+    /// One verifier per 15-minute window is the fix. Rotating per flow was never
+    /// a requirement: PKCE binds a code to THIS client, and every one of these
+    /// flows is the same client on the same device. What it must not do is
+    /// invalidate a credential that is still outstanding.
+    ///
+    /// The web SDK avoided this by giving magic link its OWN slot
+    /// (`TOKEN_KEYS.MAGIC_LINK_VERIFIER`), because there `sendMagicLink()` is an
+    /// SDK call. On native the hosted page requests the link, so the SDK never
+    /// learns it happened and cannot set a slot aside — hence a window here.
+    /// Internal, not private, so the reuse window can be tested directly — the
+    /// defect it fixes is invisible from outside (a swallowed 401 much later).
+    func _beginFlowPKCE() -> String {
+        // Reuse while the outstanding one can still be needed. Reading the issue
+        // time from the Keychain matters: a relaunch has nothing in memory.
+        if let existing = _pendingFlowVerifier(), _flowVerifierIsFresh() {
+            flowVerifier = existing
+            return generateCodeChallenge(from: existing)
+        }
+
+        let verifier = generateCodeVerifier()
+        flowVerifier = verifier
+        try? keychain.set(verifier, forKey: KeychainKeys.flowVerifier)
+        try? keychain.set(String(Date().timeIntervalSince1970), forKey: KeychainKeys.flowVerifierIssuedAt)
+        return generateCodeChallenge(from: verifier)
+    }
+
+    /// Is the stored verifier still inside its reuse window?
+    ///
+    /// Fails CLOSED — an unreadable or unparsable timestamp answers false, so a
+    /// fresh pair is minted. Getting this wrong in that direction costs one
+    /// sign-in attempt; the other direction pins a verifier forever.
+    private func _flowVerifierIsFresh() -> Bool {
+        guard
+            let raw = try? keychain.get(forKey: KeychainKeys.flowVerifierIssuedAt),
+            let seconds = TimeInterval(raw ?? "")
+        else { return false }
+        let age = Date().timeIntervalSince1970 - seconds
+        // A negative age means the clock moved backwards; treat it as stale
+        // rather than trusting it.
+        return age >= 0 && age < Self.flowVerifierLifetime
+    }
+
+    /// The verifier for the flow being completed: in memory when the app stayed
+    /// alive, from the Keychain when a deep link relaunched it.
+    private func _pendingFlowVerifier() -> String? {
+        if let v = flowVerifier { return v }
+        return try? keychain.get(forKey: KeychainKeys.flowVerifier)
+    }
+
+    /// Drop the pending verifier once it can no longer be needed. Called after a
+    /// successful exchange and on sign-out — a stale one would be offered to the
+    /// next flow, whose challenge it cannot match.
+    func _clearFlowPKCE() {
+        flowVerifier = nil
+        try? keychain.delete(forKey: KeychainKeys.flowVerifier)
+        // The stamp goes with it. Left behind, it would make the NEXT verifier
+        // look older than it is and cut its window short.
+        try? keychain.delete(forKey: KeychainKeys.flowVerifierIssuedAt)
+    }
+
     /// Calls /api/sdk/auth/initiate and returns the raw auth URL (no routing).
     internal func _initiateAuthFlow() async throws -> URL {
         await _awaitAttestReady()  // #25: wait for the attest token before the gated initiate call
@@ -763,6 +992,10 @@ public final class OneloAuth: ObservableObject {
         components.queryItems = [
             URLQueryItem(name: "key", value: config.publishableKey),
             URLQueryItem(name: "callback_scheme", value: scheme),
+            // Every /auth/initiate caller must bind the challenge, not just the
+            // one in `signInWithHostedFlow`: a code minted by an unbound call
+            // could be exchanged by anyone holding it.
+            URLQueryItem(name: "code_challenge", value: _beginFlowPKCE()),
         ]
         var request = URLRequest(url: components.url!)
         addStandardHeaders(&request)
@@ -800,6 +1033,9 @@ public final class OneloAuth: ObservableObject {
             URLQueryItem(name: "key", value: config.publishableKey),
             URLQueryItem(name: "callback_scheme", value: config.callbackScheme),
             URLQueryItem(name: "lang", value: lang),
+            // Same binding as /auth/initiate — this endpoint mints the sign-in
+            // token on the `present sign_in` branch, so it needs the challenge too.
+            URLQueryItem(name: "code_challenge", value: _beginFlowPKCE()),
         ]
         var request = URLRequest(url: components.url!)
         addStandardHeaders(&request)
@@ -829,6 +1065,11 @@ public final class OneloAuth: ObservableObject {
             let logoStr = json["app_logo_url"] as? String
             if let name { hostedAppName = name }
             if let logoStr { hostedAppLogoUrl = URL(string: logoStr) }
+            // Remember WHERE Onelo hosts its surfaces for this app. The backend
+            // just told us, so it is never assembled or assumed here — and it is
+            // the only thing `handleAuthCallback` can check a deep-linked gate
+            // URL against before loading it in a WebView.
+            _rememberHostedOrigin(url)
             return .present(
                 surface: (json["surface"] as? String) ?? "",
                 url: url,
@@ -1095,7 +1336,11 @@ public final class OneloAuth: ObservableObject {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         var body: [String: String] = ["code": code, "publishableKey": config.publishableKey]
-        if let verifier = pkceVerifier { body["code_verifier"] = verifier }
+        // The FLOW verifier first: it is the one whose challenge was bound to the
+        // token this code hangs off, and the only one that survives a relaunch.
+        // `pkceVerifier` is the rotating /api/sdk/config pair and is kept as a
+        // fallback purely for tokens minted before the flow binding existed.
+        if let verifier = _pendingFlowVerifier() ?? pkceVerifier { body["code_verifier"] = verifier }
         let bodyData = try JSONSerialization.data(withJSONObject: body)
         request.httpBody = bodyData
         addStandardHeaders(&request)
@@ -1130,7 +1375,122 @@ public final class OneloAuth: ObservableObject {
         let session = OneloSession(accessToken: accessToken, refreshToken: refreshToken, expiresAt: expiresAt, user: user)
         try saveSession(session)
         currentSession = session
+        // The flow is finished, so the persisted verifier can only mismatch the
+        // next one's challenge. Left behind it would be offered to that flow and
+        // rejected, turning a fresh sign-in into an unexplained failure.
+        _clearFlowPKCE()
         return session
+    }
+
+    /// Record the origin serving this app's hosted surfaces, as told by the
+    /// backend. Never parsed out of a value that arrived from outside.
+    /// Internal, not private, so tests can prime the trust anchor the same way
+    /// the backend does — the security guard below is meaningless without a test
+    /// that proves a FOREIGN origin is refused.
+    func _rememberHostedOrigin(_ url: URL) {
+        guard url.scheme?.lowercased() == "https", let host = url.host, !host.isEmpty else { return }
+        try? keychain.set("https://\(host)", forKey: KeychainKeys.hostedOrigin)
+    }
+
+    /// Is this URL one of Onelo's own hosted surfaces for this app?
+    ///
+    /// Fails CLOSED: an unknown origin, a non-https URL, or no remembered origin
+    /// at all all answer false. The cost of a false negative is that the app
+    /// re-resolves the flow and shows sign-in — recoverable in one tap. The cost
+    /// of a false positive is loading an attacker's page inside the app's own
+    /// sign-in window, which is not.
+    private func _isOneloHostedSurface(_ url: URL) -> Bool {
+        guard url.scheme?.lowercased() == "https", let host = url.host?.lowercased() else { return false }
+        // Any origin the backend has named for this app. `storeUrl`/`manageUrl`
+        // are included because a cold start may have neither a remembered origin
+        // nor a resolved flow yet, while config has already been restored.
+        let known = [
+            try? keychain.get(forKey: KeychainKeys.hostedOrigin),
+            storeUrl?.absoluteString,
+            manageUrl?.absoluteString,
+        ]
+        .compactMap { $0 }
+        .compactMap { URL(string: $0)?.host?.lowercased() }
+
+        return known.contains(host)
+    }
+
+    /// Complete a hosted sign-in from a deep link the OS handed your app.
+    ///
+    /// Needed for any flow that finishes OUTSIDE the SDK's WebView — a magic link
+    /// is the reason it exists: the email opens in the browser, the browser hands
+    /// the code back over your registered scheme, and the app may not even have
+    /// been running. Wire it from SwiftUI's `.onOpenURL` or AppKit/UIKit's
+    /// `application(_:open:options:)`:
+    ///
+    /// ```swift
+    /// .onOpenURL { url in Task { try? await onelo.auth.handleAuthCallback(url) } }
+    /// ```
+    ///
+    /// Returns the session on success, `nil` when the URL is not one of ours (so
+    /// you can pass every incoming URL through without pre-filtering). Only the
+    /// canonical `<scheme>://callback?code=…` shape is honoured — the same guard
+    /// the WebView coordinator applies, so a crafted `myapp://anything?code=…`
+    /// cannot smuggle a foreign code into the exchange.
+    ///
+    /// Safe on a cold start: it waits for session restoration to settle before
+    /// exchanging, because a link can relaunch a killed process and the verifier
+    /// it needs is read back from the Keychain.
+    @MainActor
+    @discardableResult
+    public func handleAuthCallback(_ url: URL) async throws -> OneloSession? {
+        guard
+            url.scheme?.lowercased() == config.callbackScheme.lowercased(),
+            url.host?.lowercased() == "callback",
+            let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems
+        else { return nil }
+
+        // ── A refusal, not a sign-in ─────────────────────────────────────────
+        // The person proved who they are and the Access Gate said no, so there
+        // is deliberately no code to exchange: the backend withholds it rather
+        // than letting the app decide. WHICH screen they are owed — the store or
+        // "No active plan" — was decided server-side, and this SDK carries that
+        // URL without reading, parsing or branching on it.
+        //
+        // Before this existed, the refusal could only be shown in the browser
+        // tab the email opened, and the app was never told anything: the user
+        // saw "No active plan" in Safari while the app sat on "Check your inbox"
+        // forever (Turingo, 2026-08-19).
+        if let gate = items.first(where: { $0.name == "gate" })?.value,
+           let gateUrl = URL(string: gate),
+           // Only ever an Onelo-hosted surface. This value arrives over a custom
+           // scheme, which ANY app on the device can fire at us, and it goes on
+           // to be loaded in a WebView — so an unchecked value here is a
+           // phishing page wearing the app's own sign-in window.
+           _isOneloHostedSurface(gateUrl) {
+            #if os(macOS)
+            NSApplication.shared.activate(ignoringOtherApps: true)
+            #endif
+            try? await awaitReady()
+            pendingGateUrl = gateUrl
+            return nil
+        }
+
+        guard
+            let code = items.first(where: { $0.name == "code" })?.value,
+            !code.isEmpty
+        else { return nil }
+
+        #if os(macOS)
+        // Bring the app forward. The OS delivers the URL but does NOT focus us, so
+        // when the browser sits on another display or Space the user watches a
+        // "returning you to the app" page while the app signs in silently
+        // somewhere they cannot see (Adrian, 2026-08-17). Activating is legitimate
+        // here and nowhere else: the user just clicked a link whose entire purpose
+        // is to come back to this app.
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        #endif
+
+        // A relaunch reaches this before `initialize()` has settled. Exchanging
+        // now would race the restore and could publish a session that the restore
+        // then overwrites; waiting costs nothing on a warm app (already ready).
+        try? await awaitReady()
+        return try await exchangeHostedCode(code)
     }
 
     /// Sign in — goes through Onelo backend to track last_seen_at and validate app access.
@@ -1268,6 +1628,10 @@ public final class OneloAuth: ObservableObject {
         isLoading = true
         defer { isLoading = false }
 
+        // A pending flow verifier belongs to the session being ended. Keeping it
+        // would hand the next sign-in a verifier that cannot match its challenge.
+        _clearFlowPKCE()
+
         // Tear down ALL local session state up-front, BEFORE the network await
         // below. Previously keychain.clear()/currentSession=nil ran AFTER
         // `await client.signOut()`, leaving a window where the proactive
@@ -1389,7 +1753,14 @@ public final class OneloAuth: ObservableObject {
                let userId = userData["id"] as? String {
                 let userEmail = userData["email"] as? String
                 let ent = OneloEntitlement(rawValue: (userData["entitlement"] as? String) ?? "") ?? .none
-                return OneloUser(id: userId, email: userEmail, role: .member, tenantId: nil, entitlement: ent)
+                // Carried on every refresh for the same reason it is carried on
+                // sign-in: the gate answer must never go stale while the session
+                // lives on. Absent → nil → the legacy fallback, not a refusal.
+                let allowed = userData["allowed_in"] as? Bool
+                return OneloUser(
+                    id: userId, email: userEmail, role: .member, tenantId: nil,
+                    entitlement: ent, allowedIn: allowed
+                )
             }
             return currentSession?.user ?? OneloUser(id: "", email: nil, role: .member, tenantId: nil)
         }()
@@ -2005,6 +2376,30 @@ public final class OneloAuth: ObservableObject {
 
     func _clearSessionForTesting() {
         currentSession = nil
+    }
+
+    /// Flip `isReady` without running `initialize()` (which needs the network).
+    /// Used by `AwaitReadyTimeoutTests` to prove `awaitReady(timeout:)` still
+    /// WAKES on the publisher, not just that its deadline fires — a fix that got
+    /// the timeout right and broke the wake-up would otherwise look green.
+    /// `DEBUG`-only, like the hooks above, so it cannot exist in a shipped build.
+    func _setReadyForTesting(_ value: Bool) {
+        isReady = value
+    }
+
+    /// Drive the gate inputs directly, so `isAllowedIn` can be asserted without a
+    /// Keychain, a backend or a live session.
+    ///
+    /// Added because the one line that matters — reading the SERVER'S
+    /// `allowed_in` instead of re-deriving the rule — was provably untested:
+    /// reverting it to the old local derivation left all 147 tests green
+    /// (measured 2026-08-19). A rule nothing asserts is a rule that comes back.
+    /// `DEBUG`-only, like the hooks above, so it cannot exist in a shipped build.
+    func _setGateInputsForTesting(session: OneloSession?, paywallEnabled: Bool) {
+        self.paywallEnabled = paywallEnabled
+        self.currentSession = session
+        self.isReady = true
+        _recomputeAllowedIn()
     }
     #endif
 

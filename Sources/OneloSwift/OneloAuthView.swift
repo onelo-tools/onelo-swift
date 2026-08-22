@@ -15,23 +15,79 @@ private let kWidePresetSize  = NSSize(width: 1024, height: 720)
 private let kNarrowPresetSize = NSSize(width: 440, height: 640)
 #endif
 
+/// Is this `?error=` value the hosted page saying its addressing token is spent?
+///
+/// `invalid_token` is what "Use a different account" on the no-plan page sends
+/// after signing the user out; the other two are idle expiry. The response is to
+/// reload a FRESH hosted URL, not to surface an error — the flow re-resolves and
+/// now answers `sign_in`, so the user lands on a clean form.
+///
+/// A file-level function rather than the inline comparison it replaced, so the
+/// rule is testable directly. Every other Onelo SDK now has the same predicate
+/// under the same name; this is the one they were all copied from.
+///
+/// NOT a catch-all: a genuine failure must still surface. Reloading on every
+/// error would loop forever on one.
+func isExpiredAuthError(_ err: String?) -> Bool {
+    err == "invalid_token" || err == "expired_token" || err == "token_expired"
+}
+
+/// Does closing THIS surface have to sign the user out?
+///
+/// The backend stamps `exit=signout` on a store or no-plan URL it hands out
+/// because the user only reached it by authenticating with NO plan — so the
+/// screen behind it is sign-in, not the app. Re-resolving without dropping the
+/// session sends the same Bearer back, the backend answers "signed in, no plan"
+/// and returns THE SAME SCREEN: it closes and instantly reopens, which reads as a
+/// dead button (found in the JS SDK on 2026-08-19; this is the Swift half).
+///
+/// A store opened by an entitled user carries no marker and closes back into the
+/// app — signing that person out for declining to buy would be hostile.
+func closingMeansSignOut(_ url: URL?) -> Bool {
+    guard let url,
+          let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems
+    else { return false }
+    return items.first(where: { $0.name == "exit" })?.value == "signout"
+}
+
 /// Skeleton variant to show during a WebView navigation transition.
 /// `.auth` covers re-loads of the hosted sign-in page (e.g. after a
 /// session-expired redirect). `.store` covers Sign-Up → /store/hosted
-/// when paywall is enabled. Lets the SwiftUI overlay draw the right
-/// shape (single column vs 3-card grid) before the new page paints.
+/// when paywall is enabled. `.neutral` covers the short hosted surfaces
+/// that are neither — see `navigationKind(for:)`. Lets the SwiftUI
+/// overlay draw the right shape before the new page paints.
 enum NavigationKind {
     case auth
     case store
+    case neutral
 }
 
 /// Inspect a URL and decide which skeleton variant should cover the
-/// transition. `/store/...` → store grid. Anything else (incl. the
-/// hosted auth page reload) → auth column. We match on path prefix
-/// rather than the whole URL so query strings / token params don't
-/// affect classification.
-private func navigationKind(for url: URL) -> NavigationKind {
-    if url.path.hasPrefix("/store/") { return .store }
+/// transition. We match on path prefix rather than the whole URL so query
+/// strings / token params don't affect classification.
+///
+/// The `.neutral` list is not cosmetic. Until 3.81.0 this function was
+/// `/store/` → `.store`, everything else → `.auth`, and the two short
+/// hosted surfaces added on 2026-08-17 fell into that `else`:
+///
+///   - `/no-plan/hosted`       — "No active plan" + one sign-out button
+///   - `/auth/sdk-magic-link`  — magic-link landing, a spinner and a line of text
+///
+/// Both got the SIGN-IN skeleton, which draws an email field, a password
+/// field, a "Forgot password?" link and up to three social pills. Neither
+/// page has any of them, so the overlay promised a form and then swapped in
+/// a single sentence. Same class of mistake as #36/#46 on the pre-auth
+/// skeleton: a skeleton must only ever describe what is actually arriving.
+///
+/// When adding a hosted surface, classify it HERE. `.auth` is the default
+/// only because a hosted-page reload is the common transition — it is not a
+/// safe fallback for a page whose shape you haven't checked.
+func navigationKind(for url: URL) -> NavigationKind {
+    let path = url.path
+    if path.hasPrefix("/store/") { return .store }
+    if path.hasPrefix("/no-plan/") || path.hasPrefix("/auth/sdk-magic-link") {
+        return .neutral
+    }
     return .auth
 }
 
@@ -118,6 +174,7 @@ public struct OneloAuthView<Content: View>: View {
     /// skeleton with no retry. On the true→false edge with still no session, we
     /// re-run `loadHostedUrl` to present the correct surface (sign-in / retry).
     private let exchangingPublisher: AnyPublisher<Bool, Never>
+    private let pendingGatePublisher: AnyPublisher<URL?, Never>
     /// #36 — mirrors `OneloAuth.isRestoringSession`. True while a stored session
     /// is being restored/verified on cold-start auto-login, so the pre-auth frame
     /// shows a branded splash instead of the sign-in skeleton.
@@ -137,6 +194,14 @@ public struct OneloAuthView<Content: View>: View {
     @State private var isOnExternalPage: Bool = false
     @State private var reloadWebView: Bool = false
     @State private var isLoadingUrl: Bool = false
+    /// Access token of the session we last reacted to. A NEW token while already
+    /// authenticated means the session was REPLACED — which is what a magic-link
+    /// sign-in does when a stale session is still in memory — and any hosted page
+    /// on screen is now stale. Neither `isAuthenticated` nor `needsPaywall`
+    /// changes in that case, so without this there is no edge to react to and the
+    /// WebView keeps showing "Check your inbox" over a perfectly good session
+    /// (found live 2026-08-17, second magic-link attempt in one app run).
+    @State private var lastAccessToken: String? = nil
     /// One-shot latch for the waitlist redirect. readyPublisher + onAppear can
     /// both fire loadHostedUrl on a cold start; without this the redirect would
     /// open the system browser twice (two tabs). Separate from isLoadingUrl so
@@ -224,6 +289,7 @@ public struct OneloAuthView<Content: View>: View {
             consentGateOwnerPublisher = oneloAuth.$consentGateOwner.eraseToAnyPublisher()
             oauthProvidersPublisher = oneloAuth.$oauthProviders.eraseToAnyPublisher()
             exchangingPublisher = oneloAuth.$isExchangingCode.eraseToAnyPublisher()
+            pendingGatePublisher = oneloAuth.$pendingGateUrl.eraseToAnyPublisher()
             restoringSessionPublisher = oneloAuth.$isRestoringSession.eraseToAnyPublisher()
             // Seed the flag synchronously so the FIRST paint of an auto-login
             // already suppresses the sign-in skeleton (#36) — before the
@@ -236,6 +302,7 @@ public struct OneloAuthView<Content: View>: View {
             consentGateOwnerPublisher = Just(nil).eraseToAnyPublisher()
             oauthProvidersPublisher = Just([String]()).eraseToAnyPublisher()
             exchangingPublisher = Just(false).eraseToAnyPublisher()
+            pendingGatePublisher = Just(nil).eraseToAnyPublisher()
             restoringSessionPublisher = Just(false).eraseToAnyPublisher()
         }
     }
@@ -302,8 +369,20 @@ public struct OneloAuthView<Content: View>: View {
                             showRetry = true
                         },
                         onSessionExpired: {
+                            // Capture BEFORE clearing: the marker lives on the URL
+                            // we are leaving, and `hostedUrl` is nil by the time
+                            // the task runs.
+                            let wasSignOutSurface = closingMeansSignOut(hostedUrl)
                             hostedUrl = nil
-                            Task { await loadHostedUrl() }
+                            Task {
+                                if wasSignOutSurface, let oneloAuth = auth as? OneloAuth {
+                                    // Best-effort: a failed server revoke must not
+                                    // strand the user on a dead screen — the local
+                                    // session is cleared either way.
+                                    try? await oneloAuth.signOut()
+                                }
+                                await loadHostedUrl()
+                            }
                         },
                         onExternalNavigation: { isExternal in
                             isOnExternalPage = isExternal
@@ -350,13 +429,18 @@ public struct OneloAuthView<Content: View>: View {
                     // the WebView (window-widening for the store page)
                     // is hidden until the new page finishes loading.
                     if isNavigating {
-                        ZStack {
-                            effectiveConfig.backgroundColor.ignoresSafeArea()
-                            switch navigationKind {
-                            case .auth:  AuthSkeletonView(providerCount: oauthProviderCount)
-                            case .store: StoreSkeletonView()
-                            }
-                        }
+                        // Extracted to its own struct rather than switching
+                        // inline. A 3-case switch here nests
+                        // `_ConditionalContent` inside this already very deep
+                        // body, and SwiftUI's type checker cost grows
+                        // exponentially with that nesting — adding the third
+                        // case pushed `swift build` past 10 minutes. The
+                        // wrapper erases it to ONE concrete type.
+                        NavigationSkeletonOverlay(
+                            kind: navigationKind,
+                            providerCount: oauthProviderCount,
+                            background: effectiveConfig.backgroundColor
+                        )
                         .transition(.opacity)
                     }
 
@@ -411,26 +495,64 @@ public struct OneloAuthView<Content: View>: View {
                         // `restoringSessionPublisher` if restore resolves with no
                         // valid session.
                         EmptyView()
-                    } else if isReady {
-                        // Only paint the skeleton AFTER config has resolved — at
-                        // that point `oauthProviderCount` is the fresh, plan-gated
-                        // value, so the social shape is correct on the FIRST paint.
-                        // Before isReady the count is a stale keychain seed (the
-                        // previous launch's value); drawing the skeleton then would
-                        // show the wrong social shape and visibly flip once config
-                        // lands. The plain background above is the only pre-resolve
-                        // state — matches the "no branded pre-auth screen" rule.
+                    } else if isAuthenticated {
+                        // Signed in, waiting on /flow/init to say what comes next
+                        // (store, "no active plan", or content). Whatever it is, it
+                        // is NOT the sign-in form — so painting the sign-in skeleton
+                        // here promises fields that will never appear. Same reasoning
+                        // as the #36 branch above, same treatment: hold the branded
+                        // background the ZStack already paints.
                         //
-                        // #B — the skeleton is now Onelo-authored HTML rendered in a
-                        // bare WebView (single-source across SDKs, pixel-identical to
-                        // the hosted page's own SSR skeleton), not a native SwiftUI
-                        // reimplementation. Transparent → the ZStack's branded base
-                        // shows through, continuous into the loaded hosted page.
+                        // Reached only while `hostedUrl == nil && !showRetry`, i.e.
+                        // strictly the decision gap. Once a URL arrives the WebView
+                        // branch wins, and a failure routes to showRetry.
+                        EmptyView()
+                    } else {
+                        // Signed-out loading state. MOUNTED here, but only made
+                        // VISIBLE once `isReady` — the two are deliberately split.
+                        //
+                        // ── Why mounting early matters (fixed 3.81.2) ───────────
+                        // The window in which this skeleton is allowed to show is
+                        // exactly ONE `/flow/init` round trip: `loadHostedUrl()` is
+                        // kicked off by `readyPublisher` the instant `isReady`
+                        // flips, and the moment it answers, `hostedUrl` is set and
+                        // the WebView branch takes over. Measured on staging:
+                        // **~122 ms**.
+                        //
+                        // Since #B the skeleton is Onelo-authored HTML in its own
+                        // bare WKWebView (single-source across SDKs, pixel-identical
+                        // to the hosted page's SSR skeleton) — and a WKWebView costs
+                        // ~100 ms to bootstrap. Constructing it INSIDE a 122 ms
+                        // window meant it sometimes made it and sometimes didn't:
+                        // the skeleton appeared at random. Adrian saw exactly that.
+                        //
+                        // Mounting it in the signed-out loading state instead lets
+                        // that bootstrap overlap the seconds of config resolution
+                        // that precede `isReady`, so by the time the window opens
+                        // the view is already warm. Nothing about WHEN it may be
+                        // seen changed:
+                        //
+                        //   - `opacity(0)` before `isReady` keeps the pre-resolve
+                        //     state a plain background — the "no branded pre-auth
+                        //     screen" rule holds.
+                        //   - #36 (`isRestoringSession`) and #46 (`isAuthenticated`)
+                        //     are `else if` branches ABOVE this one, so the
+                        //     auto-login path never even mounts it, let alone shows
+                        //     a sign-in form to someone already signed in.
+                        //   - The stale social count is a non-issue while invisible:
+                        //     `AuthSkeletonCoordinator` already reloads the HTML when
+                        //     `socialCount` changes, so the first VISIBLE paint still
+                        //     uses the fresh plan-gated value.
+                        //
+                        // `allowsHitTesting(false)` because an invisible WebView must
+                        // never swallow a tap meant for whatever sits behind it.
                         AuthSkeletonWebView(socialCount: oauthProviderCount)
                             #if os(macOS)
                             .frame(minWidth: 440)
                             #endif
                             .ignoresSafeArea()
+                            .opacity(isReady ? 1 : 0)
+                            .allowsHitTesting(false)
                     }
                 }
             }
@@ -458,6 +580,18 @@ public struct OneloAuthView<Content: View>: View {
                     _viewLog.debug("signOut detected but isReady=false, waiting for readyPublisher")
                     #endif
                 }
+            } else if wasAuthenticated && session != nil
+                        && lastAccessToken != nil
+                        && session?.accessToken != lastAccessToken {
+                // Session REPLACED, not gained or lost. Drop whatever hosted page
+                // is on screen and ask the backend again: it now answers for the
+                // new session (content, or the store when there is no plan).
+                // Cannot loop — re-resolving with a live session returns either
+                // `authorized` or a `present` with a fresh URL.
+                hostedUrl = nil
+                showRetry = false
+                errorMessage = nil
+                if isReady { Task { await loadHostedUrl() } }
             } else if wasNeedsPaywall != needsPaywall {
                 // Entitlement just changed (purchase completed → reveal content;
                 // or subscription lapsed → show store). Drop any stale WebView URL
@@ -485,6 +619,9 @@ public struct OneloAuthView<Content: View>: View {
                 // (or another presenter) can re-acquire it cleanly.
                 (auth as? OneloAuth)?.releaseConsentGate(gateToken)
             }
+            // Remember what we just reacted to, so the NEXT publish can tell a
+            // replaced session from an unchanged one.
+            lastAccessToken = session?.accessToken
         }
         .onReceive(readyPublisher) { ready in
             isReady = ready
@@ -528,6 +665,24 @@ public struct OneloAuthView<Content: View>: View {
             _viewLog.debug("exchangingPublisher settled without session → loadHostedUrl()")
             #endif
             Task { await loadHostedUrl() }
+        }
+        .onReceive(pendingGatePublisher) { gate in
+            // A sign-in that finished outside this WebView was REFUSED by the
+            // Access Gate, and the deep link brought the surface home. Show it
+            // exactly as `loadHostedUrl()` would — same slot, same WebView.
+            //
+            // This is the whole of the SDK's part: no reading of the URL, no
+            // decision about which screen it is. Without it the refusal could
+            // only ever be seen in the browser tab the email opened, while the
+            // app waited on "Check your inbox" forever (Turingo, 2026-08-19).
+            guard let gate else { return }
+            // Clear FIRST. `@Published` republishes to every subscriber, and a
+            // value left set would be re-presented by a later re-resolve after
+            // the user had dismissed it.
+            (auth as? OneloAuth)?.clearPendingGate()
+            errorMessage = nil
+            showRetry = false
+            hostedUrl = gate
         }
         .onReceive(consentRevisionPublisher) { rev in
             // Backend pushed legal.consent_required (a blocking version took
@@ -758,6 +913,45 @@ public struct OneloAuthView<Content: View>: View {
 
 // MARK: - Embedded web auth view (WKWebView)
 
+/// Should the hosted WebView load again?
+///
+/// Extracted from `updateNSView`/`updateUIView` so the rule can be TESTED. It
+/// could not be before, and it was wrong: the views reloaded only on an explicit
+/// `shouldReload` flag and ignored a changed `url` entirely. SwiftUI re-renders
+/// the representable without reloading the WKWebView, so handing the view a new
+/// URL changed nothing on screen — which silently swallowed the Access Gate's
+/// refusal arriving by deep link and left the app on "Check your inbox" forever
+/// (Turingo, 2026-08-19).
+///
+/// - `forced` covers a reload of the SAME url (retry), which a comparison alone
+///   cannot see.
+/// - Comparing loaded-vs-requested is what makes a new URL sufficient on its
+///   own, so no caller has to remember a flag.
+func shouldReloadHostedWebView(loaded: URL?, requested: URL, forced: Bool) -> Bool {
+    forced || loaded != requested
+}
+
+/// The native OAuth hand-off URL for a provider.
+///
+/// `intent` is CARRIED, never decided here: OAuth returns a verified identity
+/// and never an intention, so the backend defaults to refusing to create an
+/// account. Only the value the backend defines travels — anything else falls
+/// back to that safe default. Dropping it made "Sign up with Google" arrive as
+/// a sign-in and told the user "This account isn't registered" whichever button
+/// they pressed (2026-08-19).
+///
+/// Extracted so this is testable: it was written inline in two closures, which
+/// is also how the two copies could have drifted.
+func nativeOAuthURL(base: URL, provider: String, token: String, intent: String?) -> URL? {
+    var components = URLComponents(url: base, resolvingAgainstBaseURL: false)
+    components?.path = "/api/sdk/auth/oauth/\(provider)"
+    var items = [URLQueryItem(name: "token", value: token)]
+    if intent == "signup" { items.append(URLQueryItem(name: "intent", value: "signup")) }
+    components?.queryItems = items
+    components?.fragment = nil
+    return components?.url
+}
+
 private final class WebAuthCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
     let callbackScheme: String
     let originalHost: String?
@@ -767,6 +961,16 @@ private final class WebAuthCoordinator: NSObject, WKNavigationDelegate, WKUIDele
     let onSessionExpired: () -> Void
     var onExternalNavigation: ((Bool) -> Void)?
     var onContentHeight: ((CGFloat) -> Void)?
+    /// The URL this WebView was last told to load.
+    ///
+    /// `updateNSView`/`updateUIView` used to reload ONLY on the `shouldReload`
+    /// flag, so handing the view a DIFFERENT `url` changed nothing on screen.
+    /// That silently swallowed the Access Gate's refusal arriving by deep link:
+    /// the SDK set the surface, SwiftUI re-rendered with the new URL, and the
+    /// WebView carried on showing "Check your inbox" forever (Turingo,
+    /// 2026-08-19). Comparing what was ASKED for against what was LOADED makes
+    /// a new URL sufficient on its own — no caller has to remember a flag.
+    var loadedURL: URL?
     /// Emitted on every WebView transition AFTER the first successful
     /// load. The Bool says "loading vs idle", the kind tells the parent
     /// which skeleton variant to draw underneath (auth vs store).
@@ -781,7 +985,15 @@ private final class WebAuthCoordinator: NSObject, WKNavigationDelegate, WKUIDele
     /// Flips once didFinish fires for the first time. After that, every
     /// new didStartProvisionalNavigation is treated as a real transition.
     private var hasFinishedFirstLoad: Bool = false
-    var onNativeOAuth: ((String, String) -> Void)?
+    /// `(provider, token, intent)` — `intent` is `"signup"` when the user pressed
+    /// a SIGN-UP affordance, nil otherwise. Carried from the hosted page, never
+    /// decided here: OAuth returns a verified identity and never an intention, so
+    /// the backend defaults to refusing to create an account. Dropping this made
+    /// "Sign up with Google" reach the backend as a sign-in — no account was
+    /// created and the user was told "This account isn't registered" whichever
+    /// button they pressed (found on Flutter 2026-08-19; Swift is the other SDK
+    /// on this bridge).
+    var onNativeOAuth: ((String, String, String?) -> Void)?
     /// Fires when the hosted legal page (loaded in gate mode) emits
     /// `onelo:consent`. The String is the action: "accept" or "decline".
     var onConsent: ((String) -> Void)?
@@ -847,7 +1059,10 @@ private final class WebAuthCoordinator: NSObject, WKNavigationDelegate, WKUIDele
         } else if type == "onelo:native_oauth",
                   let provider = body["provider"] as? String,
                   let token = body["token"] as? String {
-            DispatchQueue.main.async { self.onNativeOAuth?(provider, token) }
+            // Absent on an older hosted page — which the builder below treats as
+            // a sign-in, the safe default.
+            let intent = body["intent"] as? String
+            DispatchQueue.main.async { self.onNativeOAuth?(provider, token, intent) }
         } else if type == "onelo:native_oauth_url",
                   let urlStr = body["url"] as? String,
                   let url = URL(string: urlStr) {
@@ -983,8 +1198,7 @@ private final class WebAuthCoordinator: NSObject, WKNavigationDelegate, WKUIDele
             let items = components?.queryItems
             if let code = items?.first(where: { $0.name == "code" })?.value {
                 DispatchQueue.main.async { self.onCode(code) }
-            } else if let error = items?.first(where: { $0.name == "error" })?.value,
-                      error == "expired_token" || error == "invalid_token" || error == "token_expired" {
+            } else if isExpiredAuthError(items?.first(where: { $0.name == "error" })?.value) {
                 // Token expired while user was idle — reload hosted page silently
                 DispatchQueue.main.async { self.onSessionExpired() }
             } else {
@@ -1269,7 +1483,12 @@ private func authSkeletonHTML(socialCount: Int) -> String {
     *{box-sizing:border-box;margin:0;padding:0}
     html,body{background:transparent;font-family:-apple-system,sans-serif;overflow:hidden}
     @keyframes onelo-shimmer{0%{background-position:-60vw 0}100%{background-position:100vw 0}}
-    .wrap{display:flex;flex-direction:column;align-items:center;width:100%;padding:48px 24px 0}
+    /* Bottom inset matches the top. It was `48px 24px 0` until 3.81.0 —
+       the same missing-bottom-gap defect that was fixed across the hosted
+       pages on 2026-08-17. Here it made the last placeholder (the sign-up
+       line) sit flush against the window edge, so the swap into the real
+       page visibly nudged everything up. */
+    .wrap{display:flex;flex-direction:column;align-items:center;width:100%;padding:48px 24px;box-sizing:border-box}
     .col{width:100%;max-width:300px;display:flex;flex-direction:column;gap:10px}
     .sk{background-color:rgba(255,255,255,0.04);background-image:linear-gradient(90deg,rgba(255,255,255,0) 0%,rgba(255,255,255,0.12) 50%,rgba(255,255,255,0) 100%);background-size:60vw 100%;background-repeat:no-repeat;background-attachment:fixed;animation:onelo-shimmer 2.4s linear infinite;border-radius:8px}
     .strong{background-color:rgba(255,255,255,0.08);background-image:linear-gradient(90deg,rgba(255,255,255,0) 0%,rgba(255,255,255,0.18) 50%,rgba(255,255,255,0) 100%);background-size:60vw 100%;background-repeat:no-repeat;background-attachment:fixed;animation:onelo-shimmer 2.4s linear infinite;border-radius:9px}
@@ -1460,13 +1679,11 @@ private struct EmbeddedWebAuthView: NSViewRepresentable {
             }
             window.setFrame(frame, display: true, animate: true)
         }
-        c.onNativeOAuth = { [weak c] provider, token in
+        c.onNativeOAuth = { [weak c] provider, token, intent in
             guard let c else { return }
-            var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
-            components?.path = "/api/sdk/auth/oauth/\(provider)"
-            components?.queryItems = [URLQueryItem(name: "token", value: token)]
-            components?.fragment = nil
-            guard let oauthUrl = components?.url else { return }
+            guard let oauthUrl = nativeOAuthURL(
+                base: url, provider: provider, token: token, intent: intent,
+            ) else { return }
             c.startNativeOAuth(oauthUrl: oauthUrl)
         }
         return c
@@ -1495,14 +1712,22 @@ private struct EmbeddedWebAuthView: NSViewRepresentable {
         webView.uiDelegate = context.coordinator
         webView.enclosingScrollView?.hasVerticalScroller = false
         webView.enclosingScrollView?.verticalScrollElasticity = .none
+        // Record the initial load too, or the first update() would see a
+        // mismatch against nil and reload the page it has just started.
+        context.coordinator.loadedURL = url
         webView.load(oneloHostedURLRequest(url))
         return webView
     }
 
     func updateNSView(_ nsView: WKWebView, context: Context) {
-        if shouldReload {
+        // A changed URL is reason enough. `shouldReload` remains for a forced
+        // reload of the SAME URL (retry), which a comparison alone cannot see.
+        if shouldReloadHostedWebView(
+            loaded: context.coordinator.loadedURL, requested: url, forced: shouldReload,
+        ) {
+            context.coordinator.loadedURL = url
             nsView.load(oneloHostedURLRequest(url))
-            DispatchQueue.main.async { shouldReload = false }
+            if shouldReload { DispatchQueue.main.async { shouldReload = false } }
         }
         DispatchQueue.main.async {
             guard let window = nsView.window else { return }
@@ -1527,13 +1752,11 @@ private struct EmbeddedWebAuthView: UIViewRepresentable {
         c.onExternalNavigation = onExternalNavigation
         c.onNavigationLoading = onNavigationLoading
         c.onConsent = onConsent
-        c.onNativeOAuth = { [weak c] provider, token in
+        c.onNativeOAuth = { [weak c] provider, token, intent in
             guard let c else { return }
-            var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
-            components?.path = "/api/sdk/auth/oauth/\(provider)"
-            components?.queryItems = [URLQueryItem(name: "token", value: token)]
-            components?.fragment = nil
-            guard let oauthUrl = components?.url else { return }
+            guard let oauthUrl = nativeOAuthURL(
+                base: url, provider: provider, token: token, intent: intent,
+            ) else { return }
             c.startNativeOAuth(oauthUrl: oauthUrl)
         }
         return c
@@ -1583,14 +1806,21 @@ private struct EmbeddedWebAuthView: UIViewRepresentable {
         webView.uiDelegate = context.coordinator
         webView.scrollView.showsHorizontalScrollIndicator = false
         webView.scrollView.alwaysBounceHorizontal = false
+        // Record the initial load too, or the first update() would see a
+        // mismatch against nil and reload the page it has just started.
+        context.coordinator.loadedURL = url
         webView.load(oneloHostedURLRequest(url))
         return webView
     }
 
     func updateUIView(_ uiView: WKWebView, context: Context) {
-        if shouldReload {
+        // Same rule as macOS — see the comment on `loadedURL`.
+        if shouldReloadHostedWebView(
+            loaded: context.coordinator.loadedURL, requested: url, forced: shouldReload,
+        ) {
+            context.coordinator.loadedURL = url
             uiView.load(oneloHostedURLRequest(url))
-            DispatchQueue.main.async { shouldReload = false }
+            if shouldReload { DispatchQueue.main.async { shouldReload = false } }
         }
     }
 }
@@ -2386,6 +2616,99 @@ struct StoreSkeletonView: View {
         OneloShimmerFill(radius: radius, strong: strong)
             .frame(maxWidth: .infinity)
             .frame(height: height)
+    }
+}
+
+// MARK: - Navigation skeleton overlay
+
+/// The full-bounds skeleton painted ON TOP of the auth WebView during a
+/// navigation, branded background included.
+///
+/// Exists as a struct purely to keep `OneloAuthView.body` cheap to type-check:
+/// switching over three variants inline nested `_ConditionalContent` two deep
+/// inside that body and drove `swift build` over 10 minutes. Here the switch
+/// is the whole body of a tiny view, and the call site sees one concrete type.
+/// `AnyView` does the same erasure and costs one allocation per variant swap,
+/// which happens at most once per navigation.
+private struct NavigationSkeletonOverlay: View {
+    let kind: NavigationKind
+    let providerCount: Int
+    let background: Color
+
+    var body: some View {
+        ZStack {
+            background.ignoresSafeArea()
+            skeleton
+        }
+    }
+
+    private var skeleton: AnyView {
+        switch kind {
+        case .auth:    return AnyView(AuthSkeletonView(providerCount: providerCount))
+        case .store:   return AnyView(StoreSkeletonView())
+        case .neutral: return AnyView(NeutralSkeletonView())
+        }
+    }
+}
+
+// MARK: - Neutral skeleton (short hosted surfaces)
+
+/// Skeleton for the hosted surfaces that are neither a sign-in form nor the
+/// store — today `/no-plan/hosted` and `/auth/sdk-magic-link`. See
+/// `navigationKind(for:)` for why they need their own variant: before 3.81.0
+/// they fell through to `AuthSkeletonView` and the overlay drew an email
+/// field, a password field, a "Forgot password?" link and social pills for
+/// pages that have none of them.
+///
+/// **Deliberately does NOT draw a button**, even though `/no-plan/hosted` ends
+/// in "Use a different account". The two pages share a logo, a heading and a
+/// short paragraph; only one has a CTA. A skeleton that promises a control the
+/// arriving page may not have is the exact failure #36 and #46 were about —
+/// whereas content appearing where the skeleton left blank space reads as
+/// loading finishing, which is what it is. So the shape is the INTERSECTION of
+/// both pages, not the union.
+struct NeutralSkeletonView: View {
+    var body: some View {
+        VStack(spacing: 0) {
+            // Vertically centered, matching both pages' `justify-center`.
+            // minLength mirrors AuthSkeletonView so short windows keep air.
+            Spacer(minLength: 24)
+
+            // Logo — both pages render the tenant logo at 48pt tall with
+            // `object-contain`, so the WIDTH is unknowable here. 96pt is a
+            // middle-of-the-road wordmark; a square box would mis-promise a
+            // badge-shaped logo just as often.
+            shimmerRect(width: 96, height: 48, radius: 12)
+
+            Spacer().frame(height: 24)
+
+            // Heading — "No active plan" / the magic-link title.
+            shimmerRect(width: 180, height: 20, radius: 6)
+
+            Spacer().frame(height: 12)
+
+            // Body paragraph, two lines, second one short — matches the
+            // `max-w-sm` copy on both pages wrapping to about two lines.
+            shimmerRect(width: 260, height: 12, radius: 4)
+                .opacity(0.7)
+
+            Spacer().frame(height: 8)
+
+            shimmerRect(width: 190, height: 12, radius: 4)
+                .opacity(0.7)
+
+            Spacer(minLength: 24)
+        }
+        // Horizontal inset matches the pages' `px-6`; the bottom inset is the
+        // same 48pt as the top so the skeleton→page hand-off doesn't shift.
+        .padding(.horizontal, 24)
+        .padding(.vertical, 48)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func shimmerRect(width: CGFloat, height: CGFloat, radius: CGFloat) -> some View {
+        OneloShimmerFill(radius: radius, strong: false)
+            .frame(width: width, height: height)
     }
 }
 

@@ -1,7 +1,7 @@
 import Foundation
 
 public enum OneloSDK {
-    public static let sdkVersion = "3.77.0"
+    public static let sdkVersion = "3.86.1"
 }
 
 public enum UserRole: String, Codable, Sendable {
@@ -28,23 +28,35 @@ public struct OneloUser: Codable, Sendable {
     /// from a keychain blob saved before the SDK started persisting it). Treat absence as `.none`
     /// for gating purposes — never as `.active`.
     public let entitlement: OneloEntitlement
+    /// **May this person see the app?** Computed by Onelo, never here.
+    ///
+    /// The rule — no paywall, or a live grant — used to be re-derived in every
+    /// SDK from two raw settings. Three languages, three copies, and each was
+    /// found wrong on a different day. The server now ships the conclusion.
+    ///
+    /// `nil` means the backend did not send it (an older server), NOT "no".
+    /// Only then may the legacy derivation stand in — see `_recomputeAllowedIn`.
+    public let allowedIn: Bool?
 
     public init(
         id: String,
         email: String?,
         role: UserRole,
         tenantId: String?,
-        entitlement: OneloEntitlement = .none
+        entitlement: OneloEntitlement = .none,
+        allowedIn: Bool? = nil
     ) {
         self.id = id
         self.email = email
         self.role = role
         self.tenantId = tenantId
         self.entitlement = entitlement
+        self.allowedIn = allowedIn
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, email, role, tenantId, entitlement
+        case allowedIn = "allowed_in"
     }
 
     public init(from decoder: Decoder) throws {
@@ -54,6 +66,9 @@ public struct OneloUser: Codable, Sendable {
         role = (try? c.decode(UserRole.self, forKey: .role)) ?? .member
         tenantId = try? c.decode(String.self, forKey: .tenantId)
         entitlement = (try? c.decode(OneloEntitlement.self, forKey: .entitlement)) ?? .none
+        // Absent stays nil — "the server did not say" and "the server said no"
+        // are different answers, and only the first may fall back.
+        allowedIn = try? c.decode(Bool.self, forKey: .allowedIn)
     }
 }
 
