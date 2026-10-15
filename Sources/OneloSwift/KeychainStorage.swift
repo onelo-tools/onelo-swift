@@ -1,8 +1,59 @@
 import Foundation
 import Security
 
+/// Where `OneloAuth` keeps the session and its launch caches: string values
+/// under string keys, one namespace per store.
+///
+/// The SDK reads it ONLY through this protocol, so the store can be swapped
+/// without touching `OneloAuth`. Apps get the Keychain (`production()`); the
+/// test suite injects an in-memory store and never reaches the real Keychain
+/// (#732 — an ad-hoc-signed `xctest` binary otherwise raises a "wants to use
+/// com.onelo.auth" dialog on every build).
+protocol OneloSessionStorage: AnyObject, Sendable {
+    func set(_ value: String, forKey key: String) throws
+    func get(forKey key: String) throws -> String?
+    func delete(forKey key: String) throws
+    /// Remove every value in this store (sign-out, revocation).
+    func clear() throws
+    /// The server just accepted `refreshToken` (the token presented, before
+    /// rotation) and returned a fresh session. A store that migrated exactly
+    /// that token from the legacy shared Keychain (#740) now knows the session
+    /// is this app's and removes the legacy copy. Other stores do nothing.
+    func sessionRefreshSucceeded(refreshToken: String)
+}
+
+extension OneloSessionStorage {
+    func sessionRefreshSucceeded(refreshToken: String) {}
+}
+
+enum OneloSessionStorageFactory {
+    /// The store every app gets by default. This is the ONE place that picks
+    /// the production backend: change it here and nowhere else. Tests never
+    /// call it — they pass their own store explicitly.
+    ///
+    /// Since #740 that is this app's own session Keychain: the data protection
+    /// keychain where the app is entitled to it, otherwise the macOS file-based
+    /// keychain, always under a service scoped to this app's bundle id. See
+    /// `OneloSessionKeychain`.
+    static func production() -> any OneloSessionStorage {
+        OneloSessionKeychain(
+            service: OneloSessionKeychain.serviceName(
+                bundleIdentifier: Bundle.main.bundleIdentifier,
+                processName: ProcessInfo.processInfo.processName
+            ),
+            backend: SecItemKeychainBackend(),
+            defaults: .standard
+        )
+    }
+}
+
 /// Secure token storage backed by iOS/macOS Keychain.
-public final class KeychainStorage: Sendable {
+///
+/// Kept for source compatibility. The SDK itself no longer uses it: since #740
+/// the session lives in `OneloSessionKeychain` (per-app service, data protection
+/// keychain). This class still targets the macOS file-based keychain under the
+/// service you pass.
+public final class KeychainStorage: OneloSessionStorage, Sendable {
     private let service: String
 
     public init(service: String = "com.onelo.auth") {

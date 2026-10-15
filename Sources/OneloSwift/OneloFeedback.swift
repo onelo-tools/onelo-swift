@@ -36,14 +36,25 @@ public final class OneloFeedback: NSObject, ObservableObject {
     /// The resolved hosted URL — available after `open()` resolves.
     /// AppKit apps can read this directly instead of using `.feedbackSheet()`.
     public private(set) var hostedURL: URL?
+    /// The options of the open form, initiated again to renew its `ft` (#622).
+    private var lastOptions = OpenFeedbackOptions()
+    /// The app's brand tokens (#681) the sheet / window chrome paints with —
+    /// kept in step with `OneloAuth.brandTokens` by `Onelo`.
+    public internal(set) var brandTokens: OneloBrandTokens = .neutral
 
 #if os(macOS)
     private weak var feedbackWindow: NSWindow?
 #endif
 
-    init(client: _OneloHTTPClient, features: OneloFeatures) {
+    /// The signed-in Onelo user's access token (#820). Wired by `Onelo` to
+    /// `OneloAuth.userToken`; with a session the initiate call carries it and
+    /// the report names a verified reporter. Nil, the call is exactly as before.
+    private let userToken: _OneloUserToken?
+
+    init(client: _OneloHTTPClient, features: OneloFeatures, userToken: _OneloUserToken? = nil) {
         self.client = client
         self.features = features
+        self.userToken = userToken
     }
 
     // MARK: - Initiate (shared)
@@ -69,10 +80,22 @@ public final class OneloFeedback: NSObject, ObservableObject {
             items.append(.init(name: "session", value: jsonStr))
         }
 
+        // Signed in (#820): `Authorization: Bearer <access token>` makes the
+        // server sign the token's user as a VERIFIED reporter. A refused token is
+        // refreshed and retried once; refused again, the form still opens without
+        // it (as a signed-out call would), so feedback never fails on identity.
         // userId is sent as a HEADER (X-Onelo-User-Id), not a query param, so the
         // developer's user id never appears in the access-logged initiate URL.
-        let headers = options.userId.map { ["X-Onelo-User-Id": $0] } ?? [:]
-        let json = try await client.get(path: "/api/sdk/feedback/initiate", queryItems: items, headers: headers)
+        // Without a session it is the developer's unverified label.
+        let userIdHeader = options.userId.map { ["X-Onelo-User-Id": $0] } ?? [:]
+        let (status, json) = try await _sendWithUserToken(userToken, onRefused: {}) { [client] attempt in
+            try await client.getRaw(
+                path: "/api/sdk/feedback/initiate",
+                queryItems: items,
+                headers: userIdHeader.merging(_OneloUserTokenWire.headers(attempt.token)) { _, new in new }
+            )
+        }
+        guard (200..<300).contains(status) else { throw client.httpError(json, statusCode: status) }
         guard
             let urlStr = json["hosted_url"] as? String,
             let url    = URL(string: urlStr)
@@ -86,9 +109,24 @@ public final class OneloFeedback: NSObject, ObservableObject {
     /// Fetches the hosted URL and sets `isPresented = true`.
     /// Use with `.feedbackSheet(onelo.feedback)` in SwiftUI apps.
     public func open(options: OpenFeedbackOptions = OpenFeedbackOptions()) async throws {
+        lastOptions = options
         hostedURL   = try await fetchHostedURL(options: options)
         hostedReady = false   // fail-safe ✕ visible until the hosted page mounts
         isPresented = true
+    }
+
+    /// #622 — answers the hosted form's `onelo:renew_request` (kind `feedback`).
+    /// The form's reporter token `ft` lives 30 minutes; a form left open longer
+    /// asks for a fresh one on submit. The open form's options are initiated
+    /// again, so the report keeps its reporter, type, area and session. Returns
+    /// the script that delivers the reply into the page.
+    func renewReplyScript(requestId: String) async -> String {
+        do {
+            let url = try await fetchHostedURL(options: lastOptions)
+            return portalRenewReplyScript(requestId: requestId, hostedUrl: url.absoluteString, reason: "")
+        } catch {
+            return portalRenewReplyScript(requestId: requestId, hostedUrl: nil, reason: "renew_failed")
+        }
     }
 
     func makeWebView() -> OneloBrowserFeedbackView? {
@@ -100,6 +138,12 @@ public final class OneloFeedback: NSObject, ObservableObject {
             },
             onHostedReady: { [weak self] in
                 Task { @MainActor [weak self] in self?.hostedReady = true }
+            },
+            onRenew: { [weak self] requestId in
+                guard let self else {
+                    return portalRenewReplyScript(requestId: requestId, hostedUrl: nil, reason: "renew_failed")
+                }
+                return await self.renewReplyScript(requestId: requestId)
             }
         )
     }
@@ -128,6 +172,8 @@ public final class OneloFeedback: NSObject, ObservableObject {
         win.minSize = NSSize(width: 480, height: 680)
         win.isReleasedWhenClosed = false
         win.appearance = nil
+        // #681 — the brand page ground behind the (transparent) web view.
+        win.backgroundColor = Color(oneloCSS: brandTokens.pageBg).map { NSColor($0) } ?? .windowBackgroundColor
 
         let webConfig = WKWebViewConfiguration()
         webConfig.userContentController.addUserScript(FeedbackWebCoordinator.relayScript)
@@ -137,12 +183,21 @@ public final class OneloFeedback: NSObject, ObservableObject {
         // Dark background while loading so there's no white flash
         webView.setValue(false, forKey: "drawsBackground")
 
+        lastOptions = options
         let coordinator = FeedbackWebCoordinator { [weak win] in win?.close() }
         // Retry from the error screen re-runs the fetch in the same window
         // instead of leaving the user stuck (or silently closing — see below).
         coordinator.onRetry = { [weak self, weak webView, weak win] in
             guard let self, let webView, let win else { return }
             self.loadHostedForm(into: webView, window: win, options: options)
+        }
+        // #622 — the form's `ft` expired; answer only while on the hosted origin.
+        coordinator.hostedOrigin = { [weak self] in portalOrigin(of: self?.hostedURL) }
+        coordinator.onRenew = { [weak self] requestId in
+            guard let self else {
+                return portalRenewReplyScript(requestId: requestId, hostedUrl: nil, reason: "renew_failed")
+            }
+            return await self.renewReplyScript(requestId: requestId)
         }
         objc_setAssociatedObject(win, &_coordinatorKey, coordinator, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
         webView.navigationDelegate = coordinator
@@ -165,7 +220,7 @@ public final class OneloFeedback: NSObject, ObservableObject {
     /// (violates the no-silent-swallows rule).
     private func loadHostedForm(into webView: WKWebView, window win: NSWindow, options: OpenFeedbackOptions) {
         // Load skeleton screen immediately — shimmer animation while network resolves
-        webView.loadHTMLString(Self.skeletonHTML, baseURL: nil)
+        webView.loadHTMLString(oneloFeedbackSkeletonHTML(self.brandTokens), baseURL: nil)
 
         Task { [weak self, weak webView, weak win] in
             guard let self else { return }
@@ -179,110 +234,13 @@ public final class OneloFeedback: NSObject, ObservableObject {
             } catch {
                 let message = error.localizedDescription
                 await MainActor.run {
-                    webView?.loadHTMLString(Self.errorHTML(message: message), baseURL: nil)
+                    webView?.loadHTMLString(oneloErrorPageHTML(self.brandTokens, title: "Couldn't load feedback", message: message, retryHref: "onelo://feedback_retry"), baseURL: nil)
                     win?.makeKeyAndOrderFront(nil)
                 }
             }
         }
     }
 
-    // Skeleton screen shown while the hosted URL is being fetched.
-    // Mirrors the rough layout of the feedback form with a shimmer animation.
-    private static let skeletonHTML = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>
-      * { box-sizing: border-box; margin: 0; padding: 0; }
-      body {
-        background: #111;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-        padding: 40px 36px 32px;
-        overflow: hidden;
-      }
-      @keyframes shimmer {
-        0%   { background-position: -600px 0; }
-        100% { background-position: 600px 0; }
-      }
-      .sk {
-        border-radius: 10px;
-        background: linear-gradient(90deg, #1e1e1e 25%, #2a2a2a 50%, #1e1e1e 75%);
-        background-size: 600px 100%;
-        animation: shimmer 1.4s infinite linear;
-      }
-      /* App icon */
-      .icon  { width: 64px; height: 64px; border-radius: 14px; margin: 0 auto 16px; }
-      /* Title line */
-      .title { width: 220px; height: 22px; margin: 0 auto 40px; border-radius: 6px; }
-      /* Type selector cards */
-      .cards { display: flex; gap: 12px; margin-bottom: 32px; }
-      .card  { flex: 1; height: 76px; border-radius: 12px; }
-      /* Field labels + inputs */
-      .label { width: 60px; height: 13px; border-radius: 4px; margin-bottom: 8px; }
-      .input { width: 100%; height: 44px; border-radius: 10px; margin-bottom: 24px; }
-      .textarea { width: 100%; height: 110px; border-radius: 10px; margin-bottom: 32px; }
-      /* Submit button */
-      .btn   { width: 100%; height: 48px; border-radius: 12px; }
-    </style>
-    </head>
-    <body>
-      <div class="sk icon"></div>
-      <div class="sk title"></div>
-      <div class="cards">
-        <div class="sk card"></div>
-        <div class="sk card"></div>
-        <div class="sk card"></div>
-      </div>
-      <div class="sk label"></div>
-      <div class="sk input"></div>
-      <div class="sk label"></div>
-      <div class="sk textarea"></div>
-      <div class="sk btn"></div>
-    </body>
-    </html>
-    """
-
-    // Error screen shown when the hosted URL can't be resolved. Includes a
-    // Retry button that navigates to the `onelo://feedback_retry` sentinel,
-    // which the coordinator intercepts to re-run the fetch.
-    private static func errorHTML(message: String) -> String {
-        let safe = message
-            .replacingOccurrences(of: "&", with: "&amp;")
-            .replacingOccurrences(of: "<", with: "&lt;")
-            .replacingOccurrences(of: ">", with: "&gt;")
-        return """
-        <!DOCTYPE html>
-        <html>
-        <head>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>
-          * { box-sizing: border-box; margin: 0; padding: 0; }
-          html, body { height: 100%; }
-          body {
-            background: #111; color: #e5e5e5;
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-            display: flex; flex-direction: column; align-items: center;
-            justify-content: center; text-align: center; padding: 40px 36px;
-          }
-          .title { font-size: 17px; font-weight: 600; margin-bottom: 10px; }
-          .msg   { font-size: 13px; color: #9a9a9a; line-height: 1.5; max-width: 320px; margin-bottom: 28px; }
-          .btn {
-            appearance: none; border: 0; cursor: pointer;
-            background: #fff; color: #111; font-size: 14px; font-weight: 600;
-            padding: 11px 22px; border-radius: 10px;
-          }
-          .btn:active { opacity: 0.8; }
-        </style>
-        </head>
-        <body>
-          <div class="title">Couldn't load feedback</div>
-          <div class="msg">\(safe)</div>
-          <button class="btn" onclick="window.location.href='onelo://feedback_retry'">Try again</button>
-        </body>
-        </html>
-        """
-    }
 #endif
 }
 
@@ -295,19 +253,38 @@ final class FeedbackWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate
     var onHostedReady: (() -> Void)?
     /// Invoked when the in-window error screen's Retry button fires.
     var onRetry: (() -> Void)?
+    /// #622 — answers the form's renew request; returns the reply script.
+    var onRenew: ((String) async -> String)?
+    /// #622 — the hosted form's origin; only a page on it is answered.
+    var hostedOrigin: () -> String? = { nil }
     init(onDismiss: @escaping () -> Void) { self.onDismiss = onDismiss }
+
+    /// The request id of a `onelo://feedback_renew?request_id=…` sentinel (#622).
+    static func renewRequestId(from url: URL) -> String? {
+        guard url.scheme == "onelo", url.host == "feedback_renew" else { return nil }
+        let id = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+            .queryItems?.first(where: { $0.name == "request_id" })?.value
+        return (id?.isEmpty == false) ? id : nil
+    }
 
     // JS relay: forward the hosted page's postMessages → sentinel navigations the
     // coordinator intercepts. `onelo:feedback_submitted` (done) and — from the
     // canonical hosted ✕ (Phase 2) — `onelo:feedback_close` (user cancelled) both
     // dismiss; `onelo:ready` tells the native side the hosted page mounted (so it
     // hides its fail-safe ✕, shown only during the pre-load/error window).
-    static let relayScript = WKUserScript(
-        source: """
+    //
+    // #622 — `window.OneloFeedbackHost` tells the hosted form it runs inside an
+    // SDK that can renew its reporter token `ft`; a renew request the page
+    // posts to itself becomes the `onelo://feedback_renew` sentinel.
+    static let relaySource = """
         (function() {
+          window.OneloFeedbackHost = true;
           window.addEventListener('message', function(e) {
             if (!e.data || !e.data.type) return;
-            if (e.data.type === 'onelo:feedback_submitted') {
+            if (e.source === window && e.data.type === 'onelo:renew_request'
+                && e.data.kind === 'feedback' && typeof e.data.request_id === 'string') {
+              window.location.href = 'onelo://feedback_renew?request_id=' + encodeURIComponent(e.data.request_id);
+            } else if (e.data.type === 'onelo:feedback_submitted') {
               window.location.href = 'onelo://feedback_submitted';
             } else if (e.data.type === 'onelo:feedback_close') {
               window.location.href = 'onelo://feedback_close';
@@ -316,7 +293,10 @@ final class FeedbackWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate
             }
           });
         })();
-        """,
+        """
+
+    static let relayScript = WKUserScript(
+        source: relaySource,
         injectionTime: .atDocumentStart,
         forMainFrameOnly: false
     )
@@ -343,6 +323,20 @@ final class FeedbackWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate
             case "feedback_retry":
                 decisionHandler(.cancel)
                 Task { @MainActor in self.onRetry?() }
+                return
+            case "feedback_renew":
+                // #622 — not a close: answer into the page and keep it open.
+                decisionHandler(.cancel)
+                guard let requestId = Self.renewRequestId(from: url),
+                      let onRenew = self.onRenew,
+                      let expected = self.hostedOrigin(),
+                      portalOrigin(of: webView.url) == expected else { return }
+                Task { @MainActor [weak webView] in
+                    let script = await onRenew(requestId)
+                    // Completion-handler form: the async overload traps when the
+                    // script evaluates to undefined, which a postMessage does.
+                    webView?.evaluateJavaScript(script, completionHandler: nil)
+                }
                 return
             default:
                 break
@@ -376,6 +370,7 @@ struct OneloBrowserFeedbackView {
     let url: URL
     let onDismiss: () -> Void
     var onHostedReady: (() -> Void)? = nil
+    var onRenew: ((String) async -> String)? = nil
 
     func makeWebView(coordinator: FeedbackWebCoordinator) -> WKWebView {
         let config = WKWebViewConfiguration()
@@ -390,6 +385,9 @@ struct OneloBrowserFeedbackView {
     func makeCoordinator() -> FeedbackWebCoordinator {
         let c = FeedbackWebCoordinator(onDismiss: onDismiss)
         c.onHostedReady = onHostedReady
+        c.onRenew = onRenew
+        let origin = portalOrigin(of: url)
+        c.hostedOrigin = { origin }
         return c
     }
 }
@@ -435,10 +433,13 @@ private struct FeedbackSheetView: View {
         // A bare ZStack + `.ignoresSafeArea()` webview makes the webview top =
         // surface top, so the hosted ✕ is flush top-right in feedback AND portal.
         ZStack(alignment: .topLeading) {
+            // #681 — brand page ground + brand-tinted spinner.
+            OneloBrandPalette(feedback.brandTokens).pageBg.ignoresSafeArea()
             if let webView = feedback.makeWebView() {
                 webView.ignoresSafeArea()
             } else {
                 ProgressView()
+                    .tint(OneloBrandPalette(feedback.brandTokens).brand)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             // #40 Phase 2 + #44 — native ✕ is a FAIL-SAFE only, and must NOT flash
@@ -457,6 +458,7 @@ private struct FeedbackSheetView: View {
                 }
             }
         }
+        .environment(\.oneloBrandTokens, feedback.brandTokens)
         .task {
             // #44 — arm the fail-safe ✕ only after the grace period (auto-cancels
             // when the sheet dismisses).

@@ -15,13 +15,17 @@ import XCTest
 @MainActor
 final class HandleAuthCallbackTests: XCTestCase {
 
+    /// In-memory session store (#732): never the real Keychain. A "relaunched"
+    /// instance built over the same store reads what the first one persisted.
+    private let storage = InMemorySessionStorage()
+
     private func makeAuth() -> OneloAuth {
         let config = OneloConfig(
             publishableKey: "onelo_pk_test_stub",
             apiUrl: URL(string: "https://test.example.com")!,
             callbackScheme: "turingo"
         )
-        return OneloAuth(config: config, urlSession: .shared, skipInitialize: true)
+        return OneloAuth(config: config, urlSession: .shared, skipInitialize: true, storage: storage)
     }
 
     /// Returning nil rather than throwing lets an app funnel EVERY incoming URL
@@ -84,32 +88,28 @@ final class HandleAuthCallbackTests: XCTestCase {
 @MainActor
 final class GateDeepLinkTests: XCTestCase {
 
+    /// In-memory session store (#732): never the real Keychain. A "relaunched"
+    /// instance built over the same store reads what the first one persisted.
+    private let storage = InMemorySessionStorage()
+
     private func makeAuth() -> OneloAuth {
         let config = OneloConfig(
             publishableKey: "onelo_pk_test_stub",
             apiUrl: URL(string: "https://test.example.com")!,
             callbackScheme: "turingo"
         )
-        return OneloAuth(config: config, urlSession: .shared, skipInitialize: true)
+        return OneloAuth(config: config, urlSession: .shared, skipInitialize: true, storage: storage)
     }
 
-    /// The trust anchor is PERSISTED (Keychain), on purpose: a magic link can
-    /// relaunch a killed process, and a value that died with the process would
-    /// leave nothing to check against on exactly the path this exists for.
-    ///
-    /// That persistence is shared across the whole test process, and it caught a
-    /// test lying: `test_with_no_remembered_origin_it_fails_closed` passed only
-    /// because an earlier test had already written the anchor. Clearing here is
-    /// what makes "no anchor" actually mean no anchor.
+    /// The trust anchor is PERSISTED in the session store, on purpose: a magic
+    /// link can relaunch a killed process, and a value that died with the
+    /// process would leave nothing to check against on exactly the path this
+    /// exists for. Each test gets a fresh in-memory store (#732), so "no anchor"
+    /// means no anchor; the check below keeps that explicit.
     override func setUp() async throws {
         try await super.setUp()
-        // Targeted delete, not clear(). The anchor outlived clear() even in a
-        // single-test run — i.e. it was left behind by a PREVIOUS run of the
-        // suite, on disk. Whatever clear() is doing on the macOS file-based
-        // keychain, it is not reliably removing this row, and a test that quietly
-        // depends on that would assert nothing at all.
-        try? KeychainStorage().delete(forKey: "hosted_origin")
-        let leftover = try? KeychainStorage().get(forKey: "hosted_origin")
+        try? storage.delete(forKey: "hosted_origin")
+        let leftover = try? storage.get(forKey: "hosted_origin")
         XCTAssertNil(leftover, "setUp did not actually clear the anchor")
     }
 
@@ -201,19 +201,23 @@ final class GateDeepLinkTests: XCTestCase {
 @MainActor
 final class FlowVerifierReuseTests: XCTestCase {
 
+    /// In-memory session store (#732): never the real Keychain. A "relaunched"
+    /// instance built over the same store reads what the first one persisted.
+    private let storage = InMemorySessionStorage()
+
     private func makeAuth() -> OneloAuth {
         let config = OneloConfig(
             publishableKey: "onelo_pk_test_stub",
             apiUrl: URL(string: "https://test.example.com")!,
             callbackScheme: "turingo"
         )
-        return OneloAuth(config: config, urlSession: .shared, skipInitialize: true)
+        return OneloAuth(config: config, urlSession: .shared, skipInitialize: true, storage: storage)
     }
 
     override func setUp() async throws {
         try await super.setUp()
-        try? KeychainStorage().delete(forKey: "flow_code_verifier")
-        try? KeychainStorage().delete(forKey: "flow_code_verifier_issued_at")
+        try? storage.delete(forKey: "flow_code_verifier")
+        try? storage.delete(forKey: "flow_code_verifier_issued_at")
     }
 
     func test_a_second_flow_does_not_invalidate_an_outstanding_challenge() async throws {
@@ -233,11 +237,11 @@ final class FlowVerifierReuseTests: XCTestCase {
         // the deep link, so ONLY the Keychain copy is left to exchange with.
         let auth = makeAuth()
         _ = auth._beginFlowPKCE()
-        let stored = try KeychainStorage().get(forKey: "flow_code_verifier")
+        let stored = try storage.get(forKey: "flow_code_verifier")
 
         _ = auth._beginFlowPKCE()
 
-        XCTAssertEqual(try KeychainStorage().get(forKey: "flow_code_verifier"), stored)
+        XCTAssertEqual(try storage.get(forKey: "flow_code_verifier"), stored)
     }
 
     func test_a_stale_verifier_is_replaced() async throws {
@@ -246,7 +250,7 @@ final class FlowVerifierReuseTests: XCTestCase {
         let auth = makeAuth()
         let first = auth._beginFlowPKCE()
         // 16 minutes ago — one minute past the link's own lifetime.
-        try KeychainStorage().set(
+        try storage.set(
             String(Date().timeIntervalSince1970 - (16 * 60)),
             forKey: "flow_code_verifier_issued_at",
         )
@@ -259,7 +263,7 @@ final class FlowVerifierReuseTests: XCTestCase {
         // and reusing it blindly would pin it indefinitely.
         let auth = makeAuth()
         let first = auth._beginFlowPKCE()
-        try KeychainStorage().delete(forKey: "flow_code_verifier_issued_at")
+        try storage.delete(forKey: "flow_code_verifier_issued_at")
 
         XCTAssertNotEqual(auth._beginFlowPKCE(), first)
     }
@@ -267,7 +271,7 @@ final class FlowVerifierReuseTests: XCTestCase {
     func test_a_clock_that_moved_backwards_is_treated_as_stale() async throws {
         let auth = makeAuth()
         let first = auth._beginFlowPKCE()
-        try KeychainStorage().set(
+        try storage.set(
             String(Date().timeIntervalSince1970 + 3600),
             forKey: "flow_code_verifier_issued_at",
         )
@@ -283,6 +287,6 @@ final class FlowVerifierReuseTests: XCTestCase {
 
         auth._clearFlowPKCE()
 
-        XCTAssertNil(try KeychainStorage().get(forKey: "flow_code_verifier_issued_at"))
+        XCTAssertNil(try storage.get(forKey: "flow_code_verifier_issued_at"))
     }
 }

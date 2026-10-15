@@ -80,6 +80,21 @@ final class AccessGateWiringTests: XCTestCase {
         XCTAssertFalse(closingMeansSignOut(nil))
     }
 
+    func test_a_dead_link_on_a_signout_surface_keeps_the_session() {
+        // #619: the access-gate store outlived its link and handed back
+        // `token_expired`. That is not the user leaving — restart on the same
+        // session so the gate re-resolves to the store on a fresh link.
+        let gateStore = URL(string: "https://st.onelo.tools/store/hosted?token=srt_x&exit=signout")
+        XCTAssertFalse(signOutBeforeRestart("token_expired", gateStore))
+        XCTAssertFalse(signOutBeforeRestart("expired_token", gateStore))
+        // The ✕ / "Use a different account" still sign out, as before.
+        XCTAssertTrue(signOutBeforeRestart("invalid_token", gateStore))
+        XCTAssertTrue(signOutBeforeRestart(nil, gateStore))
+        // An ordinary store never signs out.
+        XCTAssertFalse(signOutBeforeRestart("invalid_token",
+            URL(string: "https://st.onelo.tools/store/hosted?token=srt_x")))
+    }
+
     // MARK: - The vocabulary this SDK must not reinvent
 
     func test_invalid_token_means_start_over_not_failure() {
@@ -114,7 +129,8 @@ final class AllowedInSignalTests: XCTestCase {
                 callbackScheme: "turingo"
             ),
             urlSession: .shared,
-            skipInitialize: true
+            skipInitialize: true,
+            storage: InMemorySessionStorage()
         )
     }
 

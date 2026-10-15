@@ -1,7 +1,7 @@
 import Foundation
 
 public enum OneloSDK {
-    public static let sdkVersion = "3.86.1"
+    public static let sdkVersion = "3.104.0"
 }
 
 public enum UserRole: String, Codable, Sendable {
@@ -37,6 +37,16 @@ public struct OneloUser: Codable, Sendable {
     /// `nil` means the backend did not send it (an older server), NOT "no".
     /// Only then may the legacy derivation stand in — see `_recomputeAllowedIn`.
     public let allowedIn: Bool?
+    /// Has this user proved their address receives mail (Email Verification,
+    /// #819)? From the backend's `email_verified`; `nil` when an older backend
+    /// did not send it. OAuth, Magic Link and an e-mailed password reset count
+    /// as verified.
+    public let emailVerified: Bool?
+    /// Why `allowedIn` is `false`, when the server named a reason the app may
+    /// branch on. Today only `"email_unverified"`: the parent App requires Email
+    /// Verification and this user has not opened the link yet. `nil` when
+    /// allowed in or when the reason is the paywall. Tolerate unknown values.
+    public let accessReason: String?
 
     public init(
         id: String,
@@ -44,7 +54,9 @@ public struct OneloUser: Codable, Sendable {
         role: UserRole,
         tenantId: String?,
         entitlement: OneloEntitlement = .none,
-        allowedIn: Bool? = nil
+        allowedIn: Bool? = nil,
+        emailVerified: Bool? = nil,
+        accessReason: String? = nil
     ) {
         self.id = id
         self.email = email
@@ -52,11 +64,15 @@ public struct OneloUser: Codable, Sendable {
         self.tenantId = tenantId
         self.entitlement = entitlement
         self.allowedIn = allowedIn
+        self.emailVerified = emailVerified
+        self.accessReason = accessReason
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, email, role, tenantId, entitlement
         case allowedIn = "allowed_in"
+        case emailVerified = "email_verified"
+        case accessReason = "access_reason"
     }
 
     public init(from decoder: Decoder) throws {
@@ -69,7 +85,51 @@ public struct OneloUser: Codable, Sendable {
         // Absent stays nil — "the server did not say" and "the server said no"
         // are different answers, and only the first may fall back.
         allowedIn = try? c.decode(Bool.self, forKey: .allowedIn)
+        emailVerified = try? c.decode(Bool.self, forKey: .emailVerified)
+        accessReason = try? c.decode(String.self, forKey: .accessReason)
     }
+
+    /// A user from a backend `user` payload (sign-in, sign-up, refresh,
+    /// hosted-callback). The ONE place the wire becomes an `OneloUser`, so no
+    /// path can drop the server's access answer (`allowed_in`, `email_verified`,
+    /// `access_reason`) — the custom-UI sign-in and sign-up paths did (#819
+    /// review), which let an unverified user into a free app through the
+    /// local fallback. Absent fields stay nil.
+    static func fromWire(_ userData: [String: Any], id: String) -> OneloUser {
+        OneloUser(
+            id: id,
+            email: userData["email"] as? String,
+            role: .member,
+            tenantId: nil,
+            entitlement: OneloEntitlement(rawValue: (userData["entitlement"] as? String) ?? "") ?? .none,
+            allowedIn: userData["allowed_in"] as? Bool,
+            emailVerified: userData["email_verified"] as? Bool,
+            accessReason: userData["access_reason"] as? String
+        )
+    }
+
+    /// The server's access answer from a `/api/sdk/auth/user` body merged over
+    /// this user (#819): `allowedIn`, `emailVerified` and `accessReason` move
+    /// together. A field the body does not carry keeps its stored value; when
+    /// the body carries `allowed_in`, `accessReason` is taken from the body even
+    /// when absent — the answer is complete and an old reason must not outlive it.
+    func mergingAccessAnswer(_ json: [String: Any], entitlement: OneloEntitlement) -> OneloUser {
+        let answered = json["allowed_in"] is Bool
+        return OneloUser(
+            id: id, email: email, role: role, tenantId: tenantId, entitlement: entitlement,
+            allowedIn: answered ? json["allowed_in"] as? Bool : allowedIn,
+            emailVerified: (json["email_verified"] as? Bool) ?? emailVerified,
+            accessReason: answered ? json["access_reason"] as? String : accessReason
+        )
+    }
+}
+
+/// The result of `OneloAuth.resendVerificationEmail(redirectTo:)` (#819).
+public struct OneloVerificationResend: Sendable, Equatable {
+    /// A new e-mail went out; the previous link stopped working.
+    public let sent: Bool
+    /// The address was already verified, so nothing was sent.
+    public let emailVerified: Bool
 }
 
 public struct OneloSession: Sendable {
@@ -107,6 +167,60 @@ public struct OneloConfig: Sendable {
     }
 }
 
+/// #818 — whether your own sign-up screen should show the optional Marketing
+/// Consent checkbox, and with what text. Set on the parent App in Auth →
+/// Sign-up; an App that sells asks at Checkout instead (`asked` false). Show
+/// `text` unticked and pass the person's choice to
+/// `signUp(email:password:marketingConsent:)`.
+public struct OneloSignupMarketingConsent: Decodable, Equatable, Sendable {
+    public let asked: Bool
+    /// The checkbox label, already filled in. Nil when not asked.
+    public let text: String?
+    /// The language `text` is in; sent back with the consent.
+    public let language: String?
+
+    public static let notAsked = OneloSignupMarketingConsent(asked: false, text: nil, language: nil)
+
+    public init(asked: Bool, text: String?, language: String?) {
+        self.asked = asked
+        self.text = text
+        self.language = language
+    }
+
+    enum CodingKeys: String, CodingKey { case asked, text, language }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        asked = (try? c.decode(Bool.self, forKey: .asked)) ?? false
+        text = try? c.decode(String.self, forKey: .text)
+        language = try? c.decode(String.self, forKey: .language)
+    }
+
+    /// The device's preferred language as a BCP 47 tag, `en` when unknown.
+    static var deviceLanguage: String { Locale.preferredLanguages.first ?? "en" }
+}
+
+/// #818 — the waitlist checkboxes your form showed. Only the reserved purposes.
+public struct OneloWaitlistConsent: Equatable, Sendable {
+    /// Marketing Consent — optional, never pre-ticked.
+    public var marketing: Bool?
+    /// The waitlist's custom checkbox, when it has one.
+    public var custom: Bool?
+
+    public init(marketing: Bool? = nil, custom: Bool? = nil) {
+        self.marketing = marketing
+        self.custom = custom
+    }
+
+    /// The `consent` field of the join body, or nil when nothing was given.
+    var wireValue: [String: Bool]? {
+        var out: [String: Bool] = [:]
+        if let marketing { out["marketing"] = marketing }
+        if let custom { out["custom"] = custom }
+        return out.isEmpty ? nil : out
+    }
+}
+
 /// Internal config resolved from publishable key
 struct ResolvedConfig: Decodable {
     let supabaseUrl: String
@@ -138,6 +252,14 @@ struct ResolvedConfig: Decodable {
     /// when no custom branding). The auth view paints it so the pre-auth / loading
     /// frame matches the hosted page instead of flashing a system colour (#26).
     let checkoutBgColor: String?
+    /// Branding "Brand color" (`primary_color`); nil when the app has none. SDK-drawn
+    /// controls shown before a hosted page loads use it, neutral when nil (#601).
+    let primaryColor: String?
+    /// Resolved brand tokens (#681): `brand_tokens`, or the shape the two legacy
+    /// colours imply on an older backend (`OneloBrandTokens.fromLegacy`).
+    let brandTokens: OneloBrandTokens
+    /// #818 — the sign-up Marketing Consent question; not asked on an older backend.
+    let signupMarketingConsent: OneloSignupMarketingConsent
 
     enum CodingKeys: String, CodingKey {
         case supabaseUrl = "supabase_url"
@@ -155,6 +277,9 @@ struct ResolvedConfig: Decodable {
         case manageUrl = "manage_url"
         case oauthProviders = "oauth_providers"
         case checkoutBgColor = "checkout_bg_color"
+        case primaryColor = "primary_color"
+        case brandTokens = "brand_tokens"
+        case signupMarketingConsent = "signup_marketing_consent"
     }
 
     init(from decoder: Decoder) throws {
@@ -177,6 +302,15 @@ struct ResolvedConfig: Decodable {
         manageUrl = try? c.decode(String.self, forKey: .manageUrl)
         oauthProviders = (try? c.decode([String].self, forKey: .oauthProviders)) ?? []
         checkoutBgColor = try? c.decode(String.self, forKey: .checkoutBgColor)
+        primaryColor = try? c.decode(String.self, forKey: .primaryColor)
+        let legacy = OneloBrandTokens.fromLegacy(primaryColor: primaryColor, pageBg: checkoutBgColor)
+        if let bt = try? c.nestedContainer(keyedBy: OneloBrandTokens.CodingKeys.self, forKey: .brandTokens) {
+            brandTokens = OneloBrandTokens.decode(bt, fallback: legacy)
+        } else {
+            brandTokens = legacy
+        }
+        signupMarketingConsent = (try? c.decode(OneloSignupMarketingConsent.self, forKey: .signupMarketingConsent))
+            ?? .notAsked
     }
 }
 
@@ -197,21 +331,23 @@ public enum OneloResponseReasonCode {
 
 /// Errors raised by the Features module's entitlement-aware APIs (Task 4.5+).
 /// Separate from `OneloError` so callers can catch entitlement failures
-/// (`.notEntitled`, `.secureModeRequired`, `.invalidUserHash`) without
-/// having to pattern-match on string-bearing `OneloError.serverError`.
+/// (`.notEntitled`, `.notAuthenticated`) without having to pattern-match on
+/// string-bearing `OneloError.serverError`.
 public enum OneloFeaturesError: Error, Equatable, Sendable {
-    /// `_load(userId:)` has not been called yet (or `userId` was nil).
-    /// Entitlement endpoints are user-scoped — anonymous callers can't
-    /// request a module token.
+    /// No user is signed in (entitlement endpoints are user-scoped —
+    /// anonymous callers can't request a module token), or the signed-in
+    /// user's access token was refused even after a refresh.
     case notAuthenticated
     /// Backend returned 403 not_entitled. The current user does not have
     /// access to the requested feature slug.
     case notEntitled
-    /// Backend returned 401 secure_mode_required. The app is configured to
-    /// require a userIdHash but the SDK was called without one.
+    /// Never thrown: Secure Mode is retired and the server no longer answers
+    /// with `secure_mode_required`. Kept so existing code compiles.
+    @available(*, deprecated, message: "Secure Mode is retired; the server no longer returns this.")
     case secureModeRequired
-    /// Backend returned 401 invalid_user_hash. The HMAC supplied as
-    /// `userIdHash` did not verify against the userId.
+    /// Never thrown: Secure Mode is retired and the server no longer answers
+    /// with `invalid_user_hash`. Kept so existing code compiles.
+    @available(*, deprecated, message: "Secure Mode is retired; the server no longer returns this.")
     case invalidUserHash
     /// Network failure or malformed response.
     case networkError
@@ -243,6 +379,26 @@ public enum OneloError: LocalizedError, Sendable {
     /// is Paywall → Store → Access Gate in the Onelo dashboard, on the app
     /// itself (it is per platform, never on a parent).
     case inAppStoreNotAllowed
+    /// The session is over: it expired, was replaced (`session_compromised` —
+    /// the same refresh token was presented again outside the server's grace
+    /// window) or is not recognised. NOT an account action — the user just
+    /// signs in again. The SDK has already cleared `currentSession`.
+    case sessionEnded
+    /// The account was banned. The only refusal that says "suspended";
+    /// `isUserRevoked` is set alongside it.
+    case userRevoked
+    /// The user's plan lapsed and this app has no free tier — route them to
+    /// the store / upgrade flow (`OneloAuthView` does). Not a revocation.
+    case noActivePlan
+    /// Email Verification (#819): at most 3 verification e-mails an hour.
+    case verificationRateLimited
+    /// Email Verification is Off for this App (Auth → Sign-up on the parent App).
+    case emailVerificationOff
+    /// The verification link was used, replaced by a newer one, or expired.
+    case invalidVerificationToken
+    /// The `redirectTo` given for the verification link is not one of the App's
+    /// allowed web origins nor `<registered-scheme>://…`.
+    case invalidVerifyRedirect
 
     public var errorDescription: String? {
         switch self {
@@ -258,6 +414,15 @@ public enum OneloError: LocalizedError, Sendable {
         case .storeNotConfigured: return "The store hasn't been configured for this app yet."
         case .inAppStoreNotAllowed:
             return "Plans can't be purchased inside this app. Buyers purchase on the web and sign in here."
+        case .sessionEnded: return "Your session ended — please sign in again"
+        case .userRevoked: return "This user account has been suspended"
+        case .noActivePlan: return "No active subscription — the plan has expired or was cancelled."
+        case .verificationRateLimited: return "At most 3 verification emails an hour — try again later"
+        case .emailVerificationOff: return "Email verification is off for this app — turn it on in Auth → Sign-up"
+        case .invalidVerificationToken:
+            return "This verification link is invalid, already used, replaced by a newer one, or expired"
+        case .invalidVerifyRedirect:
+            return "redirectTo must be one of this app's allowed web origins or <your-scheme>://…"
         }
     }
 }
@@ -273,6 +438,28 @@ func oneloErrorCode(from json: [String: Any]) -> String? {
     if let code = (json["detail"] as? [String: Any])?["error"] as? String { return code }
     if let code = json["detail"] as? String { return code }
     return nil
+}
+
+/// What a refused `/api/sdk/auth/refresh` means for the app (#548). The
+/// backend answers `{"detail": {"error" | "error_code": …}}`; only a ban is an
+/// account action — every other refusal just ends the session.
+func refreshRefusalError(status: Int, json: [String: Any]) -> OneloError {
+    let detail = json["detail"] as? [String: Any]
+    let code = oneloErrorCode(from: json) ?? (detail?["error_code"] as? String)
+    switch code {
+    case "banned":
+        return .userRevoked
+    case "no_plan_available":
+        return .noActivePlan
+    default:
+        // Pre-dict backends sent a bare string detail on a 403 account action.
+        if status == 403, let legacy = json["detail"] as? String,
+           ["account_deleted", "account_suspended", "account_payment_failed"].contains(where: legacy.contains) {
+            return .userRevoked
+        }
+        // session_compromised / session_expired / session_invalid / anything else.
+        return .sessionEnded
+    }
 }
 
 /// Why the resolver assigned this status.
@@ -333,3 +520,13 @@ struct FeatureStateWire: Decodable {
     }
 }
 
+/// What a refused Email Verification call means (#819).
+func verificationError(status: Int, json: [String: Any]) -> OneloError {
+    let code = oneloErrorCode(from: json)
+    if status == 429 || code == "verification_rate_limited" { return .verificationRateLimited }
+    if status == 409 || code == "email_verification_off" { return .emailVerificationOff }
+    if status == 400 && code == "invalid_verify_redirect_to" { return .invalidVerifyRedirect }
+    if status == 400 && code == "invalid_token" { return .invalidVerificationToken }
+    if status == 401 { return .notAuthenticated }
+    return .serverError("Email verification request failed: HTTP \(status)")
+}

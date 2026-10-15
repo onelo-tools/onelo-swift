@@ -9,7 +9,7 @@ final class OneloIdentityBridgeTests: XCTestCase {
             publishableKey: "pk_test",
             apiUrl: URL(string: "https://example.com")!,
             callbackScheme: ""
-        ))
+        ), storage: InMemorySessionStorage())
     }
 
     func testSessionPublisherEmitsUserIdOnSignIn() async {
@@ -46,7 +46,7 @@ final class OneloIdentityBridgeTests: XCTestCase {
     /// and events shipped as `anonymous`.
     func testMonitorReceivesUserIdViaIdentify() async throws {
         let onelo = Onelo(
-            publishableKey: "pk_test",
+            testingKey: "pk_test",
             baseURL: URL(string: "https://example.invalid")!,
             autoLifecycleRefresh: false
         )
@@ -64,7 +64,7 @@ final class OneloIdentityBridgeTests: XCTestCase {
     /// `signOut` semantics for apps that don't use Onelo Auth.
     func testMonitorUserIdClearedByClearIdentity() async throws {
         let onelo = Onelo(
-            publishableKey: "pk_test",
+            testingKey: "pk_test",
             baseURL: URL(string: "https://example.invalid")!,
             autoLifecycleRefresh: false
         )
@@ -78,7 +78,7 @@ final class OneloIdentityBridgeTests: XCTestCase {
 
     func testMonitorReceivesUserIdWhenSessionAppears() async throws {
         let onelo = Onelo(
-            publishableKey: "pk_test",
+            testingKey: "pk_test",
             baseURL: URL(string: "https://example.invalid")!,
             autoLifecycleRefresh: false
         )
@@ -104,7 +104,7 @@ final class OneloIdentityBridgeTests: XCTestCase {
 
     func testMonitorUserIdClearedOnSignOut() async throws {
         let onelo = Onelo(
-            publishableKey: "pk_test",
+            testingKey: "pk_test",
             baseURL: URL(string: "https://example.invalid")!,
             autoLifecycleRefresh: false
         )

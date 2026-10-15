@@ -14,7 +14,7 @@ final class OneloConsentGateClaimTests: XCTestCase {
             publishableKey: "onelo_pk_test_stub",
             apiUrl: URL(string: "https://test.example.com")!
         )
-        return OneloAuth(config: config, urlSession: .shared, skipInitialize: true)
+        return OneloAuth(config: config, urlSession: .shared, skipInitialize: true, storage: InMemorySessionStorage())
     }
 
     func test_free_gate_can_be_claimed() {

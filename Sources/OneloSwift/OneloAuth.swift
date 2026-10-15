@@ -24,6 +24,11 @@ private let _authLog = Logger(subsystem: "com.onelo.sdk", category: "auth")
 public final class OneloAuth: ObservableObject {
     @Published public private(set) var currentSession: OneloSession? {
         didSet {
+            // A different user (or signing out) starts a new token-refusal
+            // episode for the Features calls. The same user — a refresh
+            // republishing the session — does not: that is what keeps a
+            // persistently refused token from looping refresh → call → refresh.
+            if oldValue?.user.id != currentSession?.user.id { userToken.reset() }
             // "Allowed in" depends on the session AND on the entitlement carried
             // inside it, so it has to be recomputed on every republish — not only
             // when the session appears or disappears.
@@ -178,9 +183,9 @@ public final class OneloAuth: ObservableObject {
     /// slow-but-working handshake (~3-4 round trips) while capping a stalled
     /// network so the auth flow never hangs.
     private static let attestWaitCapMs: Int = 5000
-    /// App name returned by /initiate — shown in HostedSignInButton before Safari opens.
+    /// App name returned by /initiate — shown before the hosted page opens.
     @Published public private(set) var hostedAppName: String = "App"
-    /// App logo URL returned by /initiate — shown in HostedSignInButton if set, otherwise Onelo logo.
+    /// App logo URL returned by /initiate — shown before the hosted page opens, if set.
     @Published public private(set) var hostedAppLogoUrl: URL? = nil
     /// True while a hosted-callback code is being exchanged for a session (via the
     /// in-app WebView OR an external-browser deep-link). `OneloAuthView` reads it
@@ -211,6 +216,32 @@ public final class OneloAuth: ObservableObject {
     /// loading frame matches the hosted page instead of flashing a system colour
     /// (#26). Nil until config resolves (view falls back to the config default).
     @Published public private(set) var pageBackgroundColorHex: String?
+    /// Branding "Brand color" hex (`primary_color`) from `/api/sdk/config` (#601).
+    /// SDK-drawn controls shown before a hosted page loads (the retry "Sign In"
+    /// button) paint it; nil until config resolves or when the app has none →
+    /// neutral grey, never Onelo orange.
+    @Published public private(set) var brandPrimaryColorHex: String?
+    /// The app's resolved brand tokens (#681) — the ONE model every piece of
+    /// this SDK's native chrome paints from. `/api/sdk/config` sets it (cached in
+    /// the keychain for the next launch's first paint); a store / portal /
+    /// upgrade initiate response carrying `brand_tokens` refreshes it. `.neutral`
+    /// before any of that — never Onelo orange.
+    @Published public private(set) var brandTokens: OneloBrandTokens = .neutral
+
+    /// Adopt the branding a config / initiate response body carries (#681).
+    /// No-op when the body carries none.
+    func adoptBrandTokens(fromJSON json: [String: Any]) {
+        guard let t = OneloBrandTokens.from(json: json) else { return }
+        setBrandTokens(t)
+    }
+
+    private func setBrandTokens(_ t: OneloBrandTokens) {
+        guard t != brandTokens else { return }
+        brandTokens = t
+        if let json = try? JSONEncoder().encode(t), let s = String(data: json, encoding: .utf8) {
+            try? keychain.set(s, forKey: KeychainKeys.brandTokens)
+        }
+    }
     /// True if app is in waitlist mode — `OneloAuthView` opens `sdkRedirectUrl` instead of sign-in.
     @Published public private(set) var waitlistMode: Bool = false
     /// Developer-configured URL to open when `waitlistMode` is true and `sdkRedirectUrl` is set.
@@ -223,9 +254,12 @@ public final class OneloAuth: ObservableObject {
     /// Empty when social is disabled by the plan OR the developer. Drives the
     /// loading skeleton so it draws social pills only when the hosted form will.
     @Published public private(set) var oauthProviders: [String] = []
+    /// #818 — should your own sign-up screen ask for Marketing Consent, and
+    /// with what text (in the device language). From `/api/sdk/config`.
+    @Published public private(set) var signupMarketingConsent: OneloSignupMarketingConsent = .notAsked
 
     private var client: AuthClient?
-    private let keychain: KeychainStorage
+    private let keychain: any OneloSessionStorage
     let config: OneloConfig
 
     /// Callback URL scheme registered for this SDK instance, exposed for
@@ -271,8 +305,29 @@ public final class OneloAuth: ObservableObject {
     /// modules (OneloFeatures, future OneloPaywall realtime) attach their
     /// handlers to this same stream via `eventStream.on(...)`.
     public var eventStream: OneloEventStream { _eventStream }
+
+    /// The signed-in user's access token for the Features calls and the Event
+    /// Stream (#519): read fresh per call (an expired one is refreshed first),
+    /// refreshed at most once per refusal episode.
+    lazy var userToken: _OneloUserToken = _OneloUserToken(
+        current: { [weak self] in await self?._accessTokenForFeatures() },
+        refresh: { [weak self] in (try? await self?.refreshSession())??.accessToken }
+    )
+
+    /// In-flight `refreshSession()`, shared by concurrent callers (the scheduled
+    /// refresh, a refused Features token, a manual call). Without it two callers
+    /// present the same rotating refresh token and the second is refused — which
+    /// clears the session and signs the user out.
+    private var _refreshInFlight: Task<OneloSession?, Error>?
     /// Refresh this many seconds before the access token expires.
     private let _refreshLeadTime: TimeInterval = 60
+    /// Consecutive transient refresh failures (offline, a lost response, 429,
+    /// 5xx — incl. `503 refresh_unavailable`). Drives the retry backoff:
+    /// 5 s, 10 s, 20 s, 40 s, then every 60 s. Reset by the next good refresh.
+    private var _refreshRetryAttempt = 0
+    /// Until then no caller starts a refresh on its own — the scheduled retry
+    /// owns it (no hammering /auth/refresh during an outage).
+    private var _refreshBackoffUntil: Date?
     private let _urlSession: URLSession
     #if DEBUG
     private var _skipInitialize: Bool = false
@@ -287,6 +342,8 @@ public final class OneloAuth: ObservableObject {
         static let supabaseAnonKey = "supabase_anon_key"
         static let oauthProviders = "oauth_providers"
         static let checkoutBgColor = "checkout_bg_color"
+        /// #681 — the resolved brand tokens JSON, for the next launch's first paint.
+        static let brandTokens = "brand_tokens"
         /// PKCE verifier for a hosted flow that may OUTLIVE this process.
         ///
         /// Deliberately a separate slot from the in-memory `pkceVerifier`, which
@@ -309,9 +366,16 @@ public final class OneloAuth: ObservableObject {
         static let flowVerifierIssuedAt = "flow_code_verifier_issued_at"
     }
 
-    public init(config: OneloConfig) {
+    public convenience init(config: OneloConfig) {
+        self.init(config: config, storage: OneloSessionStorageFactory.production())
+    }
+
+    /// Designated initializer: `storage` holds the session and launch caches.
+    /// Apps go through `init(config:)` (the Keychain); tests pass an in-memory
+    /// store so they never touch the real Keychain (#732).
+    init(config: OneloConfig, storage: any OneloSessionStorage) {
         self.config = config
-        self.keychain = KeychainStorage()
+        self.keychain = storage
         self._urlSession = .shared
         let ctx = _OneloSecurityContext()
         #if os(macOS)
@@ -333,11 +397,19 @@ public final class OneloAuth: ObservableObject {
         self._eventStream.on("session.revoked") { [weak self] payload in
             Task { @MainActor in self?._handleSessionRevoked(payload) }
         }
+        // #635: this user's grant changed (purchase, switch, refund, pause…).
+        // The backend sends it only to this user's streams, right after the
+        // fresh `features_updated`; re-read the entitlement so
+        // `hasActiveAccess` follows.
+        self._eventStream.on("paywall.access_changed") { [weak self] _ in
+            Task { @MainActor in _ = await self?.revalidateEntitlement() }
+        }
         // A blocking legal version just took effect → bump the revision so
         // OneloAuthView re-checks consent and shows the gate immediately.
         self._eventStream.on("legal.consent_required") { [weak self] _ in
             Task { @MainActor in self?.consentRevision += 1 }
         }
+        self._eventStream.userToken = self.userToken
         OneloAuth.validateCallbackSchemeRegistration(config.callbackScheme)
         // Seed the cached provider list so the loading skeleton draws the right
         // number of social pills on the FIRST paint, before resolveConfig lands.
@@ -349,6 +421,11 @@ public final class OneloAuth: ObservableObject {
         // system-colour flash.
         if let cachedBg = try? keychain.get(forKey: KeychainKeys.checkoutBgColor), !cachedBg.isEmpty {
             pageBackgroundColorHex = cachedBg
+        }
+        // #681 — seed the cached brand tokens for the same first-paint reason.
+        if let cached = try? keychain.get(forKey: KeychainKeys.brandTokens),
+           let t = try? JSONDecoder().decode(OneloBrandTokens.self, from: Data(cached.utf8)) {
+            brandTokens = t
         }
         // #36 — seed `isRestoringSession` SYNCHRONOUSLY here, BEFORE the async
         // `initialize()`/`restoreSession()` Task starts and BEFORE `isReady=true`.
@@ -477,9 +554,9 @@ public final class OneloAuth: ObservableObject {
     }
 
     #if DEBUG
-    init(config: OneloConfig, urlSession: URLSession, skipInitialize: Bool) {
+    init(config: OneloConfig, urlSession: URLSession, skipInitialize: Bool, storage: any OneloSessionStorage) {
         self.config = config
-        self.keychain = KeychainStorage()
+        self.keychain = storage
         self._urlSession = urlSession
         self._skipInitialize = skipInitialize
         let ctx = _OneloSecurityContext()
@@ -490,6 +567,7 @@ public final class OneloAuth: ObservableObject {
         let httpClient = _OneloHTTPClient(publishableKey: config.publishableKey, baseURL: config.apiUrl, securityContext: ctx)
         self._httpClient = httpClient
         self._eventStream = OneloEventStream(httpClient: httpClient)
+        self._eventStream.userToken = self.userToken
     }
     #endif
 
@@ -526,14 +604,29 @@ public final class OneloAuth: ObservableObject {
         return email
     }
 
+    /// The stored user's id, read synchronously from the Keychain (nil when none).
+    /// Lets Features show that user's persisted snapshot on the first paint while
+    /// the session is still being restored (onelo-swift-staging#1).
+    nonisolated func storedUserIdSync() -> String? {
+        guard let json = try? keychain.get(forKey: KeychainKeys.userJson),
+              let data = json.data(using: .utf8),
+              let user = try? JSONDecoder().decode(OneloUser.self, from: data),
+              !user.id.isEmpty
+        else { return nil }
+        return user.id
+    }
+
     /// Synchronous check for a restorable stored session — true iff the Keychain
     /// holds a COMPLETE, decodable session (the same fields `restoreSession()`
-    /// requires). Nonisolated + synchronous, so a view can call it during
+    /// requires), or only a refresh token, which `restoreSession()` turns into a
+    /// session with one refresh (a session migrated from the legacy shared
+    /// Keychain, #740). Nonisolated + synchronous, so a view can call it during
     /// construction to decide, on the FIRST paint, whether a cold start is an
     /// auto-login (paint a branded splash) or a genuine signed-out start (show
     /// the sign-in form). Without this the SDK can't tell the two apart until the
     /// async restore/verify resolves, so it flashes the sign-in skeleton (#36).
     public nonisolated func hasStoredSessionSync() -> Bool {
+        if hasRefreshTokenOnlySync() { return true }
         guard
             (try? keychain.get(forKey: KeychainKeys.accessToken)) != nil,
             (try? keychain.get(forKey: KeychainKeys.refreshToken)) != nil,
@@ -545,6 +638,14 @@ public final class OneloAuth: ObservableObject {
             !user.id.isEmpty
         else { return false }
         return true
+    }
+
+    /// True when the store holds a refresh token and no access token: the shape a
+    /// session migrated from the legacy shared Keychain has (#740). Only the
+    /// refresh token is migrated, so the legacy read can prompt at most once.
+    private nonisolated func hasRefreshTokenOnlySync() -> Bool {
+        (try? keychain.get(forKey: KeychainKeys.accessToken)) == nil
+            && (try? keychain.get(forKey: KeychainKeys.refreshToken)) != nil
     }
 
     /// Convenience: returns true when the current user has an active paid grant for this app.
@@ -582,12 +683,12 @@ public final class OneloAuth: ObservableObject {
         // answer saying "no" for someone who had just paid, locked out by the
         // very refresh meant to let them in. Absent in the response keeps the
         // previous value rather than erasing it (older backend).
-        let allowed = (json["allowed_in"] as? Bool) ?? session.user.allowedIn
-        if ent != session.user.entitlement || allowed != session.user.allowedIn {
-            let updatedUser = OneloUser(
-                id: session.user.id, email: session.user.email, role: session.user.role,
-                tenantId: session.user.tenantId, entitlement: ent, allowedIn: allowed
-            )
+        // #819: allowedIn, emailVerified and accessReason move together.
+        let updatedUser = session.user.mergingAccessAnswer(json, entitlement: ent)
+        if ent != session.user.entitlement
+            || updatedUser.allowedIn != session.user.allowedIn
+            || updatedUser.emailVerified != session.user.emailVerified
+            || updatedUser.accessReason != session.user.accessReason {
             let updated = OneloSession(
                 accessToken: session.accessToken, refreshToken: session.refreshToken,
                 expiresAt: session.expiresAt, user: updatedUser
@@ -714,9 +815,9 @@ public final class OneloAuth: ObservableObject {
             URLQueryItem(name: "key", value: config.publishableKey),
             URLQueryItem(name: "callback_scheme", value: scheme),
             // Binds the resulting code to THIS client. Optional server-side, so an
-            // older backend simply ignores it. Also what makes a magic link
-            // requested from this session same-device only: the hosted page reads
-            // this challenge off the token row and passes it to /magic-link.
+            // older backend simply ignores it. It is also what pairs a magic link
+            // requested from this sheet: opened on another device, the link shows
+            // a code screen and the sign-in completes here (#540/#541).
             URLQueryItem(name: "code_challenge", value: _beginFlowPKCE()),
         ]
         var initRequest = URLRequest(url: components.url!)
@@ -737,90 +838,129 @@ public final class OneloAuth: ObservableObject {
         if let name = initJson["app_name"] as? String { hostedAppName = name }
         if let logoStr = initJson["app_logo_url"] as? String { hostedAppLogoUrl = URL(string: logoStr) }
 
-        // 2. Open hosted page via ASWebAuthenticationSession
-        let callbackUrl: URL = try await withCheckedThrowingContinuation { continuation in
+        // 2. Open hosted page via ASWebAuthenticationSession, parked so that a
+        //    return the OS delivers OUTSIDE the session (a magic link opened in
+        //    Mail on this device → `handleAuthCallback`) settles it too.
+        let hostedReturn = try await _awaitHostedReturn { complete in
             let session = ASWebAuthenticationSession(
                 url: hostedUrl,
                 callbackURLScheme: scheme
             ) { url, error in
-                if let error = error as? ASWebAuthenticationSessionError,
-                   error.code == .canceledLogin {
-                    continuation.resume(throwing: OneloError.cancelled)
-                    return
-                }
-                if let error {
-                    continuation.resume(throwing: OneloError.serverError(error.localizedDescription))
-                    return
-                }
-                guard let url else {
-                    continuation.resume(throwing: OneloError.serverError("No callback URL"))
-                    return
-                }
-                continuation.resume(returning: url)
+                complete(Self._mapAuthSessionCompletion(url: url, error: error))
             }
             session.presentationContextProvider = context
             session.prefersEphemeralWebBrowserSession = false
             session.start()
+            return { session.cancel() }
         }
 
-        // 3. Extract code from callback URL
-        guard
-            let callbackComponents = URLComponents(url: callbackUrl, resolvingAgainstBaseURL: false),
-            let code = callbackComponents.queryItems?.first(where: { $0.name == "code" })?.value
-        else {
-            throw OneloError.serverError("No code in callback URL")
+        switch hostedReturn {
+        case .session(let session):
+            // `handleAuthCallback` already exchanged the code.
+            return session
+        case .callback(let callbackUrl):
+            // 3. Extract code from callback URL
+            guard
+                let callbackComponents = URLComponents(url: callbackUrl, resolvingAgainstBaseURL: false),
+                let code = callbackComponents.queryItems?.first(where: { $0.name == "code" })?.value
+            else {
+                throw OneloError.serverError("No code in callback URL")
+            }
+            // 4. Exchange with the FLOW verifier — the one whose challenge
+            //    /auth/initiate bound above. This used to send `pkceVerifier`
+            //    (the /api/sdk/config pair), which the backend refused with
+            //    "PKCE verification failed" on every return (#541).
+            return try await exchangeHostedCode(code)
+        }
+    }
+
+    /// How a parked hosted sign-in ends: the session's own callback URL, or a
+    /// session `handleAuthCallback` already produced from an OS deep link.
+    enum _HostedSignInReturn {
+        case callback(URL)
+        case session(OneloSession)
+    }
+
+    /// The ASWebAuthenticationSession currently waiting in `presentHostedSignIn`.
+    private var _parkedHostedSignIn: _ParkedHostedSignIn?
+
+    /// Resumes its continuation exactly once. `cancel()` on the session can call
+    /// the completion handler again with `.canceledLogin`; that second call is
+    /// ignored.
+    final class _ParkedHostedSignIn: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<_HostedSignInReturn, Error>?
+        var cancel: (() -> Void)?
+
+        init(_ continuation: CheckedContinuation<_HostedSignInReturn, Error>) {
+            self.continuation = continuation
         }
 
-        // 4. Exchange code for session
-        var exchangeBody: [String: String] = ["code": code, "publishableKey": config.publishableKey]
-        if let verifier = pkceVerifier { exchangeBody["code_verifier"] = verifier }
-        let exchangeUrl = config.apiUrl.appendingPathComponent("/api/sdk/auth/hosted-callback")
-        var request = URLRequest(url: exchangeUrl)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        let exchangeData0 = try JSONSerialization.data(withJSONObject: exchangeBody)
-        request.httpBody = exchangeData0
-        addStandardHeaders(&request)
-        // #38 — hosted-callback is replay-guarded → attach the assertion.
-        await applyAuthAssertion(to: &request, body: exchangeData0)
-
-        let (exchangeData, exchangeResponse) = try await URLSession.shared.data(for: request)
-        guard let exchangeHttp = exchangeResponse as? HTTPURLResponse, exchangeHttp.statusCode == 200 else {
-            let json = (try? JSONSerialization.jsonObject(with: exchangeData)) as? [String: Any] ?? [:]
-            let msg = json["error"] as? String ?? "Code exchange failed"
-            throw OneloError.serverError(msg)
+        /// Returns false when it was already settled.
+        @discardableResult
+        func settle(_ result: Result<_HostedSignInReturn, Error>) -> Bool {
+            lock.lock()
+            let c = continuation
+            continuation = nil
+            lock.unlock()
+            guard let c else { return false }
+            c.resume(with: result)
+            return true
         }
+    }
 
-        let json = (try? JSONSerialization.jsonObject(with: exchangeData)) as? [String: Any] ?? [:]
-        guard
-            let accessToken = json["access_token"] as? String,
-            let refreshToken = json["refresh_token"] as? String,
-            let expiresIn = json["expires_in"] as? Int,
-            let userData = json["user"] as? [String: Any],
-            let userId = userData["id"] as? String
-        else {
-            let msg = json["error"] as? String ?? "Invalid session response"
-            throw OneloError.serverError(msg)
+    /// Park a hosted presentation until it returns. `start` opens the container,
+    /// hands it a completion callback and returns how to dismiss it.
+    ///
+    /// Internal so the park/settle contract can be tested without presenting a
+    /// real ASWebAuthenticationSession.
+    func _awaitHostedReturn(
+        start: (@escaping (Result<URL, Error>) -> Void) -> (() -> Void)
+    ) async throws -> _HostedSignInReturn {
+        // A second presentation replaces the first: its sheet is gone for good.
+        _settleParkedHostedSignIn(.failure(OneloError.cancelled))
+        var mine: _ParkedHostedSignIn?
+        defer {
+            if let mine, _parkedHostedSignIn === mine { _parkedHostedSignIn = nil }
         }
+        return try await withCheckedThrowingContinuation { continuation in
+            let parked = _ParkedHostedSignIn(continuation)
+            mine = parked
+            _parkedHostedSignIn = parked
+            parked.cancel = start { result in
+                parked.settle(result.map { .callback($0) })
+            }
+        }
+    }
 
-        let userEmail = userData["email"] as? String
-        let expiresAt = Date().addingTimeInterval(TimeInterval(expiresIn))
-        let user = OneloUser(
-                id: userId,
-                email: userEmail,
-                role: .member,
-                tenantId: nil,
-                entitlement: OneloEntitlement(rawValue: (userData["entitlement"] as? String) ?? "") ?? .none,
-                // The gate answer arrives with the session it belongs to.
-                allowedIn: userData["allowed_in"] as? Bool
-            )
-        let session = OneloSession(accessToken: accessToken, refreshToken: refreshToken, expiresAt: expiresAt, user: user)
-        try saveSession(session)
-        currentSession = session
-        return session
+    /// Finish the parked hosted presentation, if one is waiting, and dismiss its
+    /// sheet. Returns true when one was waiting.
+    @discardableResult
+    func _settleParkedHostedSignIn(_ result: Result<_HostedSignInReturn, Error>) -> Bool {
+        guard let parked = _parkedHostedSignIn else { return false }
+        _parkedHostedSignIn = nil
+        let settled = parked.settle(result)
+        // After settling, so the `.canceledLogin` this may trigger is ignored.
+        parked.cancel?()
+        return settled
+    }
+
+    /// ASWebAuthenticationSession's completion, as a result. The person closing
+    /// the sheet is `.cancelled` — a clean state they can start again from, not
+    /// an error to show.
+    nonisolated static func _mapAuthSessionCompletion(url: URL?, error: Error?) -> Result<URL, Error> {
+        if let error = error as? ASWebAuthenticationSessionError, error.code == .canceledLogin {
+            return .failure(OneloError.cancelled)
+        }
+        if let error {
+            return .failure(OneloError.serverError(error.localizedDescription))
+        }
+        guard let url else { return .failure(OneloError.serverError("No callback URL")) }
+        return .success(url)
     }
 
     // MARK: - Hosted flow (WKWebView)
+
 
     /// Calls /api/sdk/paywall/store-initiate and returns a tokenized store URL for the WKWebView.
     /// The store page handles plan selection + payment + registration in one flow.
@@ -885,6 +1025,7 @@ public final class OneloAuth: ObservableObject {
         guard let urlStr = json["store_url"] as? String, let url = URL(string: urlStr) else {
             throw OneloError.serverError("Invalid store-initiate response")
         }
+        adoptBrandTokens(fromJSON: json) // #681: store-initiate carries brand_tokens
         if let name = json["app_name"] as? String { hostedAppName = name }
         if let logoStr = json["app_logo_url"] as? String { hostedAppLogoUrl = URL(string: logoStr) }
         return url
@@ -1081,14 +1222,17 @@ public final class OneloAuth: ObservableObject {
         }
     }
 
-    /// Opens the hosted Customer Portal in a WebAuth session. Lets the
-    /// signed-in user manage subscriptions, request refunds (when within
-    /// the app's `refund_window_days`), and view past invoices. Requires
-    /// an active session — throws `OneloError.notAuthenticated` otherwise.
+    /// Mints a hosted Customer Portal URL. The portal lets the signed-in user
+    /// manage subscriptions, request refunds (when within the app's
+    /// `refund_window_days`), and view past invoices. Requires an active
+    /// session — throws `OneloError.notAuthenticated` otherwise.
     ///
     /// Closes when the user taps "Return to app" inside the portal,
     /// which redirects to `<callbackScheme>://callback?source=portal`.
-    public func initiateCustomerPortal() async throws -> URL {
+    ///
+    /// - Parameter intent: `.changePlan` makes the portal open straight into
+    ///   the plan picker (#606).
+    public func initiateCustomerPortal(intent: OneloPortalIntent? = nil) async throws -> URL {
         guard let session = currentSession else {
             throw OneloError.notAuthenticated
         }
@@ -1120,140 +1264,75 @@ public final class OneloAuth: ObservableObject {
         guard let urlStr = json["hosted_url"] as? String, let url = URL(string: urlStr) else {
             throw OneloError.serverError("Invalid portal-initiate response")
         }
+        adoptBrandTokens(fromJSON: json) // #681: portal-initiate carries brand_tokens
         if let name = json["app_name"] as? String { hostedAppName = name }
         if let logoStr = json["app_logo_url"] as? String { hostedAppLogoUrl = URL(string: logoStr) }
-        return url
+        return portalURL(url, intent: intent)
     }
 
-    /// True when the host app is an accessory / menubar / dock-less
-    /// process — `LSUIElement=YES` in Info.plist OR
-    /// `NSApp.activationPolicy() == .accessory`. On such apps,
-    /// `ASWebAuthenticationSession.start()` silently never presents:
-    /// the session callback never fires, the `await` hangs forever,
-    /// no error is thrown. Detected in Turingo dev builds 2026-05-21.
-    /// We use this to fall back to opening the portal in the system
-    /// browser instead. Returns false on iOS / Catalyst.
+    /// Opens the Customer Portal in the SDK's own window (#606) and returns
+    /// when the user closes it: a standalone window on macOS (menu-bar and
+    /// accessory apps included), a sheet over the top-most view controller on
+    /// iOS. No SwiftUI host and no presentation anchor are needed.
+    ///
+    /// The portal renders in the embedded WebView of ``OneloCustomerPortalView``,
+    /// so every hand-back reaches the app: the portal's Done, a hard account
+    /// event (deletion / revoke / compromise clears the session through
+    /// ``handlePortalCallback(_:)``), and a purchase or plan switch made in the
+    /// store the portal opens. When the window closes, the entitlement is
+    /// re-read so ``hasActiveAccess`` reflects a plan bought or changed there.
+    ///
+    /// - Parameter intent: `.changePlan` opens the portal straight into the
+    ///   plan picker; the portal asks the backend where the change goes.
+    ///   Parity with `@onelo/js` `customerPortal.open({ intent: 'change_plan' })`.
+    /// - Throws: `OneloError.notAuthenticated` without a session.
     @MainActor
-    private var isAccessoryApp: Bool {
-        #if canImport(AppKit) && os(macOS)
-        if NSApp.activationPolicy() == .accessory { return true }
-        if let lsui = Bundle.main.object(forInfoDictionaryKey: "LSUIElement") as? Bool, lsui { return true }
-        if let lsui = Bundle.main.object(forInfoDictionaryKey: "LSUIElement") as? String, lsui == "1" || lsui.lowercased() == "true" { return true }
-        return false
-        #else
-        return false
-        #endif
+    public func openCustomerPortal(intent: OneloPortalIntent? = nil) async throws {
+        // Mint before presenting: a signed-out user gets the error, not a window.
+        let url = try await initiateCustomerPortal(intent: intent)
+        await presentInPortalContainer(url)
     }
 
-    /// Convenience wrapper: opens the Customer Portal via
-    /// ASWebAuthenticationSession and returns when the user dismisses.
-    /// On iOS / macOS apps with a deep-link callback scheme this is the
-    /// one-call entry point — call from a button handler.
-    ///
-    /// On macOS *menubar/accessory apps* (LSUIElement=true or
-    /// .accessory activation policy) ASWebAuth never actually presents
-    /// — there's no key window for it to attach to and the session
-    /// silently hangs. This implementation detects that and falls back
-    /// to `NSWorkspace.shared.open(url)` so the buyer at least sees the
-    /// portal in their default browser. Apps that prefer to stay
-    /// in-app should use `OneloCustomerPortalView` (WKWebView embedded
-    /// in a SwiftUI sheet) instead.
-    ///
-    /// IMPORTANT: `context` (`ASWebAuthenticationPresentationContextProviding`)
-    /// is held WEAKLY by the system session. Make sure your provider is
-    /// retained elsewhere — typically a singleton class or a property
-    /// on the view controller that owns the button. An ad-hoc anonymous
-    /// adapter (`{ session in window }`) goes out of scope before
-    /// presentation and the session silently fails to open.
+    /// Opens the Customer Portal. Since 3.93 this presents the SDK's own window
+    /// exactly like ``openCustomerPortal(intent:)``; `context` is no longer
+    /// used. It used ASWebAuthenticationSession, which never received the
+    /// store's hand-back (#606).
+    @available(*, deprecated, renamed: "openCustomerPortal(intent:)", message: "The portal opens in the SDK's own window; no presentation anchor is needed.")
     @MainActor
     public func openCustomerPortal(
-        from context: ASWebAuthenticationPresentationContextProviding
+        from context: ASWebAuthenticationPresentationContextProviding,
+        intent: OneloPortalIntent? = nil
     ) async throws {
-        let url = try await initiateCustomerPortal()
-        // Menubar / accessory apps can't host an ASWebAuth window.
-        // Fall back to system browser — Stripe's deep-link callback
-        // back into the host app's URL scheme still works the same.
-        #if canImport(AppKit) && os(macOS)
-        if isAccessoryApp {
+        try await openCustomerPortal(intent: intent)
+    }
+
+    /// Presents an already-minted hosted URL — a portal, or the store / plan
+    /// switch `/upgrade-initiate` resolved — in the SDK's portal container and
+    /// returns when it closes. Where nothing can be presented (iOS without a
+    /// key window) it falls back to the system browser, whose return deep-link
+    /// ``handlePortalCallback(_:)`` handles. Re-reads the entitlement at the end.
+    @MainActor
+    func presentInPortalContainer(_ url: URL) async {
+        let presented = await OneloPortalPresenter.present(
+            urlProvider: { url },
+            renewProvider: { [weak self] in
+                guard let self else { throw OneloError.notAuthenticated }
+                return try await self.initiateCustomerPortal()
+            },
+            callbackScheme: config.callbackScheme,
+            onPortalCallback: { [weak self] callbackUrl in self?.handlePortalCallback(callbackUrl) },
+            brandTokens: { [weak self] in self?.brandTokens ?? .neutral }
+        )
+        if !presented {
+            print("[Onelo] No window to present the Customer Portal in — opening the system browser.")
+            #if canImport(AppKit) && os(macOS)
             NSWorkspace.shared.open(url)
+            #elseif canImport(UIKit)
+            await UIApplication.shared.open(url)
+            #endif
             return
         }
-        #endif
-        let scheme = config.callbackScheme
-        _ = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<URL?, Error>) in
-            // Resume guard — ASWebAuth doesn't fire its callback when
-            // the session can't present (rare race on macOS that the
-            // explicit accessory-app check above mostly covers, but
-            // also seen on first launch before the app has a key window).
-            // A 30s deadline turns the silent hang into an explicit error
-            // the host app can surface as a retry CTA.
-            //
-            // Atomic single-resume guard. NSLock + Bool because the
-            // callback and the timeout can fire from arbitrary threads
-            // and we need a CAS-style "exchange and tell me the old
-            // value" to make sure only one of them resumes the
-            // continuation.
-            let resumeLock = NSLock()
-            var didResume = false
-            let exchange: () -> Bool = {
-                resumeLock.lock()
-                defer { resumeLock.unlock() }
-                if didResume { return true }
-                didResume = true
-                return false
-            }
-            let timeoutDeadline = DispatchTime.now() + .seconds(30)
-            let session = ASWebAuthenticationSession(
-                url: url,
-                callbackURLScheme: scheme
-            ) { [weak self] callbackUrl, error in
-                guard exchange() == false else { return }
-                if let error = error as? ASWebAuthenticationSessionError,
-                   error.code == .canceledLogin {
-                    continuation.resume(returning: nil)
-                    return
-                }
-                if let error {
-                    continuation.resume(throwing: OneloError.serverError(error.localizedDescription))
-                    return
-                }
-
-                // 2026-05-26: portal can signal account-lifecycle events
-                // via deep-link query params. When the buyer schedules
-                // account deletion, the portal redirects to
-                // `<scheme>://callback?source=portal&event=account_deletion_scheduled`
-                // — route it through the shared handlePortalCallback so we
-                // clear the local session INSTANTLY instead of waiting up to
-                // 13 min for the heartbeat to pick up app_sessions.revoked_at
-                // via 401. Same code path as the external-browser and embedded
-                // portal presentations, so all three behave identically.
-                if let callbackUrl {
-                    Task { @MainActor [weak self] in
-                        self?.handlePortalCallback(callbackUrl)
-                    }
-                }
-
-                continuation.resume(returning: callbackUrl)
-            }
-            session.presentationContextProvider = context
-            // Non-ephemeral on purpose. On macOS, ephemeral WebAuth
-            // sessions detach into a separate system-managed window
-            // outside the app's window manager — buyers see "browser
-            // opens on another screen and nothing happens" because the
-            // portal page is loading there, not inline with the app
-            // (regression observed 2026-05-21). The portal page itself
-            // already short-circuits replay via single-use prt_* tokens
-            // (deleted after refund, 10-min TTL), so persistent
-            // Safari cookies don't add meaningful risk.
-            session.prefersEphemeralWebBrowserSession = false
-            session.start()
-
-            DispatchQueue.main.asyncAfter(deadline: timeoutDeadline) {
-                guard exchange() == false else { return }
-                session.cancel()
-                continuation.resume(throwing: OneloError.timeout("Customer portal didn't open in 30s — accessory apps may need openCustomerPortalInBrowser() or OneloCustomerPortalView."))
-            }
-        }
+        _ = await revalidateEntitlement()
     }
 
     /// Opens the hosted Customer Portal in the user's default browser
@@ -1261,14 +1340,12 @@ public final class OneloAuth: ObservableObject {
     /// (iOS). No ASWebAuthenticationSession, no presentation context,
     /// no SwiftUI host required — just hands the URL off to the OS.
     ///
-    /// Designed for accessory / menubar / dock-less apps where ASWebAuth
-    /// can't attach to a key window and silently hangs (see
-    /// `openCustomerPortal(from:)` notes). Stripe's deep-link callback
-    /// back into the host app via the registered URL scheme works
-    /// identically to the embedded path.
+    /// Prefer ``openCustomerPortal(intent:)``: a browser tab cannot hand a
+    /// finished purchase or plan switch back to the app. Wire
+    /// ``handlePortalCallback(_:)`` to your URL handler when you use this.
     @MainActor
-    public func openCustomerPortalInBrowser() async throws {
-        let url = try await initiateCustomerPortal()
+    public func openCustomerPortalInBrowser(intent: OneloPortalIntent? = nil) async throws {
+        let url = try await initiateCustomerPortal(intent: intent)
         #if canImport(AppKit) && os(macOS)
         NSWorkspace.shared.open(url)
         #elseif canImport(UIKit)
@@ -1297,19 +1374,34 @@ public final class OneloAuth: ObservableObject {
     /// the server-side revocation via a 401. Returns true when the URL was a
     /// portal callback (`source=portal`), false otherwise. Never throws.
     ///
-    /// The in-app paths — `openCustomerPortal(from:)` and
+    /// The in-app paths — `openCustomerPortal(intent:)` and
     /// `OneloCustomerPortalView` — route through this same method, so all three
     /// presentation styles behave identically. Mirrors the Electron SDK's
     /// `customerPortal.handlePortalCallback(url)`.
     @MainActor
     @discardableResult
     public func handlePortalCallback(_ url: URL) -> Bool {
-        guard
-            let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
-            comps.queryItems?.first(where: { $0.name == "source" })?.value == "portal"
-        else { return false }
-        applyPortalEvent(comps.queryItems?.first(where: { $0.name == "event" })?.value)
+        // The one Store Hand-back decoder (#615).
+        guard let hb = classifyHandBack(url) else { return false }
+        if case .portalClosed(let event) = hb {
+            applyPortalEvent(event)
+            return true
+        }
+        // A purchase or plan switch finished in the store the portal opened:
+        // reconcile the plan now, not when the stream catches up (#659). No
+        // code exchange — the buyer is already signed in.
+        guard let change = OneloPlanChange(hb) else { return false }
+        reportPlanChange(change)
         return true
+    }
+
+    /// Set by `Onelo` to its plan-change refresher (#659).
+    var planChangeHandler: ((OneloPlanChange) -> Void)?
+
+    /// A hosted container finished a purchase or a plan switch. Internal: the
+    /// SDK's own containers call it; `Onelo` reconciles features + entitlement.
+    func reportPlanChange(_ change: OneloPlanChange) {
+        planChangeHandler?(change)
     }
 
     /// Clear the local session on a hard portal event: wipe the keychain, drop
@@ -1346,11 +1438,13 @@ public final class OneloAuth: ObservableObject {
         addStandardHeaders(&request)
         // #38 — hosted-callback is replay-guarded → attach the assertion.
         await applyAuthAssertion(to: &request, body: bodyData)
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await _urlSession.data(for: request)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            // One attempt, no retry. The verifier stays stored: the backend checks
+            // PKCE before it spends the code, so the link is still usable after a
+            // "code_verifier required" / "PKCE verification failed" refusal.
             let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
-            let msg = json["error"] as? String ?? "Code exchange failed"
-            throw OneloError.serverError(msg)
+            throw OneloError.serverError(Self._exchangeFailureMessage(json))
         }
         let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
         guard
@@ -1363,15 +1457,9 @@ public final class OneloAuth: ObservableObject {
             let msg = json["error"] as? String ?? "Invalid session response"
             throw OneloError.serverError(msg)
         }
-        let userEmail = userData["email"] as? String
         let expiresAt = Date().addingTimeInterval(TimeInterval(expiresIn))
-        let user = OneloUser(
-                id: userId,
-                email: userEmail,
-                role: .member,
-                tenantId: nil,
-                entitlement: OneloEntitlement(rawValue: (userData["entitlement"] as? String) ?? "") ?? .none
-            )
+        // The gate answer arrives with the session it belongs to.
+        let user = OneloUser.fromWire(userData, id: userId)
         let session = OneloSession(accessToken: accessToken, refreshToken: refreshToken, expiresAt: expiresAt, user: user)
         try saveSession(session)
         currentSession = session
@@ -1379,7 +1467,20 @@ public final class OneloAuth: ObservableObject {
         // next one's challenge. Left behind it would be offered to that flow and
         // rejected, turning a fresh sign-in into an unexplained failure.
         _clearFlowPKCE()
+        // A hosted flow can chain sign-in → store, so a code may carry a
+        // purchase: reconcile the plan at once (#659). A plain sign-in costs
+        // one extra resolve.
+        reportPlanChange(.purchase)
         return session
+    }
+
+    /// The backend's reason for a refused exchange. FastAPI puts it in `detail`
+    /// ("code_verifier required", "PKCE verification failed", "Code already
+    /// used"); older handlers used `error`.
+    nonisolated static func _exchangeFailureMessage(_ json: [String: Any]) -> String {
+        let reason = (json["detail"] as? String) ?? (json["error"] as? String)
+        guard let reason, !reason.isEmpty else { return "Code exchange failed" }
+        return "Code exchange failed: \(reason)"
     }
 
     /// Record the origin serving this app's hosted surfaces, as told by the
@@ -1436,6 +1537,9 @@ public final class OneloAuth: ObservableObject {
     /// Safe on a cold start: it waits for session restoration to settle before
     /// exchanging, because a link can relaunch a killed process and the verifier
     /// it needs is read back from the Keychain.
+    ///
+    /// When `presentHostedSignIn` is waiting on its sheet, a successful exchange
+    /// here also finishes that call with the same session and closes the sheet.
     @MainActor
     @discardableResult
     public func handleAuthCallback(_ url: URL) async throws -> OneloSession? {
@@ -1471,6 +1575,13 @@ public final class OneloAuth: ObservableObject {
             return nil
         }
 
+        // A store finished in the SYSTEM BROWSER with a plan switch and no
+        // code: nothing to exchange, but the plan moved (#659).
+        if case .switched(let reason)? = classifyHandBack(url) {
+            reportPlanChange(.switched(reason: reason))
+            return nil
+        }
+
         guard
             let code = items.first(where: { $0.name == "code" })?.value,
             !code.isEmpty
@@ -1490,7 +1601,13 @@ public final class OneloAuth: ObservableObject {
         // now would race the restore and could publish a session that the restore
         // then overwrites; waiting costs nothing on a warm app (already ready).
         try? await awaitReady()
-        return try await exchangeHostedCode(code)
+        let session = try await exchangeHostedCode(code)
+        // A same-device return arrives here, OUTSIDE a waiting
+        // `presentHostedSignIn` sheet; finish that sheet with this session. A
+        // failed exchange leaves the sheet open: the hosted page there can still
+        // resend the link or finish another way.
+        _settleParkedHostedSignIn(.success(.session(session)))
+        return session
     }
 
     /// Sign in — goes through Onelo backend to track last_seen_at and validate app access.
@@ -1540,15 +1657,10 @@ public final class OneloAuth: ObservableObject {
         }
         pkceVerifier = nil
 
-        let userEmail = userData["email"] as? String
         let expiresAt = Date().addingTimeInterval(TimeInterval(expiresIn))
-        let user = OneloUser(
-                id: userId,
-                email: userEmail,
-                role: .member,
-                tenantId: nil,
-                entitlement: OneloEntitlement(rawValue: (userData["entitlement"] as? String) ?? "") ?? .none
-            )
+        // #819: the access answer (allowed_in / email_verified / access_reason)
+        // travels with the user — dropping it fell back to the local rule.
+        let user = OneloUser.fromWire(userData, id: userId)
         let session = OneloSession(accessToken: accessToken, refreshToken: refreshToken, expiresAt: expiresAt, user: user)
         try saveSession(session)
         currentSession = session
@@ -1557,14 +1669,28 @@ public final class OneloAuth: ObservableObject {
 
     /// Sign up — registers via Onelo backend so the user is tracked in app_users.
     /// Returns `true` if email verification is required.
+    ///
+    /// `marketingConsent` (#818): the person ticked the Marketing Consent
+    /// checkbox your screen showed with `signupMarketingConsent.text`. Never
+    /// pre-tick it; sent only when true.
     public func signUp(email: String, password: String) async throws -> Bool {
+        try await signUp(email: email, password: password, marketingConsent: false)
+    }
+
+    /// Sign up with the person's Marketing Consent choice (#818). See
+    /// `signUp(email:password:)` and `signupMarketingConsent`.
+    public func signUp(email: String, password: String, marketingConsent: Bool) async throws -> Bool {
         isLoading = true
         defer { isLoading = false }
 
-        return try await _signUpAttempt(email: email, password: password, isRetry: false)
+        return try await _signUpAttempt(
+            email: email, password: password, marketingConsent: marketingConsent, isRetry: false
+        )
     }
 
-    private func _signUpAttempt(email: String, password: String, isRetry: Bool) async throws -> Bool {
+    private func _signUpAttempt(
+        email: String, password: String, marketingConsent: Bool, isRetry: Bool
+    ) async throws -> Bool {
         if !isRetry { await _awaitAttestReady() }  // #25: gated POST — wait for the attest token (retry already has it)
         if pkceVerifier == nil {
             guard !isRetry else { throw OneloError.serverError("SDK not ready — call after isReady") }
@@ -1574,12 +1700,17 @@ public final class OneloAuth: ObservableObject {
             throw OneloError.serverError("SDK not ready — call after isReady")
         }
 
-        let body: [String: String] = [
+        var body: [String: Any] = [
             "email": email,
             "password": password,
             "publishableKey": config.publishableKey,
             "code_verifier": verifier,
         ]
+        if marketingConsent {
+            // #818: in the language of the text the screen showed.
+            body["marketing_consent"] = true
+            body["lang"] = signupMarketingConsent.language ?? OneloSignupMarketingConsent.deviceLanguage
+        }
 
         let json: [String: Any]
         do {
@@ -1587,7 +1718,9 @@ public final class OneloAuth: ObservableObject {
         } catch OneloError.serverError(let msg) where msg.contains("PKCE") && !isRetry {
             pkceVerifier = nil
             try await refreshPKCE()
-            return try await _signUpAttempt(email: email, password: password, isRetry: true)
+            return try await _signUpAttempt(
+                email: email, password: password, marketingConsent: marketingConsent, isRetry: true
+            )
         }
 
         if let errMsg = json["error"] as? String {
@@ -1601,15 +1734,9 @@ public final class OneloAuth: ObservableObject {
            let expiresIn = sessionData["expires_in"] as? Int,
            let userData = json["user"] as? [String: Any],
            let userId = userData["id"] as? String {
-            let userEmail = userData["email"] as? String
             let expiresAt = Date().addingTimeInterval(TimeInterval(expiresIn))
-            let user = OneloUser(
-                id: userId,
-                email: userEmail,
-                role: .member,
-                tenantId: nil,
-                entitlement: OneloEntitlement(rawValue: (userData["entitlement"] as? String) ?? "") ?? .none
-            )
+            // #819: same as sign-in — the access answer travels with the user.
+            let user = OneloUser.fromWire(userData, id: userId)
             let session = OneloSession(accessToken: accessToken, refreshToken: refreshToken, expiresAt: expiresAt, user: user)
             try saveSession(session)
             currentSession = session
@@ -1647,6 +1774,8 @@ public final class OneloAuth: ObservableObject {
         #endif
         _refreshTask?.cancel()
         _refreshTask = nil
+        _refreshRetryAttempt = 0
+        _refreshBackoffUntil = nil
         try? keychain.clear()
         currentSession = nil
         pkceVerifier = nil
@@ -1675,6 +1804,71 @@ public final class OneloAuth: ObservableObject {
         #endif
     }
 
+    /// Send the signed-in user a fresh Email Verification link (#819).
+    ///
+    /// Only for apps with their own screen: when the parent App requires Email
+    /// Verification, the hosted flow (`OneloAuthView`) already shows "check your
+    /// inbox" with a resend button and hands the session back by itself. The
+    /// previous link stops working; at most 3 e-mails an hour
+    /// (`.verificationRateLimited`). Throws `.emailVerificationOff` when the App
+    /// has Email verification Off.
+    ///
+    /// `redirectTo` — your own landing (an allowed web origin, or
+    /// `<your-scheme>://…`); the link then carries `onelo_verify_token` for
+    /// `confirmEmail(token:)`. `nil` opens Onelo's hosted page.
+    @discardableResult
+    public func resendVerificationEmail(redirectTo: String? = nil) async throws -> OneloVerificationResend {
+        guard let session = currentSession else { throw OneloError.notAuthenticated }
+        var body: [String: Any] = ["publishableKey": config.publishableKey]
+        if let redirectTo { body["verify_redirect_to"] = redirectTo }
+        let (status, json) = try await _postVerification(
+            "/api/sdk/auth/verify-email/resend", body: body, bearer: session.accessToken
+        )
+        guard status == 200 else { throw verificationError(status: status, json: json) }
+        return OneloVerificationResend(
+            sent: json["sent"] as? Bool ?? false,
+            emailVerified: json["email_verified"] as? Bool ?? false
+        )
+    }
+
+    /// Confirm the user's address with the `onelo_verify_token` your own landing
+    /// received from the verification link (#819). Single use. When a session
+    /// is signed in on this device it is refreshed, so `isAllowedIn` opens the
+    /// app without waiting — never by re-reading `/api/sdk/auth/user`, which
+    /// caches its answer per token for 30 s.
+    public func confirmEmail(token: String) async throws {
+        let (status, json) = try await _postVerification(
+            "/api/sdk/auth/verify-email/confirm",
+            body: ["publishableKey": config.publishableKey, "token": token],
+            bearer: nil
+        )
+        guard status == 200 else { throw verificationError(status: status, json: json) }
+        if currentSession != nil {
+            do {
+                _ = try await refreshSession()
+            } catch {
+                // The address IS confirmed; the next scheduled refresh or
+                // foreground revalidation carries the new answer.
+                _authLog.warning("confirmEmail: session refresh after confirming failed: \(error.localizedDescription, privacy: .public)")
+            }
+        }
+    }
+
+    private func _postVerification(
+        _ path: String, body: [String: Any], bearer: String?
+    ) async throws -> (Int, [String: Any]) {
+        var request = URLRequest(url: config.apiUrl.appendingPathComponent(path))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let bearer { request.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization") }
+        addStandardHeaders(&request)
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (data, response) = try await _urlSession.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw OneloError.invalidResponse }
+        let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        return (http.statusCode, json)
+    }
+
     public func resetPassword(email: String, redirectTo: URL? = nil) async throws {
         let client = try requireClient()
         try await client.resetPasswordForEmail(email, redirectTo: redirectTo)
@@ -1686,7 +1880,42 @@ public final class OneloAuth: ObservableObject {
     }
 
     /// Refreshes the session via Onelo backend — validates ban status and app membership.
+    ///
+    /// Single-flight: concurrent callers share one `/auth/refresh`, so a rotating
+    /// refresh token is never presented twice.
     public func refreshSession() async throws -> OneloSession? {
+        if let running = _refreshInFlight { return try await running.value }
+        let task = Task { @MainActor in try await self._refreshOnce() }
+        _refreshInFlight = task
+        defer { if _refreshInFlight == task { _refreshInFlight = nil } }
+        return try await task.value
+    }
+
+    /// The signed-in user's access token for a Features call, or nil when no
+    /// Onelo user is signed in. A token at (or within 30 s of) expiry is
+    /// refreshed first, so an expired one is not sent when a fresh one can be had.
+    func _accessTokenForFeatures() async -> String? {
+        guard let session = currentSession else { return nil }
+        if session.expiresAt.timeIntervalSinceNow < 30, !_inRefreshBackoff {
+            _ = try? await refreshSession()
+        }
+        return currentSession?.accessToken
+    }
+
+    private func _refreshOnce() async throws -> OneloSession? {
+        #if DEBUG
+        if let override = _refreshOverrideForTesting { return try await override() }
+        #endif
+        return try await _performRefreshSession()
+    }
+
+    #if DEBUG
+    /// Test seam: replaces the `/auth/refresh` round trip (which reads the
+    /// Keychain) so the single-flight wrapper around it can be tested.
+    var _refreshOverrideForTesting: (@MainActor () async throws -> OneloSession?)?
+    #endif
+
+    private func _performRefreshSession() async throws -> OneloSession? {
         let epoch = _signOutEpoch
         guard let refreshToken = try keychain.get(forKey: KeychainKeys.refreshToken) else { return nil }
 
@@ -1700,7 +1929,17 @@ public final class OneloAuth: ObservableObject {
         ])
         addStandardHeaders(&request)
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await URLSession.shared.data(for: request)
+        } catch {
+            // Offline, or the response was lost after the server rotated the
+            // token. Keep the session; the retry re-reads the Keychain and lands
+            // inside the server's 30 s grace window.
+            if epoch == _signOutEpoch { _scheduleRefreshRetry() }
+            throw error
+        }
         // A signOut() landed while this refresh was in flight — abandon it.
         // Don't re-save tokens or republish the session; the user is signed out.
         guard epoch == _signOutEpoch else { return nil }
@@ -1710,25 +1949,23 @@ public final class OneloAuth: ObservableObject {
 
         let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
 
-        if http.statusCode == 403 {
-            // Account deleted or suspended — treat as a hard revocation
-            let detail = json["detail"] as? String ?? ""
-            let isRevocation = detail.contains("account_deleted")
-                || detail.contains("account_suspended")
-                || detail.contains("account_payment_failed")
-            if isRevocation {
-                try? keychain.clear()
-                currentSession = nil
-                isUserRevoked = true
-                return nil
-            }
+        if http.statusCode == 429 || http.statusCode >= 500 {
+            // Transient — incl. 503 `refresh_unavailable`: the server could not
+            // record the rotation and the presented token is STILL VALID. Never
+            // clear the session for it; retry with backoff (#547/#548).
+            _scheduleRefreshRetry()
+            throw OneloError.networkError("Session refresh is temporarily unavailable (HTTP \(http.statusCode))")
         }
 
         if http.statusCode >= 400 {
-            let msg = json["error"] as? String ?? json["detail"] as? String ?? "HTTP \(http.statusCode)"
-            try keychain.clear()
+            // The session is over whatever the reason — clear it, then say WHY
+            // with the right words: only a ban is "suspended"; a replaced,
+            // expired or unknown session is a neutral "session ended" (#548).
+            let refusal = refreshRefusalError(status: http.statusCode, json: json)
+            try? keychain.clear()
             currentSession = nil
-            throw OneloError.serverError(msg)
+            if case .userRevoked = refusal { isUserRevoked = true }
+            throw refusal
         }
 
         if let errMsg = json["error"] as? String {
@@ -1751,28 +1988,53 @@ public final class OneloAuth: ObservableObject {
         let refreshedUser: OneloUser = {
             if let userData = json["user"] as? [String: Any],
                let userId = userData["id"] as? String {
-                let userEmail = userData["email"] as? String
-                let ent = OneloEntitlement(rawValue: (userData["entitlement"] as? String) ?? "") ?? .none
                 // Carried on every refresh for the same reason it is carried on
                 // sign-in: the gate answer must never go stale while the session
                 // lives on. Absent → nil → the legacy fallback, not a refusal.
-                let allowed = userData["allowed_in"] as? Bool
-                return OneloUser(
-                    id: userId, email: userEmail, role: .member, tenantId: nil,
-                    entitlement: ent, allowedIn: allowed
-                )
+                return OneloUser.fromWire(userData, id: userId)
             }
             return currentSession?.user ?? OneloUser(id: "", email: nil, role: .member, tenantId: nil)
         }()
         let expiresAt = Date().addingTimeInterval(TimeInterval(expiresIn))
         let session = OneloSession(accessToken: accessToken, refreshToken: newRefreshToken, expiresAt: expiresAt, user: refreshedUser)
         try saveSession(session)
+        // #740 — the server accepted the stored token: a session migrated from
+        // the legacy shared Keychain is this app's, so the legacy copy can go.
+        keychain.sessionRefreshSucceeded(refreshToken: refreshToken)
+        _refreshRetryAttempt = 0
+        _refreshBackoffUntil = nil
         currentSession = session
         return session
     }
 
+    private var _inRefreshBackoff: Bool {
+        guard let until = _refreshBackoffUntil else { return false }
+        return until > Date()
+    }
+
+    /// Delay before the retry after `attempt` consecutive transient failures.
+    static func refreshRetryDelay(attempt: Int) -> TimeInterval {
+        min(5 * pow(2, Double(attempt)), 60)
+    }
+
+    /// Re-arm the refresh after a transient failure, with backoff.
+    private func _scheduleRefreshRetry() {
+        let delay = OneloAuth.refreshRetryDelay(attempt: _refreshRetryAttempt)
+        _refreshRetryAttempt += 1
+        _refreshBackoffUntil = Date().addingTimeInterval(delay)
+        _refreshTask?.cancel()
+        _refreshTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            guard !Task.isCancelled, let self else { return }
+            self._refreshBackoffUntil = nil
+            _ = try? await self.refreshSession()
+        }
+    }
+
     private func refreshPKCE() async throws {
         let resolved = try await resolveConfig()
+        // #818: the same fetch answers the sign-up question; keep it current.
+        signupMarketingConsent = resolved.signupMarketingConsent
         let authURL = URL(string: resolved.supabaseUrl)!.appendingPathComponent("/auth/v1")
         client = AuthClient(
             url: authURL,
@@ -1828,17 +2090,24 @@ public final class OneloAuth: ObservableObject {
             // the already-populated hex when it flips ready. Keep this assignment
             // above the `isReady = true` line.
             pageBackgroundColorHex = resolved.checkoutBgColor
+            brandPrimaryColorHex = resolved.primaryColor
+            brandTokens = resolved.brandTokens
             waitlistMode = resolved.waitlistMode
             if let urlStr = resolved.sdkRedirectUrl { sdkRedirectUrl = URL(string: urlStr) }
             if let urlStr = resolved.storeUrl { storeUrl = URL(string: urlStr) }
             if let urlStr = resolved.manageUrl { manageUrl = URL(string: urlStr) }
             oauthProviders = resolved.oauthProviders
+            signupMarketingConsent = resolved.signupMarketingConsent
             // Cache so the loading skeleton can draw the right social-pill count on
             // the NEXT launch's first paint, before this resolveConfig completes.
             try? keychain.set(oauthProviders.joined(separator: ","), forKey: KeychainKeys.oauthProviders)
             // #26 — cache the branding background for the NEXT launch's first paint.
             if let bg = resolved.checkoutBgColor, !bg.isEmpty {
                 try? keychain.set(bg, forKey: KeychainKeys.checkoutBgColor)
+            }
+            // #681 — and the resolved tokens alongside it.
+            if let json = try? JSONEncoder().encode(resolved.brandTokens), let s = String(data: json, encoding: .utf8) {
+                try? keychain.set(s, forKey: KeychainKeys.brandTokens)
             }
 
             try? keychain.set(resolved.supabaseUrl, forKey: KeychainKeys.supabaseUrl)
@@ -1877,6 +2146,11 @@ public final class OneloAuth: ObservableObject {
             try? keychain.clear()
             currentSession = nil
             isRevoked = true
+            // #732 — the stored session was just cleared, so no restore can
+            // follow: end it. Otherwise `isRestoringSession` stays true for the
+            // whole launch and Features wait for an identity that never comes;
+            // ending it loads the signed-out identity.
+            isRestoringSession = false
         } catch {
             // Network offline or transient error — fall back to cached config so
             // the user can still use a valid existing session.
@@ -1891,6 +2165,11 @@ public final class OneloAuth: ObservableObject {
                 isReady = true
                 if allowRestore { await restoreSession() }
             else { isRestoringSession = false }  // #36 — no restore → don't leave the splash stuck on
+            } else {
+                // #740 — no cached config (a migrated session has only its
+                // refresh token), so no restore can run this launch: end it
+                // rather than leave Features waiting for an identity.
+                isRestoringSession = false
             }
         }
     }
@@ -1908,6 +2187,8 @@ public final class OneloAuth: ObservableObject {
         components.queryItems = [
             URLQueryItem(name: "key", value: config.publishableKey),
             URLQueryItem(name: "code_challenge", value: challenge),
+            // #818: the sign-up Marketing Consent text in the device language.
+            URLQueryItem(name: "lang", value: OneloSignupMarketingConsent.deviceLanguage),
         ]
 
         var configRequest = URLRequest(url: components.url!)
@@ -1942,8 +2223,11 @@ public final class OneloAuth: ObservableObject {
     }
 
     /// Adds standard SDK headers (X-Publishable-Key, X-Bundle-Id, X-Attest-Token,
-    /// X-Codesign-Fingerprint on macOS, X-Onelo-Instance-Id) to a request.
+    /// X-Codesign-Fingerprint on macOS, X-Onelo-Instance-Id) to a request, plus
+    /// the SDK's own identity (`User-Agent`, `X-SDK-Version`, `X-Onelo-Sdk-Name`;
+    /// #122) — these are the requests the dashboard's version capture reads.
     private func addStandardHeaders(_ request: inout URLRequest) {
+        _OneloSdkIdentity.apply(to: &request)
         request.setValue(config.publishableKey, forHTTPHeaderField: "X-Publishable-Key")
         request.setValue(OneloInstanceId.current(), forHTTPHeaderField: "X-Onelo-Instance-Id")
         if let bundleId = Bundle.main.bundleIdentifier {
@@ -2111,6 +2395,14 @@ public final class OneloAuth: ObservableObject {
         isRestoringSession = hasStoredSessionSync()
         defer { isRestoringSession = false }
         let epoch = _signOutEpoch
+        // #740 — a session migrated from the legacy shared Keychain is only its
+        // refresh token. One refresh turns it into a full session (saved, and
+        // published as `currentSession`) and proves it is this app's: the
+        // backend refuses another app's token, and the refusal clears it.
+        if hasRefreshTokenOnlySync() {
+            _ = try? await refreshSession()
+            return
+        }
         guard
             let accessToken = try? keychain.get(forKey: KeychainKeys.accessToken),
             let refreshToken = try? keychain.get(forKey: KeychainKeys.refreshToken),
@@ -2317,7 +2609,7 @@ public final class OneloAuth: ObservableObject {
         for (k, v) in headers { request.setValue(v, forHTTPHeaderField: k) }
     }
 
-    private func backendPost(path: String, body: [String: String]) async throws -> [String: Any] {
+    private func backendPost(path: String, body: [String: Any]) async throws -> [String: Any] {
         let url = config.apiUrl.appendingPathComponent(path)
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -2365,8 +2657,9 @@ public final class OneloAuth: ObservableObject {
     /// Initializer for unit tests. Sets `_skipInitialize` before the enqueued Task runs,
     /// preventing `initialize()` from making network calls or mutating state.
     /// Tests control session state directly via `_injectSessionForTesting` / `_clearSessionForTesting`.
-    convenience init(_testingConfig config: OneloConfig) {
-        self.init(config: config)
+    /// `storage` is required: a test must never fall back to the real Keychain (#732).
+    convenience init(_testingConfig config: OneloConfig, storage: any OneloSessionStorage) {
+        self.init(config: config, storage: storage)
         _skipInitialize = true
     }
 

@@ -50,6 +50,20 @@ func closingMeansSignOut(_ url: URL?) -> Bool {
     return items.first(where: { $0.name == "exit" })?.value == "signout"
 }
 
+/// Before restarting on a spent addressing token, must the local session go?
+///
+/// Only when the user chose to leave: the ✕ and "Use a different account"
+/// report `invalid_token` (or the page's `onelo:session_expired`) after signing
+/// out server-side, and on an `exit=signout` surface re-resolving with the old
+/// session would reopen the same screen. A link that merely DIED
+/// (`token_expired`, #619 — the access-gate store outlived its link) is not a
+/// choice to leave: the user stays signed in and the restart brings the same
+/// store back on a fresh link. Mirrors `signOutBeforeRestart` in the JS SDK.
+func signOutBeforeRestart(_ reason: String?, _ url: URL?) -> Bool {
+    if reason == "token_expired" || reason == "expired_token" { return false }
+    return closingMeansSignOut(url)
+}
+
 /// Skeleton variant to show during a WebView navigation transition.
 /// `.auth` covers re-loads of the hosted sign-in page (e.g. after a
 /// session-expired redirect). `.store` covers Sign-Up → /store/hosted
@@ -218,6 +232,12 @@ public struct OneloAuthView<Content: View>: View {
     /// just-settled exchange), not on every emission. See that handler for why
     /// this recovers the external-browser payment-return failure path.
     @State private var wasExchanging: Bool = false
+    /// A social sign-in came back from the provider's system sheet and its
+    /// code is being exchanged (#666). Covers the hosted page with "Signing you
+    /// in…": the page never learns the provider finished, so without the cover
+    /// the idle form sat on screen for the whole round trip and read as a
+    /// failed sign-in. Cleared when `handleCode` settles.
+    @State private var isCompletingNativeSignIn: Bool = false
     /// Drives a full-bounds skeleton overlay rendered ON TOP of the
     /// WKWebView during any post-first-load navigation. Today this covers
     /// the Sign Up flow (auth page → /store/hosted) where the host window
@@ -250,17 +270,23 @@ public struct OneloAuthView<Content: View>: View {
     /// re-render). Seeded from OneloAuth's cached value for a correct first paint.
     @State private var oauthProviderCount: Int = 0
 
-    private var effectiveConfig: OneloAuthConfig {
-        // #26 — paint the branding page background (checkout_bg_color) so the
-        // pre-auth / loading frame matches the hosted page instead of flashing a
-        // system colour. Falls back to the developer's config (default
-        // .systemBackground) until config resolves or if the value is malformed.
-        guard let hex = (auth as? OneloAuth)?.pageBackgroundColorHex,
-              let color = Color(oneloHex: hex) else { return requestedConfig }
-        var c = requestedConfig
-        c.backgroundColor = color
-        return c
+    /// The app's brand tokens (#681) — `OneloAuth.brandTokens` (config, cached
+    /// for the first paint), neutral for a non-OneloAuth protocol conformer.
+    private var brandTokens: OneloBrandTokens {
+        (auth as? OneloAuth)?.brandTokens ?? .neutral
     }
+
+    private var brandPalette: OneloBrandPalette { OneloBrandPalette(brandTokens) }
+
+    /// The developer's config resolved against the brand tokens (#681): an
+    /// explicit override wins, `nil` takes the token.
+    private var effectiveConfig: OneloAuthStyle {
+        OneloAuthStyle(config: requestedConfig, tokens: brandTokens)
+    }
+
+    /// Legible text on the branding background the "Signing you in…" cover
+    /// sits on (#666): the token's muted text colour (#681).
+    private var signingInForeground: Color { brandPalette.textMuted }
 
     /// True once sign-in (and any paywall) is satisfied — the point at which a
     /// blocking legal consent must be resolved before `content()` is shown.
@@ -320,7 +346,7 @@ public struct OneloAuthView<Content: View>: View {
                         callbackScheme: callbackScheme,
                         onCode: { _ in },
                         onError: { _ in /* keep the gate up; user can retry */ },
-                        onSessionExpired: {
+                        onSessionExpired: { _ in
                             Task { await loadHostedUrl() }
                         },
                         onConsent: { action in
@@ -368,11 +394,11 @@ public struct OneloAuthView<Content: View>: View {
                             errorMessage = err
                             showRetry = true
                         },
-                        onSessionExpired: {
+                        onSessionExpired: { reason in
                             // Capture BEFORE clearing: the marker lives on the URL
                             // we are leaving, and `hostedUrl` is nil by the time
-                            // the task runs.
-                            let wasSignOutSurface = closingMeansSignOut(hostedUrl)
+                            // the task runs. A dead link (#619) keeps the session.
+                            let wasSignOutSurface = signOutBeforeRestart(reason, hostedUrl)
                             hostedUrl = nil
                             Task {
                                 if wasSignOutSurface, let oneloAuth = auth as? OneloAuth {
@@ -408,6 +434,21 @@ public struct OneloAuthView<Content: View>: View {
                                     isNavigating = false
                                 }
                             }
+                        },
+                        onStoreDone: { reason in
+                            // Plan switch with no checkout (#599): nothing to
+                            // exchange and no sign-out — re-resolve, which now
+                            // answers with the app for this signed-in user, and
+                            // reconcile the plan at once (#659).
+                            (auth as? OneloAuth)?.reportPlanChange(.switched(reason: reason))
+                            hostedUrl = nil
+                            Task { await loadHostedUrl() }
+                        },
+                        onNativeCode: { code in
+                            // Cover FIRST, in the same main-actor turn the sheet
+                            // closes in, so the form never gets a frame.
+                            isCompletingNativeSignIn = true
+                            Task { await handleCode(code) }
                         },
                         shouldReload: $reloadWebView
                     )
@@ -453,11 +494,23 @@ public struct OneloAuthView<Content: View>: View {
                                 .font(.subheadline.weight(.medium))
                                 .padding(.horizontal, 12)
                                 .padding(.vertical, 7)
-                                .background(.ultraThinMaterial)
+                                // #681 — card surface + text from the brand tokens.
+                                .foregroundStyle(brandPalette.text)
+                                .background(brandPalette.cardBg)
+                                .overlay(Capsule().stroke(brandPalette.border, lineWidth: 1))
                                 .clipShape(Capsule())
                         }
                         .buttonStyle(.plain)
                         .padding(12)
+                    }
+
+                    if isCompletingNativeSignIn {
+                        // Last in the ZStack: covers the form, the navigation
+                        // skeleton and the "different method" pill alike.
+                        SigningInOverlay(
+                            background: effectiveConfig.backgroundColor,
+                            foreground: signingInForeground
+                        )
                     }
                 }
             } else {
@@ -470,7 +523,7 @@ public struct OneloAuthView<Content: View>: View {
                             if let err = errorMessage {
                                 Text(err)
                                     .font(.caption)
-                                    .foregroundStyle(.red)
+                                    .foregroundStyle(oneloStatusDanger(brandTokens))
                                     .multilineTextAlignment(.center)
                             }
                             Button("Sign In") {
@@ -479,12 +532,13 @@ public struct OneloAuthView<Content: View>: View {
                                 Task { await loadHostedUrl() }
                             }
                             .buttonStyle(.plain)
-                            .font(.headline)
-                            .foregroundStyle(.white)
+                            .font(brandPalette.bodyFont(size: 17, weight: .semibold))
+                            // #681 — the brand button pair + radius from the tokens.
+                            .foregroundStyle(brandPalette.buttonText)
                             .padding(.horizontal, 32)
                             .padding(.vertical, 12)
-                            .background(oneloOrange)
-                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                            .background(brandPalette.buttonBg)
+                            .clipShape(RoundedRectangle(cornerRadius: brandPalette.buttonRadius))
                         }
                     } else if isRestoringSession {
                         // #36 — auto-login in flight: a stored session is being
@@ -729,6 +783,8 @@ public struct OneloAuthView<Content: View>: View {
             // OneloAuthView only for sign-in then swaps to its own UI).
             (auth as? OneloAuth)?.releaseConsentGate(gateToken)
         }
+        // #681 — every skeleton / shimmer below paints from the app's tokens.
+        .environment(\.oneloBrandTokens, brandTokens)
     }
 
     private var callbackScheme: String {
@@ -895,7 +951,12 @@ public struct OneloAuthView<Content: View>: View {
         // Drop duplicate deliveries of the same sign-in's code (see isExchangingCode).
         guard !isExchangingCode else { return }
         isExchangingCode = true
-        defer { isExchangingCode = false }
+        defer {
+            isExchangingCode = false
+            // Success tears the WebView down below; failure shows the retry
+            // screen. Either way the cover has nothing left to hide.
+            isCompletingNativeSignIn = false
+        }
         do {
             _ = try await oneloAuth.exchangeHostedCode(code)
             // Login succeeded — tear down the sign-in/store WebView immediately.
@@ -952,13 +1013,86 @@ func nativeOAuthURL(base: URL, provider: String, token: String, intent: String?)
     return components?.url
 }
 
+/// Is a `#RRGGBB` / `#RGB` colour light (relative luminance above 0.5)?
+/// nil when the value is missing or malformed.
+func oneloHexIsLight(_ hex: String?) -> Bool? {
+    guard var s = hex?.trimmingCharacters(in: .whitespacesAndNewlines) else { return nil }
+    if s.hasPrefix("#") { s.removeFirst() }
+    if s.count == 3 { s = s.map { "\($0)\($0)" }.joined() }
+    guard s.count == 6, let v = UInt64(s, radix: 16) else { return nil }
+    func lin(_ c: UInt64) -> Double {
+        let x = Double(c & 0xFF) / 255.0
+        return x <= 0.03928 ? x / 12.92 : pow((x + 0.055) / 1.055, 2.4)
+    }
+    let l = 0.2126 * lin(v >> 16) + 0.7152 * lin(v >> 8) + 0.0722 * lin(v)
+    return l > 0.5
+}
+
+/// What an `ASWebAuthenticationSession` return means for the hosted view.
+enum NativeOAuthReturn: Equatable {
+    /// Signed in at the provider; the code is exchanged next.
+    case code(String)
+    /// Store flow: the account exists but payment is still owed. The store
+    /// page reloads itself to take the card; nothing is exchanged.
+    case preauth(String)
+    /// Shown on the retry screen.
+    case failed(String)
+    /// The user closed the sheet — silent, the form stays usable.
+    case cancelled
+    /// A callback carrying none of the above — ignored, as before.
+    case unrecognised
+
+    /// Does the hosted page get the "Signing you in…" cover (#666)?
+    ///
+    /// The provider ran OUTSIDE the hosted page, so the page never learns that
+    /// it finished: when the sheet closes, the idle sign-in form sits uncovered
+    /// for the whole `/hosted-callback` round trip and reads as a failed
+    /// sign-in. Only a returned code starts that round trip. A cancel or a
+    /// failure must leave the form (or the retry screen) usable — never a
+    /// stuck spinner (#543).
+    var coversHostedPage: Bool {
+        if case .code = self { return true }
+        return false
+    }
+}
+
+/// Decode an `ASWebAuthenticationSession` completion. Extracted from the
+/// coordinator so the rule is testable without a live session.
+func nativeOAuthReturn(callbackURL: URL?, error: Error?) -> NativeOAuthReturn {
+    if let error {
+        // Swallowing every error here (including real failures, not just user
+        // cancellation) left the presenting window stuck blank with no way
+        // forward — the user had to force-close it. Only the explicit
+        // user-cancel case stays silent; anything else surfaces so the retry
+        // screen replaces the dead window.
+        let nsError = error as NSError
+        let isUserCancel = nsError.domain == ASWebAuthenticationSessionErrorDomain
+            && nsError.code == ASWebAuthenticationSessionError.canceledLogin.rawValue
+        return isUserCancel ? .cancelled : .failed(error.localizedDescription)
+    }
+    guard let callbackURL else {
+        return .failed("Sign in with Apple did not complete. Please try again.")
+    }
+    let items = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false)?.queryItems
+    if let code = items?.first(where: { $0.name == "code" })?.value { return .code(code) }
+    if let preauth = items?.first(where: { $0.name == "preauth" })?.value { return .preauth(preauth) }
+    if let err = items?.first(where: { $0.name == "error" })?.value { return .failed(err) }
+    return .unrecognised
+}
+
 private final class WebAuthCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
     let callbackScheme: String
     let originalHost: String?
     let originalPath: String?
     let onCode: (String) -> Void
     let onError: (String) -> Void
-    let onSessionExpired: () -> Void
+    /// Called with the hand-back's error code (`invalid_token`, `token_expired`…),
+    /// or nil when the page reported the expiry another way.
+    let onSessionExpired: (String?) -> Void
+    /// The store finished a plan switch with no checkout (#599), with the
+    /// store's reason. nil → the navigation is just swallowed (surfaces that
+    /// never show a switch store).
+    var onStoreDone: ((String) -> Void)?
     var onExternalNavigation: ((Bool) -> Void)?
     var onContentHeight: ((CGFloat) -> Void)?
     /// The URL this WebView was last told to load.
@@ -994,6 +1128,10 @@ private final class WebAuthCoordinator: NSObject, WKNavigationDelegate, WKUIDele
     /// button they pressed (found on Flutter 2026-08-19; Swift is the other SDK
     /// on this bridge).
     var onNativeOAuth: ((String, String, String?) -> Void)?
+    /// A code returned by the provider's system sheet (#666). Separate from
+    /// `onCode` so the view can cover the hosted page while it is exchanged —
+    /// the page itself never learns the provider finished. nil → `onCode`.
+    var onNativeCode: ((String) -> Void)?
     /// Fires when the hosted legal page (loaded in gate mode) emits
     /// `onelo:consent`. The String is the action: "accept" or "decline".
     var onConsent: ((String) -> Void)?
@@ -1027,7 +1165,7 @@ private final class WebAuthCoordinator: NSObject, WKNavigationDelegate, WKUIDele
     /// termination surfaces the error rather than spinning indefinitely.
     private var _hasReloadedAfterCrash: Bool = false
 
-    init(callbackScheme: String, originalHost: String?, originalPath: String?, onCode: @escaping (String) -> Void, onError: @escaping (String) -> Void, onSessionExpired: @escaping () -> Void) {
+    init(callbackScheme: String, originalHost: String?, originalPath: String?, onCode: @escaping (String) -> Void, onError: @escaping (String) -> Void, onSessionExpired: @escaping (String?) -> Void) {
         self.callbackScheme = callbackScheme
         self.originalHost = originalHost
         self.originalPath = originalPath
@@ -1052,7 +1190,7 @@ private final class WebAuthCoordinator: NSObject, WKNavigationDelegate, WKUIDele
             return
         }
         if type == "onelo:session_expired" {
-            DispatchQueue.main.async { self.onSessionExpired() }
+            DispatchQueue.main.async { self.onSessionExpired(nil) }
         } else if type == "onelo:consent",
                   let action = body["action"] as? String {
             DispatchQueue.main.async { self.onConsent?(action) }
@@ -1102,30 +1240,13 @@ private final class WebAuthCoordinator: NSObject, WKNavigationDelegate, WKUIDele
         ) { [weak self] callbackURL, error in
             guard let self else { return }
             self._appleAuthSession = nil
-            if let error {
-                // Swallowing every error here (including real failures, not just
-                // user cancellation) left the presenting window stuck blank with
-                // no way forward — the user had to force-close it. Only the
-                // explicit user-cancel case stays silent (matches the "keep the
-                // gate up, let the user retry" pattern used elsewhere in this
-                // file); anything else surfaces via onError so the retry screen
-                // replaces the dead window.
-                let nsError = error as NSError
-                let isUserCancel = nsError.domain == ASWebAuthenticationSessionErrorDomain
-                    && nsError.code == ASWebAuthenticationSessionError.canceledLogin.rawValue
-                if !isUserCancel {
-                    DispatchQueue.main.async { self.onError(error.localizedDescription) }
-                }
-                return
-            }
-            guard let callbackURL else {
-                DispatchQueue.main.async { self.onError("Sign in with Apple did not complete. Please try again.") }
-                return
-            }
-            let items = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false)?.queryItems
-            if let code = items?.first(where: { $0.name == "code" })?.value {
-                DispatchQueue.main.async { self.onCode(code) }
-            } else if let preauth = items?.first(where: { $0.name == "preauth" })?.value {
+            let outcome = nativeOAuthReturn(callbackURL: callbackURL, error: error)
+            switch outcome {
+            case .code(let code):
+                // The return that starts the exchange gets the cover (#666).
+                let deliver = outcome.coversHostedPage ? (self.onNativeCode ?? self.onCode) : self.onCode
+                DispatchQueue.main.async { deliver(code) }
+            case .preauth(let preauth):
                 // Paid product store flow — OAuth succeeded, account is provisioned,
                 // but the buyer still owes payment. Reload the hosted store page
                 // with ?oauth_preauth=… — StoreClient.tsx already has a useEffect
@@ -1143,24 +1264,28 @@ private final class WebAuthCoordinator: NSObject, WKNavigationDelegate, WKUIDele
                         webView.load(oneloHostedURLRequest(newURL))
                     }
                 }
-            } else if let err = items?.first(where: { $0.name == "error" })?.value {
-                DispatchQueue.main.async { self.onError(err) }
+            case .failed(let message):
+                DispatchQueue.main.async { self.onError(message) }
+            case .cancelled, .unrecognised:
+                // Cancel: keep the gate up, let the user retry (matches the
+                // pattern used elsewhere in this file).
+                break
             }
         }
         session.presentationContextProvider = self
         // Non-ephemeral on purpose — the "logout must be authoritative" problem
         // (a live provider SSO session silently re-issuing a code, so sign-out
-        // bounces right back) is solved SERVER-SIDE instead: the Google authorize
-        // URL now carries `prompt=select_account`, forcing the account chooser on
-        // every authorize regardless of shared cookies. We do NOT set
+        // bounces right back) is solved SERVER-SIDE instead: the Google and GitHub
+        // authorize URLs carry `prompt=select_account`, forcing the account
+        // chooser on every authorize regardless of shared cookies. We do NOT set
         // `prefersEphemeralWebBrowserSession = true` here because on macOS an
         // ephemeral ASWebAuthenticationSession detaches into a separate
         // system-managed window outside the app's window manager — the same
         // regression documented in `openCustomerPortal(from:)` ("auth window opens
         // on another screen and nothing happens"). prompt=select_account achieves
-        // authoritative logout without that macOS hazard. (GitHub/Apple authorize
-        // endpoints don't honor prompt=select_account; their re-auth is governed by
-        // the provider session and is out of scope of this lever.)
+        // authoritative logout without that macOS hazard. (Apple's authorize
+        // endpoint has no such parameter; its re-auth is governed by the provider
+        // session and is out of scope of this lever.)
         session.prefersEphemeralWebBrowserSession = false
         _appleAuthSession = session
         session.start()
@@ -1194,14 +1319,17 @@ private final class WebAuthCoordinator: NSObject, WKNavigationDelegate, WKUIDele
                 decisionHandler(.cancel)
                 return
             }
-            let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
-            let items = components?.queryItems
-            if let code = items?.first(where: { $0.name == "code" })?.value {
+            // The one Store Hand-back decoder (#615).
+            switch classifyHandBack(url) {
+            case .purchase(let code)?:
                 DispatchQueue.main.async { self.onCode(code) }
-            } else if isExpiredAuthError(items?.first(where: { $0.name == "error" })?.value) {
+            case .switched(let reason)?:
+                // A plan switch with no checkout (#599) — a success, re-resolve.
+                DispatchQueue.main.async { self.onStoreDone?(reason) }
+            case .error(let error)? where isExpiredAuthError(error):
                 // Token expired while user was idle — reload hosted page silently
-                DispatchQueue.main.async { self.onSessionExpired() }
-            } else {
+                DispatchQueue.main.async { self.onSessionExpired(error) }
+            default:
                 DispatchQueue.main.async { self.onError("Auth callback missing code parameter") }
             }
             _viewLog.notice("[nav] decidePolicy: CANCEL (callback scheme handled)")
@@ -1345,7 +1473,7 @@ private final class WebAuthCoordinator: NSObject, WKNavigationDelegate, WKUIDele
         if !isExternal, let path = originalPath, !currentURL.path.hasPrefix(path) {
             let isRootRedirect = currentURL.path == "/" || currentURL.path.isEmpty
             if isRootRedirect {
-                DispatchQueue.main.async { self.onSessionExpired() }
+                DispatchQueue.main.async { self.onSessionExpired(nil) }
             }
             return
         }
@@ -1464,7 +1592,7 @@ private let sessionExpiredRelayScript = WKUserScript(
 // mismatch. Shimmer uses the same CSS-keyframe sweep as `portalSkeletonHTML`
 // (`background-attachment: fixed` is safe here — a bare loadHTMLString WebView
 // has no transformed ancestors to re-anchor it).
-private func authSkeletonHTML(socialCount: Int) -> String {
+func authSkeletonHTML(socialCount: Int, tokens t: OneloBrandTokens) -> String {
     // Social pills + "or" divider are drawn ONLY when the caller knows social
     // will appear (socialCount = plan-gated provider count). Default 0 → none,
     // matching apps where social is disabled (developer OR plan) instead of
@@ -1481,8 +1609,8 @@ private func authSkeletonHTML(socialCount: Int) -> String {
     <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
     <style>
     *{box-sizing:border-box;margin:0;padding:0}
-    html,body{background:transparent;font-family:-apple-system,sans-serif;overflow:hidden}
-    @keyframes onelo-shimmer{0%{background-position:-60vw 0}100%{background-position:100vw 0}}
+    html,body{background:transparent;font-family:\(t.bodyFont);overflow:hidden}
+    \(t.skeletonCSS)
     /* Bottom inset matches the top. It was `48px 24px 0` until 3.81.0 —
        the same missing-bottom-gap defect that was fixed across the hosted
        pages on 2026-08-17. Here it made the last placeholder (the sign-up
@@ -1490,12 +1618,10 @@ private func authSkeletonHTML(socialCount: Int) -> String {
        page visibly nudged everything up. */
     .wrap{display:flex;flex-direction:column;align-items:center;width:100%;padding:48px 24px;box-sizing:border-box}
     .col{width:100%;max-width:300px;display:flex;flex-direction:column;gap:10px}
-    .sk{background-color:rgba(255,255,255,0.04);background-image:linear-gradient(90deg,rgba(255,255,255,0) 0%,rgba(255,255,255,0.12) 50%,rgba(255,255,255,0) 100%);background-size:60vw 100%;background-repeat:no-repeat;background-attachment:fixed;animation:onelo-shimmer 2.4s linear infinite;border-radius:8px}
-    .strong{background-color:rgba(255,255,255,0.08);background-image:linear-gradient(90deg,rgba(255,255,255,0) 0%,rgba(255,255,255,0.18) 50%,rgba(255,255,255,0) 100%);background-size:60vw 100%;background-repeat:no-repeat;background-attachment:fixed;animation:onelo-shimmer 2.4s linear infinite;border-radius:9px}
-    .logo{width:64px;height:64px;border-radius:14px;background:rgba(255,255,255,0.06);border:1.5px solid rgba(255,255,255,0.1);margin-bottom:14px}
-    .head{width:200px;height:22px;margin-bottom:10px;border-radius:6px}
-    .sub{width:140px;height:13px;opacity:0.7;margin-bottom:28px;border-radius:4px}
-    .pill{height:44px;border-radius:9px}
+    .logo{width:64px;height:64px;border-radius:\(Int(t.cardRadius))px;border:1.5px solid \(t.border);margin-bottom:14px}
+    .head{width:200px;height:22px;margin-bottom:10px}
+    .sub{width:140px;height:13px;opacity:0.7;margin-bottom:28px}
+    .pill{height:44px;border-radius:\(Int(t.buttonRadius))px}
     .divider{display:flex;align-items:center;gap:12px;margin:16px 0 4px}
     .divider .ln{flex:1;height:1px;opacity:0.5;border-radius:0}
     .divider .wd{width:14px;height:11px;opacity:0.5}
@@ -1504,7 +1630,7 @@ private func authSkeletonHTML(socialCount: Int) -> String {
     .pwrow{display:flex;justify-content:space-between;align-items:center}
     .lbl-p{width:58px;height:11px}
     .forgot{width:90px;height:11px;opacity:0.7}
-    .cta{height:48px;margin-top:6px;border-radius:10px}
+    .cta{height:48px;margin-top:6px;border-radius:\(Int(t.buttonRadius))px}
     .signup{width:200px;height:12px;opacity:0.6;margin-top:6px;align-self:center}
     </style></head><body>
     <div class="wrap">
@@ -1538,11 +1664,15 @@ private func authSkeletonHTML(socialCount: Int) -> String {
 // `AuthSkeletonView` had for free.
 private final class AuthSkeletonCoordinator {
     var loadedCount: Int = -1
+    /// The brand tokens last rendered (#681) — a config landing after first
+    /// paint reloads the skeleton in the app's colours.
+    var loadedTokens: OneloBrandTokens? = nil
 }
 
 #if os(macOS)
 private struct AuthSkeletonWebView: NSViewRepresentable {
     let socialCount: Int
+    @Environment(\.oneloBrandTokens) private var tokens
 
     func makeCoordinator() -> AuthSkeletonCoordinator { AuthSkeletonCoordinator() }
 
@@ -1554,21 +1684,24 @@ private struct AuthSkeletonWebView: NSViewRepresentable {
         webView.enclosingScrollView?.hasVerticalScroller = false
         webView.enclosingScrollView?.verticalScrollElasticity = .none
         context.coordinator.loadedCount = socialCount
-        webView.loadHTMLString(authSkeletonHTML(socialCount: socialCount), baseURL: nil)
+        context.coordinator.loadedTokens = tokens
+        webView.loadHTMLString(authSkeletonHTML(socialCount: socialCount, tokens: tokens), baseURL: nil)
         return webView
     }
 
     func updateNSView(_ nsView: WKWebView, context: Context) {
         // Reload ONLY when the count actually changed — a no-op on identical
         // re-renders keeps the shimmer from restarting.
-        guard context.coordinator.loadedCount != socialCount else { return }
+        guard context.coordinator.loadedCount != socialCount || context.coordinator.loadedTokens != tokens else { return }
         context.coordinator.loadedCount = socialCount
-        nsView.loadHTMLString(authSkeletonHTML(socialCount: socialCount), baseURL: nil)
+        context.coordinator.loadedTokens = tokens
+        nsView.loadHTMLString(authSkeletonHTML(socialCount: socialCount, tokens: tokens), baseURL: nil)
     }
 }
 #elseif os(iOS)
 private struct AuthSkeletonWebView: UIViewRepresentable {
     let socialCount: Int
+    @Environment(\.oneloBrandTokens) private var tokens
 
     func makeCoordinator() -> AuthSkeletonCoordinator { AuthSkeletonCoordinator() }
 
@@ -1585,15 +1718,17 @@ private struct AuthSkeletonWebView: UIViewRepresentable {
         webView.scrollView.isScrollEnabled = false
         webView.scrollView.showsVerticalScrollIndicator = false
         context.coordinator.loadedCount = socialCount
-        webView.loadHTMLString(authSkeletonHTML(socialCount: socialCount), baseURL: nil)
+        context.coordinator.loadedTokens = tokens
+        webView.loadHTMLString(authSkeletonHTML(socialCount: socialCount, tokens: tokens), baseURL: nil)
         return webView
     }
 
     func updateUIView(_ uiView: WKWebView, context: Context) {
         // Reload ONLY when the count actually changed — see makeNSView twin.
-        guard context.coordinator.loadedCount != socialCount else { return }
+        guard context.coordinator.loadedCount != socialCount || context.coordinator.loadedTokens != tokens else { return }
         context.coordinator.loadedCount = socialCount
-        uiView.loadHTMLString(authSkeletonHTML(socialCount: socialCount), baseURL: nil)
+        context.coordinator.loadedTokens = tokens
+        uiView.loadHTMLString(authSkeletonHTML(socialCount: socialCount, tokens: tokens), baseURL: nil)
     }
 }
 #endif
@@ -1604,10 +1739,14 @@ private struct EmbeddedWebAuthView: NSViewRepresentable {
     let callbackScheme: String
     let onCode: (String) -> Void
     let onError: (String) -> Void
-    let onSessionExpired: () -> Void
+    /// Called with the hand-back's error code (`invalid_token`, `token_expired`…),
+    /// or nil when the page reported the expiry another way.
+    let onSessionExpired: (String?) -> Void
     var onExternalNavigation: ((Bool) -> Void)? = nil
     var onNavigationLoading: ((Bool, NavigationKind) -> Void)? = nil
     var onConsent: ((String) -> Void)? = nil
+    var onStoreDone: ((String) -> Void)? = nil
+    var onNativeCode: ((String) -> Void)? = nil
     @Binding var shouldReload: Bool
 
     func makeCoordinator() -> WebAuthCoordinator {
@@ -1615,6 +1754,8 @@ private struct EmbeddedWebAuthView: NSViewRepresentable {
         c.onExternalNavigation = onExternalNavigation
         c.onNavigationLoading = onNavigationLoading
         c.onConsent = onConsent
+        c.onStoreDone = onStoreDone
+        c.onNativeCode = onNativeCode
         c.onContentHeight = { [weak c] contentHeight in
             // Skip auto-height once an explicit window size was applied
             // (e.g. after onResize('wide') for the plan store page).
@@ -1741,10 +1882,14 @@ private struct EmbeddedWebAuthView: UIViewRepresentable {
     let callbackScheme: String
     let onCode: (String) -> Void
     let onError: (String) -> Void
-    let onSessionExpired: () -> Void
+    /// Called with the hand-back's error code (`invalid_token`, `token_expired`…),
+    /// or nil when the page reported the expiry another way.
+    let onSessionExpired: (String?) -> Void
     var onExternalNavigation: ((Bool) -> Void)? = nil
     var onNavigationLoading: ((Bool, NavigationKind) -> Void)? = nil
     var onConsent: ((String) -> Void)? = nil
+    var onStoreDone: ((String) -> Void)? = nil
+    var onNativeCode: ((String) -> Void)? = nil
     @Binding var shouldReload: Bool
 
     func makeCoordinator() -> WebAuthCoordinator {
@@ -1752,6 +1897,8 @@ private struct EmbeddedWebAuthView: UIViewRepresentable {
         c.onExternalNavigation = onExternalNavigation
         c.onNavigationLoading = onNavigationLoading
         c.onConsent = onConsent
+        c.onStoreDone = onStoreDone
+        c.onNativeCode = onNativeCode
         c.onNativeOAuth = { [weak c] provider, token, intent in
             guard let c else { return }
             guard let oauthUrl = nativeOAuthURL(
@@ -1859,7 +2006,7 @@ private struct EmbeddedWebAuthView: UIViewRepresentable {
 /// should be wired to it.
 private struct InlineAuthView: View {
     @ObservedObject var vm: OneloAuthViewModel
-    let config: OneloAuthConfig
+    let config: OneloAuthStyle
     let appName: String
     let appLogoUrl: URL?
 
@@ -1880,7 +2027,7 @@ private struct InlineAuthView: View {
                                         if let img = phase.image {
                                             img.resizable().scaledToFill()
                                                 .frame(width: 64, height: 64)
-                                                .clipShape(RoundedRectangle(cornerRadius: 14))
+                                                .clipShape(RoundedRectangle(cornerRadius: config.palette.cardRadius))
                                         } else {
                                             OneloLogoMark(size: 64)
                                         }
@@ -1895,7 +2042,7 @@ private struct InlineAuthView: View {
                             (Text("Sign in to ")
                                 .foregroundStyle(config.textColor)
                             + Text(appName)
-                                .foregroundStyle(oneloOrange))
+                                .foregroundStyle(config.accentColor))
                             .font(.title2.bold())
                             .multilineTextAlignment(.center)
                             .padding(.bottom, 6)
@@ -1939,7 +2086,7 @@ private struct InlineAuthView: View {
 
 private struct InlineSignInForm: View {
     @ObservedObject var vm: OneloAuthViewModel
-    let config: OneloAuthConfig
+    let config: OneloAuthStyle
 
     var body: some View {
         VStack(spacing: config.itemSpacing) {
@@ -1973,7 +2120,7 @@ private struct InlineSignInForm: View {
 
 private struct InlineSignUpForm: View {
     @ObservedObject var vm: OneloAuthViewModel
-    let config: OneloAuthConfig
+    let config: OneloAuthStyle
 
     var body: some View {
         VStack(spacing: config.itemSpacing) {
@@ -2009,7 +2156,7 @@ private struct InlineSignUpForm: View {
 
 private struct InlineForgotPasswordForm: View {
     @ObservedObject var vm: OneloAuthViewModel
-    let config: OneloAuthConfig
+    let config: OneloAuthStyle
 
     var body: some View {
         VStack(spacing: config.itemSpacing) {
@@ -2047,7 +2194,7 @@ private struct InlineForgotPasswordForm: View {
 
 private struct SignInScreen: View {
     @ObservedObject var vm: OneloAuthViewModel
-    let config: OneloAuthConfig
+    let config: OneloAuthStyle
 
     var body: some View {
         VStack(spacing: 0) {
@@ -2117,7 +2264,7 @@ private struct SignInScreen: View {
 
 private struct SignUpScreen: View {
     @ObservedObject var vm: OneloAuthViewModel
-    let config: OneloAuthConfig
+    let config: OneloAuthStyle
 
     var body: some View {
         VStack(spacing: 0) {
@@ -2188,7 +2335,7 @@ private struct SignUpScreen: View {
 
 private struct ForgotPasswordScreen: View {
     @ObservedObject var vm: OneloAuthViewModel
-    let config: OneloAuthConfig
+    let config: OneloAuthStyle
 
     var body: some View {
         VStack(spacing: 0) {
@@ -2247,9 +2394,9 @@ private struct ForgotPasswordScreen: View {
 private struct AuthTextField: View {
     let placeholder: String
     @Binding var text: String
-    let config: OneloAuthConfig
+    let config: OneloAuthStyle
 
-    init(_ placeholder: String, text: Binding<String>, config: OneloAuthConfig) {
+    init(_ placeholder: String, text: Binding<String>, config: OneloAuthStyle) {
         self.placeholder = placeholder
         self._text = text
         self.config = config
@@ -2260,9 +2407,9 @@ private struct AuthTextField: View {
             .padding(.horizontal, 12)
             .frame(height: config.inputHeight)
             .background(config.surfaceColor)
-            .clipShape(RoundedRectangle(cornerRadius: config.cornerRadius))
+            .clipShape(RoundedRectangle(cornerRadius: config.fieldCornerRadius))
             .overlay(
-                RoundedRectangle(cornerRadius: config.cornerRadius)
+                RoundedRectangle(cornerRadius: config.fieldCornerRadius)
                     .strokeBorder(config.inputBorderColor, lineWidth: config.inputBorderWidth)
             )
             .foregroundStyle(config.textColor)
@@ -2272,9 +2419,9 @@ private struct AuthTextField: View {
 private struct AuthSecureField: View {
     let placeholder: String
     @Binding var text: String
-    let config: OneloAuthConfig
+    let config: OneloAuthStyle
 
-    init(_ placeholder: String, text: Binding<String>, config: OneloAuthConfig) {
+    init(_ placeholder: String, text: Binding<String>, config: OneloAuthStyle) {
         self.placeholder = placeholder
         self._text = text
         self.config = config
@@ -2285,9 +2432,9 @@ private struct AuthSecureField: View {
             .padding(.horizontal, 12)
             .frame(height: config.inputHeight)
             .background(config.surfaceColor)
-            .clipShape(RoundedRectangle(cornerRadius: config.cornerRadius))
+            .clipShape(RoundedRectangle(cornerRadius: config.fieldCornerRadius))
             .overlay(
-                RoundedRectangle(cornerRadius: config.cornerRadius)
+                RoundedRectangle(cornerRadius: config.fieldCornerRadius)
                     .strokeBorder(config.inputBorderColor, lineWidth: config.inputBorderWidth)
             )
             .foregroundStyle(config.textColor)
@@ -2296,11 +2443,11 @@ private struct AuthSecureField: View {
 
 private struct AuthButton: View {
     let label: String
-    let config: OneloAuthConfig
+    let config: OneloAuthStyle
     let isLoading: Bool
     let action: () -> Void
 
-    init(_ label: String, config: OneloAuthConfig, isLoading: Bool, action: @escaping () -> Void) {
+    init(_ label: String, config: OneloAuthStyle, isLoading: Bool, action: @escaping () -> Void) {
         self.label = label
         self.config = config
         self.isLoading = isLoading
@@ -2343,7 +2490,7 @@ private struct AuthButton: View {
 /// Size it from the caller with `.frame(...)`. `strong` = the slightly lighter
 /// base used for "filled" elements (OAuth pills, inputs, CTA, plan cards).
 ///
-/// **Why neutral grey only:** an earlier orange tint on the CTA placeholder
+/// **Why one tone only:** an earlier orange tint on the CTA placeholder
 /// read as a broken brown bar against the dark background and pulled focus to
 /// one element. Netflix/YouTube/Apple all use a single greyscale shimmer family
 /// across every placeholder — a per-element colour reads as "broken UI".
@@ -2351,16 +2498,20 @@ private struct OneloShimmerFill: View {
     let radius: CGFloat
     var strong: Bool = false
     @State private var phase: CGFloat = 0
+    /// #681: base = card / border token, sweep = the token text colour at a
+    /// whisper — the same family on a light page as on a dark one.
+    @Environment(\.oneloBrandTokens) private var tokens
 
     /// Half of the ≈4.9s round-trip — `autoreverses: true` plays it back, so
     /// the full there-and-back cycle is 2× this.
     private static let legDuration: Double = 2.45
 
     var body: some View {
-        let baseFill = Color(white: strong ? 0.14 : 0.10)
-        // Near-white highlight kept at very low alpha so the sweep only just
+        let palette = OneloBrandPalette(tokens)
+        let baseFill = strong ? palette.border : palette.cardBg
+        // Text-colour highlight kept at very low alpha so the sweep only just
         // brushes the surface (matches the "delikatność 0.20" design pick).
-        let highlight = Color(white: strong ? 0.80 : 0.73)
+        let highlight = palette.text
         RoundedRectangle(cornerRadius: radius)
             .fill(baseFill)
             .overlay(
@@ -2414,8 +2565,10 @@ struct AuthSkeletonView: View {
     /// buttons that then vanish on swap-in (jarring). Callers that KNOW social will
     /// appear can pass the real count; today no caller does, so it stays 0.
     var providerCount: Int = 0
+    @Environment(\.oneloBrandTokens) private var tokens
     var body: some View {
-        VStack(spacing: 0) {
+        let p = OneloBrandPalette(tokens)
+        return VStack(spacing: 0) {
             // Flexible top spacer (paired with the flexible bottom Spacer) so the
             // content is VERTICALLY CENTERED, matching the hosted form's
             // `justify-content: center`. A fixed top pin made the skeleton sit too
@@ -2424,7 +2577,7 @@ struct AuthSkeletonView: View {
             Spacer(minLength: 24)
 
             // Logo box — fixed 64×64, mirrors hosted-page logo container.
-            shimmerRect(width: 64, height: 64, radius: 14)
+            shimmerRect(width: 64, height: 64, radius: p.cardRadius)
 
             Spacer().frame(height: 14)
 
@@ -2450,19 +2603,19 @@ struct AuthSkeletonView: View {
                 // OR by plan) instead of flashing pills that then vanish on swap-in.
                 if providerCount > 0 {
                     ForEach(0..<providerCount, id: \.self) { _ in
-                        shimmerBar(height: 44, radius: 9, strong: true)
+                        shimmerBar(height: 44, radius: p.buttonRadius, strong: true)
                     }
 
                     // "or" divider — two thin grey lines + small placeholder
                     // for the word itself.
                     HStack(spacing: 12) {
                         Rectangle()
-                            .fill(Color(white: 0.15))
+                            .fill(p.border)
                             .frame(height: 1)
                         shimmerRect(width: 14, height: 11, radius: 3)
                             .opacity(0.6)
                         Rectangle()
-                            .fill(Color(white: 0.15))
+                            .fill(p.border)
                             .frame(height: 1)
                     }
                     .padding(.vertical, 6)
@@ -2473,7 +2626,7 @@ struct AuthSkeletonView: View {
                     shimmerRect(width: 38, height: 11, radius: 3)
                     Spacer()
                 }
-                shimmerBar(height: 44, radius: 9, strong: true)
+                shimmerBar(height: 44, radius: p.fieldRadius, strong: true)
 
                 // Password label + "Forgot password?" link row.
                 HStack(spacing: 0) {
@@ -2482,12 +2635,12 @@ struct AuthSkeletonView: View {
                     shimmerRect(width: 90, height: 11, radius: 3)
                         .opacity(0.7)
                 }
-                shimmerBar(height: 44, radius: 9, strong: true)
+                shimmerBar(height: 44, radius: p.fieldRadius, strong: true)
 
                 // Primary CTA (Sign In) — neutral grey, slightly taller
                 // (48pt vs 44pt OAuth pills) so the swap-in to the brand-
                 // coloured button feels like a "fill-in", not a re-layout.
-                shimmerBar(height: 48, radius: 10, strong: true)
+                shimmerBar(height: 48, radius: p.buttonRadius, strong: true)
                     .padding(.top, 4)
 
                 // "Don't have an account? Sign up" row — centered.
@@ -2537,13 +2690,15 @@ struct AuthSkeletonView: View {
 /// Shares the shimmer primitive look with AuthSkeletonView so the
 /// brand language stays consistent across both transitions.
 struct StoreSkeletonView: View {
+    @Environment(\.oneloBrandTokens) private var tokens
+    private var p: OneloBrandPalette { OneloBrandPalette(tokens) }
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             Spacer().frame(height: 48)
 
             // App logo (matches store header logo container — 56×56 with
             // soft border, slightly smaller than the auth-view logo).
-            shimmerRect(width: 56, height: 56, radius: 12)
+            shimmerRect(width: 56, height: 56, radius: p.cardRadius)
 
             Spacer().frame(height: 18)
 
@@ -2595,13 +2750,13 @@ struct StoreSkeletonView: View {
                 .opacity(0.55)
             Spacer().frame(minHeight: 24)
             // CTA button — full-width inside the card.
-            shimmerBar(height: 44, radius: 10, strong: true)
+            shimmerBar(height: 44, radius: p.buttonRadius, strong: true)
         }
         .padding(20)
         .frame(maxWidth: .infinity, minHeight: 220, alignment: .topLeading)
         .background(
-            RoundedRectangle(cornerRadius: 16)
-                .stroke(Color(white: 0.14), lineWidth: 1)
+            RoundedRectangle(cornerRadius: p.cardRadius)
+                .stroke(p.border, lineWidth: 1)
         )
     }
 
@@ -2648,6 +2803,29 @@ private struct NavigationSkeletonOverlay: View {
         case .store:   return AnyView(StoreSkeletonView())
         case .neutral: return AnyView(NeutralSkeletonView())
         }
+    }
+}
+
+/// "Signing you in…" over the hosted WebView while a native social sign-in's
+/// code is exchanged (#666). Same words as the hosted page's own pending state
+/// on the web (#543). Opaque, on the branding background, so it reads as the
+/// same page rather than a new screen.
+private struct SigningInOverlay: View {
+    let background: Color
+    let foreground: Color
+
+    var body: some View {
+        ZStack {
+            background.ignoresSafeArea()
+            VStack(spacing: 14) {
+                ProgressView().tint(foreground)
+                Text("Signing you in…")
+                    .font(.subheadline)
+                    .foregroundStyle(foreground)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -2712,25 +2890,11 @@ struct NeutralSkeletonView: View {
     }
 }
 
-// MARK: - Onelo brand color
-
-private let oneloOrange = Color(red: 0.976, green: 0.451, blue: 0.086) // #f97316
-
-// MARK: - Onelo Logo (with dark background — used in hosted flow button)
-
-private struct OneloLogo: View {
-    var size: CGFloat = 56
-
-    var body: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: size * 0.22)
-                .fill(Color(red: 0.067, green: 0.067, blue: 0.067))
-                .frame(width: size, height: size)
-            OneloLogoMark(size: size * 0.72)
-        }
-        .frame(width: size, height: size)
-    }
-}
+// MARK: - Brand accent (#601 → #681)
+//
+// The retry "Sign In" button and every other SDK-drawn control now paint from
+// `OneloAuth.brandTokens` (`OneloBrandPalette`); the neutral fallback is
+// `OneloBrandTokens.neutral`. The old `oneloBrandAccent(hex:)` helper is gone.
 
 // MARK: - Onelo Logo Mark (just the white symbol, no background)
 
@@ -2764,135 +2928,6 @@ private struct OneloFooter: View {
             .font(.caption2)
         }
         .buttonStyle(.plain)
-    }
-}
-
-// MARK: - Hosted Sign In Button (legacy — no longer used by OneloAuthView)
-// Kept for reference only. OneloAuthView now uses EmbeddedWebAuthView (WKWebView).
-
-private struct HostedSignInButton: View {
-    let auth: any OneloAuthProtocol
-    let config: OneloAuthConfig
-    let onSuccess: ((OneloSession) -> Void)?
-
-    @State private var isLoading = false
-    @State private var errorMessage: String?
-    @State private var appName: String = "App"
-    @State private var appLogoUrl: URL? = nil
-
-    var body: some View {
-        GeometryReader { geo in
-            ZStack {
-                // Background
-                config.backgroundColor.ignoresSafeArea()
-
-                VStack(spacing: 0) {
-                    Spacer()
-
-                    // App / Onelo branding block
-                    VStack(spacing: 16) {
-                        // Show app logo if available, otherwise Onelo logo
-                        if let logoUrl = appLogoUrl {
-                            AsyncImage(url: logoUrl) { phase in
-                                if let image = phase.image {
-                                    image
-                                        .resizable()
-                                        .scaledToFill()
-                                        .frame(width: 72, height: 72)
-                                        .clipShape(RoundedRectangle(cornerRadius: 16))
-                                } else {
-                                    OneloLogo(size: 72)
-                                }
-                            }
-                        } else {
-                            OneloLogo(size: 72)
-                        }
-
-                        VStack(spacing: 4) {
-                            (Text("Sign in to ")
-                                .foregroundStyle(config.textColor)
-                            + Text(appName)
-                                .foregroundStyle(oneloOrange))
-                            .font(.title2.bold())
-
-                            Text("Secure authentication powered by Onelo")
-                                .font(.subheadline)
-                                .foregroundStyle(config.subtitleColor)
-                                .multilineTextAlignment(.center)
-                        }
-                    }
-                    .padding(.bottom, 40)
-
-                    // Sign In button
-                    VStack(spacing: 12) {
-                        if isLoading {
-                            ProgressView()
-                                .tint(oneloOrange)
-                                .frame(height: config.buttonHeight)
-                        } else {
-                            Button {
-                                Task { await signIn() }
-                            } label: {
-                                Text("Sign In")
-                                    .fontWeight(.semibold)
-                                    .frame(maxWidth: .infinity)
-                                    .frame(height: config.buttonHeight)
-                                    .background(oneloOrange)
-                                    .foregroundStyle(.white)
-                                    .clipShape(RoundedRectangle(cornerRadius: config.cornerRadius))
-                            }
-                            .buttonStyle(.plain)
-                        }
-
-                        if let err = errorMessage {
-                            Text(err)
-                                .font(.caption)
-                                .foregroundStyle(.red)
-                                .multilineTextAlignment(.center)
-                        }
-                    }
-                    .padding(.horizontal, config.contentPadding.leading)
-
-                    Spacer()
-
-                    // Footer — left aligned
-                    HStack {
-                        OneloFooter()
-                        Spacer()
-                    }
-                    .padding(.horizontal, config.contentPadding.leading)
-                    .padding(.bottom, 24)
-                }
-                .frame(width: geo.size.width)
-            }
-        }
-        .task {
-            guard let oneloAuth = auth as? OneloAuth else { return }
-            for await name in oneloAuth.$hostedAppName.values {
-                appName = name
-            }
-        }
-        .task {
-            guard let oneloAuth = auth as? OneloAuth else { return }
-            for await logoUrl in oneloAuth.$hostedAppLogoUrl.values {
-                appLogoUrl = logoUrl
-            }
-        }
-    }
-
-    @MainActor
-    private func signIn() async {
-        guard let oneloAuth = auth as? OneloAuth else { return }
-        isLoading = true
-        errorMessage = nil
-        defer { isLoading = false }
-        do {
-            let url = try await oneloAuth.initiateHostedFlow()
-            // Legacy path — callers should use OneloAuthView (WKWebView) instead
-            _ = url
-        } catch {
-            errorMessage = error.localizedDescription
-        }
     }
 }
 
@@ -2942,7 +2977,7 @@ struct OneloConsentGateModifier: ViewModifier {
                         callbackScheme: auth.callbackScheme,
                         onCode: { _ in },
                         onError: { _ in },
-                        onSessionExpired: { },
+                        onSessionExpired: { _ in },
                         onConsent: { action in
                             Task { await handleConsent(action, requirement: req) }
                         },

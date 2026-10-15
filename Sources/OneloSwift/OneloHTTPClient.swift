@@ -95,7 +95,7 @@ final class _OneloHTTPClient: @unchecked Sendable {
     // MARK: - Security headers
 
     private func applySecurityHeaders(to request: inout URLRequest) {
-        request.setValue("onelo-swift/\(OneloSDK.sdkVersion)", forHTTPHeaderField: "User-Agent")
+        _OneloSdkIdentity.apply(to: &request)
         request.setValue(Self.osHeader, forHTTPHeaderField: "X-Onelo-OS")
         request.setValue(OneloInstanceId.current(), forHTTPHeaderField: "X-Onelo-Instance-Id")
         if !bundleId.isEmpty {
@@ -179,7 +179,10 @@ final class _OneloHTTPClient: @unchecked Sendable {
     /// where the caller needs to discriminate 401 vs 403 vs 200 to map to
     /// typed `OneloFeaturesError` cases — the default `post` collapses every
     /// non-2xx into `OneloError.serverError(String)`, losing the structure.
-    func postRaw(path: String, body: [String: Any]) async throws -> (Int, [String: Any]) {
+    ///
+    /// `headers` (e.g. the Features `Authorization: Bearer <access token>`) are
+    /// applied AFTER the security set so they can never be clobbered.
+    func postRaw(path: String, body: [String: Any], headers: [String: String] = [:]) async throws -> (Int, [String: Any]) {
         let url = baseURL.appendingPathComponent(path)
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -188,6 +191,7 @@ final class _OneloHTTPClient: @unchecked Sendable {
         request.timeoutInterval = 10
         applySecurityHeaders(to: &request)
         await applyAssertion(to: &request)
+        for (key, value) in headers { request.setValue(value, forHTTPHeaderField: key) }
 
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse else {
@@ -199,6 +203,15 @@ final class _OneloHTTPClient: @unchecked Sendable {
     }
 
     func get(path: String, queryItems: [URLQueryItem] = [], headers: [String: String] = [:]) async throws -> [String: Any] {
+        let (status, json) = try await getRaw(path: path, queryItems: queryItems, headers: headers)
+        guard (200..<300).contains(status) else { throw httpError(json, statusCode: status) }
+        return json
+    }
+
+    /// Like `get(path:queryItems:headers:)` but returns the raw `(statusCode, json)`
+    /// pair instead of throwing on non-2xx, so a caller can tell a refused user
+    /// token (`401 invalid_user_token`) from any other failure (#820).
+    func getRaw(path: String, queryItems: [URLQueryItem] = [], headers: [String: String] = [:]) async throws -> (Int, [String: Any]) {
         guard var components = URLComponents(url: baseURL.appendingPathComponent(path), resolvingAgainstBaseURL: false) else {
             throw OneloError.serverError("Invalid URL components")
         }
@@ -218,19 +231,20 @@ final class _OneloHTTPClient: @unchecked Sendable {
         guard let http = response as? HTTPURLResponse else {
             throw OneloError.serverError("No HTTP response")
         }
-        guard (200..<300).contains(http.statusCode) else {
-            let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
-            handleAttestReject(json)
-            // Typed rather than collapsed into serverError: every caller that
-            // can open a store (openUpgrade, the upgrade router) goes through
-            // here, so mapping it once means none of them has to parse a body.
-            if oneloErrorCode(from: json) == "in_app_store_not_allowed" {
-                throw OneloError.inAppStoreNotAllowed
-            }
-            throw OneloError.serverError(errorDetail(json, statusCode: http.statusCode))
+        let json = data.isEmpty ? [:] : (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        if !(200..<300).contains(http.statusCode) { handleAttestReject(json) }
+        return (http.statusCode, json)
+    }
+
+    /// The error a non-2xx GET answer throws.
+    func httpError(_ json: [String: Any], statusCode: Int) -> OneloError {
+        // Typed rather than collapsed into serverError: every caller that
+        // can open a store (openUpgrade, the upgrade router) goes through
+        // here, so mapping it once means none of them has to parse a body.
+        if oneloErrorCode(from: json) == "in_app_store_not_allowed" {
+            return .inAppStoreNotAllowed
         }
-        if data.isEmpty { return [:] }
-        return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        return .serverError(errorDetail(json, statusCode: statusCode))
     }
 
     // MARK: - SSE
@@ -240,38 +254,73 @@ final class _OneloHTTPClient: @unchecked Sendable {
     // Task tears down the underlying URLSession data task automatically.
     //
     // Protocol parsing follows the WHATWG EventSource spec at the level we need:
-    // accumulate `event:` and `data:` lines, flush on empty line, ignore `:`
-    // comment lines (used by the server for heartbeats).
+    // accumulate `event:` and `data:` lines, flush on empty line. A `:`
+    // comment line (the server's keepalive) becomes a comment frame.
     struct SSEEvent: Sendable {
         let type: String           // "" if no `event:` line was sent (default `message`)
         let data: String           // raw payload (usually JSON we'll decode in callers)
+        /// A `:` comment line — the server's `: keepalive`, sent every 30 s so
+        /// an idle connection is not silent. Carries no payload and is never
+        /// dispatched to an event handler; it only proves the connection is
+        /// alive (#368).
+        var isComment: Bool = false
+    }
+
+    /// Builds the GET the SSE transport sends. Split out of `stream` so the
+    /// wire shape — headers and query string — is assertable without opening a
+    /// connection; `stream` below is the only production caller.
+    ///
+    /// The Publishable Key travels in the `X-Publishable-Key` request header,
+    /// never in the query string (ADR-0003). A URL carrying the raw key ends up
+    /// in the reverse proxy's access log on every connect, and the backend
+    /// stamps `Deprecation`/`Sunset` on a `?key=` connection — a header one has
+    /// nothing left to deprecate.
+    ///
+    /// `headers` (the signed-in user's `Authorization: Bearer`, #519) are applied
+    /// after the security set so they can never be clobbered.
+    func makeStreamRequest(
+        path: String,
+        queryItems: [URLQueryItem] = [],
+        headers: [String: String] = [:],
+        timeout: TimeInterval = .infinity
+    ) throws -> URLRequest {
+        guard var components = URLComponents(
+            url: self.baseURL.appendingPathComponent(path),
+            resolvingAgainstBaseURL: false
+        ) else {
+            throw OneloError.serverError("Invalid URL components")
+        }
+        if !queryItems.isEmpty { components.queryItems = queryItems }
+        guard let url = components.url else { throw OneloError.serverError("Invalid URL") }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        // SSE connections are long-lived. We rely on the server
+        // sending `:keepalive` comments so the connection stays
+        // alive through proxies and corporate firewalls.
+        request.timeoutInterval = timeout
+        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        request.setValue(self.publishableKey, forHTTPHeaderField: "X-Publishable-Key")
+        self.applySecurityHeaders(to: &request)
+        for (key, value) in headers { request.setValue(value, forHTTPHeaderField: key) }
+        return request
     }
 
     func stream(
         path: String,
         queryItems: [URLQueryItem] = [],
+        headers: [String: String] = [:],
         timeout: TimeInterval = .infinity
     ) -> AsyncThrowingStream<SSEEvent, Error> {
         AsyncThrowingStream { continuation in
             do {
-                guard var components = URLComponents(
-                    url: self.baseURL.appendingPathComponent(path),
-                    resolvingAgainstBaseURL: false
-                ) else {
-                    throw OneloError.serverError("Invalid URL components")
-                }
-                if !queryItems.isEmpty { components.queryItems = queryItems }
-                guard let url = components.url else { throw OneloError.serverError("Invalid URL") }
-
-                var request = URLRequest(url: url)
-                request.httpMethod = "GET"
-                // SSE connections are long-lived. We rely on the server
-                // sending `:keepalive` comments so the connection stays
-                // alive through proxies and corporate firewalls.
-                request.timeoutInterval = timeout
-                request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
-                request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
-                self.applySecurityHeaders(to: &request)
+                let request = try self.makeStreamRequest(
+                    path: path,
+                    queryItems: queryItems,
+                    headers: headers,
+                    timeout: timeout
+                )
 
                 // URLSession.shared.bytes(for:) + bytes.lines buffers received
                 // bytes until an internal threshold is reached, swallowing small
@@ -298,14 +347,94 @@ final class _OneloHTTPClient: @unchecked Sendable {
     }
 }
 
-/// URLSessionDataDelegate that parses SSE lines from raw didReceive(data:) chunks.
-/// State (buffer + event accumulators) is mutated only on the delegate queue,
-/// which URLSession serializes for a single task — no explicit locking needed.
-private final class SSEDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
-    private let continuation: AsyncThrowingStream<_OneloHTTPClient.SSEEvent, Error>.Continuation
+/// The Event Stream connect was answered with a non-2xx status. Carries the
+/// body's error code so the stream can tell a refused user token
+/// (`401 invalid_user_token`, #519) from every other rejection.
+struct _OneloSSERejected: LocalizedError, Sendable {
+    let status: Int
+    let errorCode: String?
+
+    var errorDescription: String? { "SSE stream rejected: HTTP \(status)" }
+
+    /// The server refused the signed-in user's access token.
+    var isUserTokenRefusal: Bool {
+        status == 401 && errorCode == _OneloUserTokenWire.invalidUserToken
+    }
+}
+
+/// Incremental Event Stream parser: the raw bytes URLSession delivers go in,
+/// frames come out. Split out of `SSEDelegate` so the wire-level behaviour is
+/// testable byte for byte without opening a connection.
+struct _OneloSSEParser {
     private var buffer = Data()
     private var currentEvent = ""
     private var dataLines: [String] = []
+
+    /// Frames completed by this chunk, in wire order.
+    mutating func feed(_ data: Data) -> [_OneloHTTPClient.SSEEvent] {
+        buffer.append(data)
+        var frames: [_OneloHTTPClient.SSEEvent] = []
+        // Drain complete lines (terminated by \n; strip trailing \r per EventSource spec).
+        while let nlIdx = buffer.firstIndex(of: 0x0A) {
+            let lineBytes = buffer[buffer.startIndex..<nlIdx]
+            buffer.removeSubrange(buffer.startIndex...nlIdx)
+            var line = String(data: Data(lineBytes), encoding: .utf8) ?? ""
+            if line.hasSuffix("\r") { line.removeLast() }
+            if let frame = processLine(line) { frames.append(frame) }
+        }
+        return frames
+    }
+
+    /// Flushes a final line that arrived without a trailing newline.
+    mutating func finish() -> [_OneloHTTPClient.SSEEvent] {
+        guard !buffer.isEmpty else { return [] }
+        var line = String(data: buffer, encoding: .utf8) ?? ""
+        buffer.removeAll()
+        if line.hasSuffix("\r") { line.removeLast() }
+        guard !line.isEmpty, let frame = processLine(line) else { return [] }
+        return [frame]
+    }
+
+    private mutating func processLine(_ line: String) -> _OneloHTTPClient.SSEEvent? {
+        if line.isEmpty {
+            // Empty line = dispatch accumulated event.
+            defer {
+                currentEvent = ""
+                dataLines = []
+            }
+            guard !dataLines.isEmpty else { return nil }
+            return _OneloHTTPClient.SSEEvent(type: currentEvent, data: dataLines.joined(separator: "\n"))
+        }
+        if line.hasPrefix(":") {
+            // The server's `: keepalive`. Surfaced as a comment frame so the
+            // consumer's staleness clock sees it; handlers never do (#368).
+            return _OneloHTTPClient.SSEEvent(type: "", data: "", isComment: true)
+        }
+        guard let colonIdx = line.firstIndex(of: ":") else { return nil }
+        let field = String(line[..<colonIdx])
+        var value = String(line[line.index(after: colonIdx)...])
+        // Per spec: a single leading space after the colon is stripped.
+        if value.hasPrefix(" ") { value.removeFirst() }
+        switch field {
+        case "event": currentEvent = value
+        case "data":  dataLines.append(value)
+        default:      break  // id/retry — not used by Onelo today
+        }
+        return nil
+    }
+}
+
+/// URLSessionDataDelegate that parses SSE lines from raw didReceive(data:) chunks.
+/// State (the parser) is mutated only on the delegate queue, which URLSession
+/// serializes for a single task — no explicit locking needed.
+private final class SSEDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    private let continuation: AsyncThrowingStream<_OneloHTTPClient.SSEEvent, Error>.Continuation
+    private var parser = _OneloSSEParser()
+    /// Set when the connect was refused: the (small) error body is collected
+    /// instead of parsed as events, so its error code can be read on completion.
+    private var rejectedStatus: Int?
+    private var rejectionBody = Data()
+    private static let maxRejectionBody = 16 * 1024
 
     init(continuation: AsyncThrowingStream<_OneloHTTPClient.SSEEvent, Error>.Continuation) {
         self.continuation = continuation
@@ -323,33 +452,35 @@ private final class SSEDelegate: NSObject, URLSessionDataDelegate, @unchecked Se
             return
         }
         guard (200..<300).contains(http.statusCode) else {
-            continuation.finish(throwing: OneloError.serverError("SSE stream rejected: HTTP \(http.statusCode)"))
-            completionHandler(.cancel)
+            // Read the error body (bounded) before failing: a refused user
+            // token is told apart from other rejections only by its code.
+            rejectedStatus = http.statusCode
+            completionHandler(.allow)
             return
         }
         completionHandler(.allow)
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        buffer.append(data)
-        // Drain complete lines (terminated by \n; strip trailing \r per EventSource spec).
-        while let nlIdx = buffer.firstIndex(of: 0x0A) {
-            let lineBytes = buffer[buffer.startIndex..<nlIdx]
-            buffer.removeSubrange(buffer.startIndex...nlIdx)
-            var line = String(data: Data(lineBytes), encoding: .utf8) ?? ""
-            if line.hasSuffix("\r") { line.removeLast() }
-            processLine(line)
+        if rejectedStatus != nil {
+            if rejectionBody.count < Self.maxRejectionBody { rejectionBody.append(data) }
+            return
         }
+        for frame in parser.feed(data) { continuation.yield(frame) }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        // Flush any final line without trailing newline.
-        if !buffer.isEmpty {
-            var line = String(data: buffer, encoding: .utf8) ?? ""
-            if line.hasSuffix("\r") { line.removeLast() }
-            if !line.isEmpty { processLine(line) }
-            buffer.removeAll()
+        if let status = rejectedStatus {
+            let json = (try? JSONSerialization.jsonObject(with: rejectionBody)) as? [String: Any] ?? [:]
+            continuation.finish(throwing: _OneloSSERejected(
+                status: status,
+                errorCode: _OneloUserTokenWire.errorCode(json)
+            ))
+            session.finishTasksAndInvalidate()
+            return
         }
+        // Flush any final line without trailing newline.
+        for frame in parser.finish() { continuation.yield(frame) }
         if let nsErr = error as NSError?, nsErr.domain == NSURLErrorDomain, nsErr.code == NSURLErrorCancelled {
             continuation.finish()
         } else if let error = error {
@@ -359,31 +490,28 @@ private final class SSEDelegate: NSObject, URLSessionDataDelegate, @unchecked Se
         }
         session.finishTasksAndInvalidate()
     }
+}
 
-    private func processLine(_ line: String) {
-        if line.isEmpty {
-            // Empty line = dispatch accumulated event.
-            if !dataLines.isEmpty {
-                let payload = dataLines.joined(separator: "\n")
-                continuation.yield(_OneloHTTPClient.SSEEvent(type: currentEvent, data: payload))
-            }
-            currentEvent = ""
-            dataLines = []
-            return
-        }
-        if line.hasPrefix(":") {
-            // SSE comment / heartbeat — ignore.
-            return
-        }
-        guard let colonIdx = line.firstIndex(of: ":") else { return }
-        let field = String(line[..<colonIdx])
-        var value = String(line[line.index(after: colonIdx)...])
-        // Per spec: a single leading space after the colon is stripped.
-        if value.hasPrefix(" ") { value.removeFirst() }
-        switch field {
-        case "event": currentEvent = value
-        case "data":  dataLines.append(value)
-        default:      break  // id/retry — not used by Onelo today
-        }
+// MARK: - SDK identity
+
+/// How this SDK identifies itself on every request (#122).
+///
+/// `X-Onelo-Sdk-Name` is the registry key the dashboard compares
+/// `X-SDK-Version` against (`LATEST_SDK_VERSIONS["onelo-swift"]`). Before
+/// this SDK sent either header, the dashboard never saw a Swift version at
+/// all, and for the SDKs it did see it GUESSED the name from `app_type`
+/// (mobile → onelo-swift), so a Flutter install was judged as Swift. Name and
+/// version are set together, from one place, so they cannot disagree.
+///
+/// Both `_OneloHTTPClient` (features / paywall / forms / ...) and
+/// `OneloAuth.addStandardHeaders` (signin / signup / refresh / config) go
+/// through here.
+enum _OneloSdkIdentity {
+    static let name = "onelo-swift"
+
+    static func apply(to request: inout URLRequest) {
+        request.setValue("\(name)/\(OneloSDK.sdkVersion)", forHTTPHeaderField: "User-Agent")
+        request.setValue(OneloSDK.sdkVersion, forHTTPHeaderField: "X-SDK-Version")
+        request.setValue(name, forHTTPHeaderField: "X-Onelo-Sdk-Name")
     }
 }

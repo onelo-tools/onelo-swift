@@ -35,7 +35,8 @@ final class AwaitReadyTimeoutTests: XCTestCase {
                 callbackScheme: "turingo"
             ),
             urlSession: .shared,
-            skipInitialize: true
+            skipInitialize: true,
+            storage: InMemorySessionStorage()
         )
     }
 

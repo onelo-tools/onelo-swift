@@ -118,7 +118,7 @@ final class FeatureEnvironmentTests: XCTestCase {
     /// threads it through to the features /resolve body.
     func test_Onelo_featureEnvironment_threads_to_resolve_body() async {
         let onelo = Onelo(
-            publishableKey: "pk_test",
+            testingKey: "pk_test",
             baseURL: URL(string: "https://example.invalid")!,
             autoLifecycleRefresh: false,
             featureEnvironment: "test"
@@ -134,7 +134,7 @@ final class FeatureEnvironmentTests: XCTestCase {
     /// An invalid featureEnvironment value normalizes to nil → field omitted.
     func test_Onelo_invalid_featureEnvironment_normalizes_to_omitted() async {
         let onelo = Onelo(
-            publishableKey: "pk_test",
+            testingKey: "pk_test",
             baseURL: URL(string: "https://example.invalid")!,
             autoLifecycleRefresh: false,
             featureEnvironment: "staging"  // not test/live → dropped

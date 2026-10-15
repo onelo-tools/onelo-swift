@@ -612,6 +612,8 @@ public class OneloMonitor {
             // the same enrichment path so app/sdk/device context is present.
             var meta: [String: Any] = [
                 "stack": self.encodeFrames(frames),
+                // Whose error this is (#548) — see monitorErrorOrigin(frames:).
+                "origin": monitorErrorOrigin(frames: frames),
             ]
             for (k, v) in data { meta[k] = v }
 

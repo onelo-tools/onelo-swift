@@ -8,10 +8,9 @@ import XCTest
 /// that the current user is entitled to a specific feature slug.
 ///
 /// Wire contract:
-///   - Request body: { publishableKey, userId, slug, userIdHash? }
+///   - Request body: { publishableKey, userId, slug } (+ Bearer when signed in, #519)
 ///   - 200 → { token, expires_in } → return token
-///   - 401 secure_mode_required → throw .secureModeRequired
-///   - 401 invalid_user_hash    → throw .invalidUserHash
+///   - 401 (any)                → throw .notAuthenticated
 ///   - 403 not_entitled         → throw .notEntitled
 ///   - no current user          → throw .notAuthenticated (no network call)
 @MainActor
@@ -137,28 +136,17 @@ final class ModuleTokenTests: XCTestCase {
         XCTAssertEqual(body["publishableKey"] as? String, "pk_test")
     }
 
-    func test_moduleToken_threads_userIdHash_when_set() async throws {
+    func test_moduleToken_never_sends_userIdHash() async throws {
         let features = makeFeatures()
         ModuleTokenStubProtocol.nextStatusCode = 200
         ModuleTokenStubProtocol.nextResponseJSON = ["token": "tok", "expires_in": 60]
 
+        // Secure Mode is retired (#519): a hash handed to _load is ignored.
         await features._load(userId: "u1", userIdHash: "abcdef123456")
         _ = try await features.moduleToken(for: "ai-chat")
 
         let body = ModuleTokenStubProtocol.tokenBodies().last!
-        XCTAssertEqual(body["userIdHash"] as? String, "abcdef123456")
-    }
-
-    func test_moduleToken_omits_userIdHash_when_nil() async throws {
-        let features = makeFeatures()
-        ModuleTokenStubProtocol.nextStatusCode = 200
-        ModuleTokenStubProtocol.nextResponseJSON = ["token": "tok", "expires_in": 60]
-
-        await features._load(userId: "u1")
-        _ = try await features.moduleToken(for: "ai-chat")
-
-        let body = ModuleTokenStubProtocol.tokenBodies().last!
-        XCTAssertNil(body["userIdHash"], "userIdHash must be omitted when not in secure mode")
+        XCTAssertNil(body["userIdHash"], "userIdHash must never be sent")
     }
 
     func test_moduleToken_throws_notEntitled_on_403() async {
@@ -177,35 +165,23 @@ final class ModuleTokenTests: XCTestCase {
         }
     }
 
-    func test_moduleToken_throws_secureModeRequired_on_401_secure_mode() async {
-        let features = makeFeatures()
-        ModuleTokenStubProtocol.nextStatusCode = 401
-        ModuleTokenStubProtocol.nextResponseJSON = ["detail": ["error": "secure_mode_required"]]
+    /// The server no longer answers `secure_mode_required` / `invalid_user_hash`;
+    /// any 401 is "not authenticated".
+    func test_moduleToken_maps_any_401_to_notAuthenticated() async {
+        for code in ["secure_mode_required", "invalid_user_hash", "unknown"] {
+            let features = makeFeatures()
+            ModuleTokenStubProtocol.nextStatusCode = 401
+            ModuleTokenStubProtocol.nextResponseJSON = ["detail": ["error": code]]
 
-        await features._load(userId: "u1")
-        do {
-            _ = try await features.moduleToken(for: "ai-chat")
-            XCTFail("Expected throw")
-        } catch OneloFeaturesError.secureModeRequired {
-            // expected
-        } catch {
-            XCTFail("Wrong error: \(error)")
-        }
-    }
-
-    func test_moduleToken_throws_invalidUserHash_on_401_invalid_hash() async {
-        let features = makeFeatures()
-        ModuleTokenStubProtocol.nextStatusCode = 401
-        ModuleTokenStubProtocol.nextResponseJSON = ["detail": ["error": "invalid_user_hash"]]
-
-        await features._load(userId: "u1", userIdHash: "wronghash")
-        do {
-            _ = try await features.moduleToken(for: "ai-chat")
-            XCTFail("Expected throw")
-        } catch OneloFeaturesError.invalidUserHash {
-            // expected
-        } catch {
-            XCTFail("Wrong error: \(error)")
+            await features._load(userId: "u1")
+            do {
+                _ = try await features.moduleToken(for: "ai-chat")
+                XCTFail("Expected throw")
+            } catch OneloFeaturesError.notAuthenticated {
+                // expected
+            } catch {
+                XCTFail("Wrong error for \(code): \(error)")
+            }
         }
     }
 

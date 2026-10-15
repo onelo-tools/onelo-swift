@@ -69,7 +69,7 @@ final class OneloPresenceHeartbeatTests: XCTestCase {
             publishableKey: "onelo_pk_test_stub",
             apiUrl: URL(string: "https://test.example.com")!
         )
-        return OneloAuth(config: config, urlSession: session, skipInitialize: true)
+        return OneloAuth(config: config, urlSession: session, skipInitialize: true, storage: InMemorySessionStorage())
     }
 }
 

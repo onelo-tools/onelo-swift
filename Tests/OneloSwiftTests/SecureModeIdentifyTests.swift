@@ -1,13 +1,10 @@
 import XCTest
 @testable import OneloSwift
 
-/// Secure mode (Features Entitlement Enforcement, Task 2.5):
-/// `Onelo.identify(_:userIdHash:)` and `OneloFeatures._load(userId:userIdHash:)`
-/// must thread the hash into the `/resolve` POST body so the backend can
-/// HMAC-verify the caller's claim to `userId`. When no hash is passed
-/// (Turingo and other non-secure callers) the field MUST be omitted —
-/// adding `userIdHash: nil` to the wire payload would change the request
-/// shape for everyone and break the backward-compat contract.
+/// Secure Mode is retired (#519): the signed-in user is proven with their
+/// Onelo access token instead. `Onelo.identify(_:userIdHash:)` and
+/// `OneloFeatures._load(userId:userIdHash:)` still compile (deprecated), but
+/// the hash is never sent — only `userId` rides along.
 @MainActor
 final class SecureModeIdentifyTests: XCTestCase {
 
@@ -121,7 +118,7 @@ final class SecureModeIdentifyTests: XCTestCase {
     /// When `userIdHash` is supplied, the `/resolve` POST body MUST include
     /// it alongside `userId`. This is the contract Task 2.1 introduced on the
     /// backend.
-    func test_load_with_hash_sends_userIdHash_in_resolve_body() async {
+    func test_load_with_hash_never_sends_userIdHash() async {
         let features = makeFeatures()
 
         // Trigger a REST refresh — `_load` itself doesn't POST `/resolve`
@@ -135,7 +132,7 @@ final class SecureModeIdentifyTests: XCTestCase {
         XCTAssertFalse(bodies.isEmpty, "Expected at least one /resolve POST")
         let body = bodies.last!
         XCTAssertEqual(body["userId"] as? String, "u1")
-        XCTAssertEqual(body["userIdHash"] as? String, "abcdef123456")
+        XCTAssertNil(body["userIdHash"], "Secure Mode is retired — the hash is never sent")
     }
 
     /// When no hash is supplied (default), the `/resolve` body MUST omit
@@ -158,9 +155,9 @@ final class SecureModeIdentifyTests: XCTestCase {
     /// hash through to `OneloFeatures._load`. Backward-compat: existing
     /// `identify(_:)` callers still work because the new parameter has a
     /// default value of `nil`.
-    func test_Onelo_identify_threads_hash_to_features_resolve() async {
+    func test_Onelo_identify_with_hash_still_compiles_and_never_sends_it() async {
         let onelo = Onelo(
-            publishableKey: "pk_test",
+            testingKey: "pk_test",
             baseURL: URL(string: "https://example.invalid")!,
             autoLifecycleRefresh: false
         )
@@ -172,14 +169,14 @@ final class SecureModeIdentifyTests: XCTestCase {
         XCTAssertFalse(bodies.isEmpty)
         let body = bodies.last!
         XCTAssertEqual(body["userId"] as? String, "u2")
-        XCTAssertEqual(body["userIdHash"] as? String, "deadbeefcafe")
+        XCTAssertNil(body["userIdHash"])
     }
 
     /// Backward-compat smoke: existing single-argument `identify(_:)`
     /// continues to compile and execute, omitting the hash on the wire.
     func test_Onelo_identify_without_hash_compiles_and_omits_field() async {
         let onelo = Onelo(
-            publishableKey: "pk_test",
+            testingKey: "pk_test",
             baseURL: URL(string: "https://example.invalid")!,
             autoLifecycleRefresh: false
         )

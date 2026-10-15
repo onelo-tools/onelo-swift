@@ -24,22 +24,27 @@ extension Color {
 
 /// Visual configuration for OneloAuthView.
 /// Pass a customised instance to match your app's design system.
+///
+/// #681: every colour and the corner radius are OPTIONAL overrides. `nil` (the
+/// default) means "use the app's brand tokens" from `/api/sdk/config`, so the
+/// native form matches the hosted pages and the Branding page without any code.
+/// Set a value only to deliberately override the Branding.
 public struct OneloAuthConfig {
-    // MARK: - Colors
-    /// Color used for buttons, links, and focus rings.
-    public var accentColor: Color
-    /// Main background color of the auth sheet.
-    public var backgroundColor: Color
-    /// Background color of input fields.
-    public var surfaceColor: Color
-    /// Primary text color.
-    public var textColor: Color
-    /// Secondary text color (subtitles, placeholders, footer).
-    public var subtitleColor: Color
-    /// Foreground color of text inside primary action buttons.
-    public var buttonForegroundColor: Color
-    /// Border color of input fields.
-    public var inputBorderColor: Color
+    // MARK: - Colors (nil = brand tokens)
+    /// Buttons, links and focus rings. nil → `button_bg`.
+    public var accentColor: Color?
+    /// Main background of the auth sheet. nil → `page_bg`.
+    public var backgroundColor: Color?
+    /// Input field background. nil → `card_bg`.
+    public var surfaceColor: Color?
+    /// Primary text. nil → `text`.
+    public var textColor: Color?
+    /// Secondary text (subtitles, placeholders, footer). nil → `text_muted`.
+    public var subtitleColor: Color?
+    /// Text inside primary action buttons. nil → `button_text`.
+    public var buttonForegroundColor: Color?
+    /// Input field border. nil → `border`.
+    public var inputBorderColor: Color?
     /// Border width of input fields. Set to 0 to remove border.
     public var inputBorderWidth: CGFloat
 
@@ -50,8 +55,9 @@ public struct OneloAuthConfig {
     public var appName: String
 
     // MARK: - Shape & spacing
-    /// Corner radius applied to buttons and input fields.
-    public var cornerRadius: CGFloat
+    /// Corner radius of buttons and input fields. nil → `button_radius` for
+    /// buttons and `field_radius` for inputs.
+    public var cornerRadius: CGFloat?
     /// Height of primary action buttons.
     public var buttonHeight: CGFloat
     /// Height of text input fields.
@@ -61,35 +67,18 @@ public struct OneloAuthConfig {
     /// Vertical spacing between form elements.
     public var itemSpacing: CGFloat
 
-    // MARK: - Presets
-
-    /// Onelo brand orange (#f97316)
-    private static let oneloOrange = Color(red: 249/255, green: 115/255, blue: 22/255)
-
     public init(
-        accentColor: Color = Color(red: 249/255, green: 115/255, blue: 22/255),
-        backgroundColor: Color = {
-            #if canImport(UIKit)
-            return Color(uiColor: .systemBackground)
-            #else
-            return Color(nsColor: .windowBackgroundColor)
-            #endif
-        }(),
-        surfaceColor: Color = {
-            #if canImport(UIKit)
-            return Color(uiColor: .secondarySystemBackground)
-            #else
-            return Color(nsColor: .controlBackgroundColor)
-            #endif
-        }(),
-        textColor: Color = .primary,
-        subtitleColor: Color = .secondary,
-        buttonForegroundColor: Color = .white,
-        inputBorderColor: Color = Color.primary.opacity(0.1),
+        accentColor: Color? = nil,
+        backgroundColor: Color? = nil,
+        surfaceColor: Color? = nil,
+        textColor: Color? = nil,
+        subtitleColor: Color? = nil,
+        buttonForegroundColor: Color? = nil,
+        inputBorderColor: Color? = nil,
         inputBorderWidth: CGFloat = 1,
         appLogo: Image? = nil,
         appName: String = "",
-        cornerRadius: CGFloat = 10,
+        cornerRadius: CGFloat? = nil,
         buttonHeight: CGFloat = 48,
         inputHeight: CGFloat = 48,
         contentPadding: EdgeInsets = EdgeInsets(top: 32, leading: 24, bottom: 24, trailing: 24),
@@ -112,15 +101,56 @@ public struct OneloAuthConfig {
         self.itemSpacing = itemSpacing
     }
 
-    /// Default config — Onelo brand indigo accent, system colors, no logo.
+    /// Default config — everything from the app's brand tokens, no logo.
     public static let `default` = OneloAuthConfig()
 
-    /// Locked Onelo brand config used automatically on free plan.
-    /// Identical to `.default` — exists so the intent is explicit in code.
-    public static let oneloBranded = OneloAuthConfig(
-        accentColor: Self.oneloOrange,
-        buttonForegroundColor: .white,
-        inputBorderColor: Color.primary.opacity(0.1),
-        inputBorderWidth: 1
-    )
+    /// Kept for source compatibility. Identical to `.default`: the hosted pages
+    /// and this form both wear the app's Branding (#681), so there is no separate
+    /// "Onelo-branded" palette to lock to.
+    public static let oneloBranded = OneloAuthConfig()
+}
+
+/// `OneloAuthConfig` resolved against the app's brand tokens (#681): every
+/// value concrete. The native form's subviews read this, never the raw config.
+struct OneloAuthStyle {
+    var accentColor: Color
+    var backgroundColor: Color
+    var surfaceColor: Color
+    var textColor: Color
+    var subtitleColor: Color
+    var buttonForegroundColor: Color
+    var inputBorderColor: Color
+    var inputBorderWidth: CGFloat
+    var appLogo: Image?
+    var appName: String
+    /// Buttons.
+    var cornerRadius: CGFloat
+    /// Input fields.
+    var fieldCornerRadius: CGFloat
+    var buttonHeight: CGFloat
+    var inputHeight: CGFloat
+    var contentPadding: EdgeInsets
+    var itemSpacing: CGFloat
+    var palette: OneloBrandPalette
+
+    init(config c: OneloAuthConfig, tokens: OneloBrandTokens) {
+        let p = OneloBrandPalette(tokens)
+        palette = p
+        accentColor = c.accentColor ?? p.buttonBg
+        backgroundColor = c.backgroundColor ?? p.pageBg
+        surfaceColor = c.surfaceColor ?? p.cardBg
+        textColor = c.textColor ?? p.text
+        subtitleColor = c.subtitleColor ?? p.textMuted
+        buttonForegroundColor = c.buttonForegroundColor ?? p.buttonText
+        inputBorderColor = c.inputBorderColor ?? p.border
+        inputBorderWidth = c.inputBorderWidth
+        appLogo = c.appLogo
+        appName = c.appName
+        cornerRadius = c.cornerRadius ?? p.buttonRadius
+        fieldCornerRadius = c.cornerRadius ?? p.fieldRadius
+        buttonHeight = c.buttonHeight
+        inputHeight = c.inputHeight
+        contentPadding = c.contentPadding
+        itemSpacing = c.itemSpacing
+    }
 }

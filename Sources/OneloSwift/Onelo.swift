@@ -11,7 +11,7 @@ import UIKit
 ///
 /// ```swift
 /// let onelo = Onelo(publishableKey: "pk_live_...", baseURL: URL(string: "https://...")!)
-/// await onelo.identify(userId)   // only needed when NOT using Onelo Auth
+/// // Features follow the signed-in Onelo user automatically.
 ///
 /// if onelo.features.feature("export-button").isEnabled {
 ///     showExportButton()
@@ -24,6 +24,11 @@ public final class Onelo: ObservableObject {
     private let callbackScheme: String
     private var heartbeatTimer: Timer?
     private var lifecycleObservers: [NSObjectProtocol] = []
+    /// Reconciles the plan after a Store Hand-back (#659). Retained here; the
+    /// auth hook holds it weakly.
+    private var planChange: PlanChangeRefresher?
+    /// Synchronous session observers (#731).
+    private var cancellables = Set<AnyCancellable>()
 
     public let features: OneloFeatures
     public let paywall: OneloPaywall
@@ -64,7 +69,7 @@ public final class Onelo: ObservableObject {
     ///     the `ONELO_FEATURE_ENVIRONMENT` process env var; if still unset the
     ///     backend falls back to the key prefix (old behavior). See
     ///     docs/architecture/feature-environment-explicit.md.
-    public init(
+    public convenience init(
         publishableKey: String,
         callbackScheme: String = "",
         baseURL: URL,
@@ -74,6 +79,36 @@ public final class Onelo: ObservableObject {
         appVersion: String? = nil,
         environment: String? = nil,
         featureEnvironment: String? = nil
+    ) {
+        self.init(
+            publishableKey: publishableKey,
+            callbackScheme: callbackScheme,
+            baseURL: baseURL,
+            suppressIdentifyWarning: suppressIdentifyWarning,
+            featureDefaultStatus: featureDefaultStatus,
+            autoLifecycleRefresh: autoLifecycleRefresh,
+            appVersion: appVersion,
+            environment: environment,
+            featureEnvironment: featureEnvironment,
+            makeAuth: { OneloAuth(config: $0) }
+        )
+    }
+
+    /// Designated initializer. `makeAuth` builds the `OneloAuth` from the
+    /// resolved config: apps get `OneloAuth(config:)` (the Keychain); tests
+    /// build one over an in-memory store so they never touch the real Keychain
+    /// (#732), optionally with its `initialize()` skipped.
+    init(
+        publishableKey: String,
+        callbackScheme: String = "",
+        baseURL: URL,
+        suppressIdentifyWarning: Bool = false,
+        featureDefaultStatus: FeatureStatus = .hidden,
+        autoLifecycleRefresh: Bool = true,
+        appVersion: String? = nil,
+        environment: String? = nil,
+        featureEnvironment: String? = nil,
+        makeAuth: (OneloConfig) -> OneloAuth
     ) {
         // Resolve the feature environment: explicit arg → Info.plist
         // (OneloFeatureEnvironment) → process env (ONELO_FEATURE_ENVIRONMENT).
@@ -93,7 +128,7 @@ public final class Onelo: ObservableObject {
         // Both are injected into the sibling transports below so the entire SDK
         // reads ONE security context: a token written once by the producer
         // (OneloAuth) is visible to every transport with nothing to mirror.
-        let oneloAuth = OneloAuth(config: OneloConfig(
+        let oneloAuth = makeAuth(OneloConfig(
             publishableKey: publishableKey,
             apiUrl: baseURL,
             callbackScheme: callbackScheme,
@@ -111,7 +146,10 @@ public final class Onelo: ObservableObject {
             suppressIdentifyWarning: suppressIdentifyWarning,
             defaultStatus: featureDefaultStatus,
             appVersion: appVersion,
-            featureEnvironment: resolvedFeatureEnv
+            featureEnvironment: resolvedFeatureEnv,
+            // The signed-in user's access token proves the user on every
+            // Features call (#519); the shared stream already has it from auth.
+            userToken: oneloAuth.userToken
         )
         self.features = featuresModule
         // #37 — gate the discovery batch-ping on the App Attest token being ready
@@ -138,7 +176,15 @@ public final class Onelo: ObservableObject {
         self.paywall = OneloPaywall(client: client)
         self.forms = OneloForms(client: client)
         self.waitlist = OneloWaitlist(client: client)
-        self.feedback = OneloFeedback(client: client, features: featuresModule)
+        self.feedback = OneloFeedback(client: client, features: featuresModule, userToken: oneloAuth.userToken)
+        // #681 — the feedback chrome follows the one brand-token model.
+        Task { @MainActor [weak feedback = self.feedback, weak oneloAuth] in
+            guard let auth = oneloAuth else { return }
+            for await t in auth.$brandTokens.values {
+                guard let feedback else { break }
+                feedback.brandTokens = t
+            }
+        }
         self.auth = OneloAuthModule(auth: oneloAuth)
 
         // Wire the upsell tap router: "Available in <plan>" UI (menu badges
@@ -160,25 +206,36 @@ public final class Onelo: ObservableObject {
             Task { @MainActor in authObject?.resetAttestedKeyForSelfHeal() }
         }
 
+        // Features follow the identity (onelo-swift-staging#1). At launch with a stored
+        // session, render that user's persisted snapshot (unconfirmed) at once —
+        // not the anonymous one — and let refreshes wait for the restore, so
+        // nothing resolves anonymously ahead of the restored user. The identity
+        // itself loads from the session watcher below; when the restore ends
+        // without a session, the watcher after it loads the signed-out identity.
+        //
+        // Nothing is mirrored for transport security: the attest bearer + codesign
+        // fingerprint reach every transport through the shared `securityContext`.
+        featuresModule._identityPending = { [weak oneloAuth] in
+            oneloAuth?.isRestoringSession ?? false
+        }
+        // #731: tell features about a sign-in synchronously, before the host
+        // app's own observers run and before the async session watcher below
+        // loads the identity — so a host that awaits `ready()` on `isAllowedIn`
+        // waits for the signed-in user's snapshot, not the previous one.
+        oneloAuth.$currentSession
+            .map { $0?.user.id }
+            .removeDuplicates()
+            .sink { [weak featuresModule] uid in featuresModule?._signedInUserWillChange(to: uid) }
+            .store(in: &cancellables)
+        if oneloAuth.isRestoringSession, let storedUserId = oneloAuth.storedUserIdSync() {
+            featuresModule._seedPersistedSnapshot(userId: storedUserId)
+        }
         Task { @MainActor [weak self] in
             guard let self else { return }
-            // OneloAuth marks isReady=true as soon as the AuthClient is wired;
-            // attestation (when required) runs in the background. Don't block
-            // features on the attest token — kick off the initial features load
-            // once isReady, regardless of whether the token has arrived.
-            //
-            // Nothing is mirrored here: the attest bearer + codesign fingerprint
-            // reach EVERY transport (shared REST client, SSE, monitor, auth
-            // URLSession) through the shared `securityContext` — the bearer via
-            // OneloAuth's `attestToken` didSet whenever attestation completes, the
-            // macOS codesign fingerprint seeded eagerly at OneloAuth init. A
-            // request issued before the token lands simply goes without it (the
-            // macOS backend path is soft; iOS reconnects) and the next one carries
-            // it. This replaced the old per-transport mirror that silently missed
-            // the SSE client and 403'd features/stream in a loop (#34).
-            for await ready in self.auth.authObject.$isReady.values {
-                guard ready else { continue }
-                await self.features._load(userId: nil)
+            for await restoring in self.auth.authObject.$isRestoringSession.values where !restoring {
+                if self.auth.authObject.currentSession == nil {
+                    await self.features._loadInitialIdentityIfNeeded()
+                }
                 break
             }
         }
@@ -206,6 +263,7 @@ public final class Onelo: ObservableObject {
             for await session in self.auth.authObject.$currentSession.values {
                 let uid = session?.user.id
                 let ent = session?.user.entitlement
+                let isFirst = !seenFirst
                 let userChanged = !seenFirst || uid != lastUserId
                 let entChanged = seenFirst && uid == lastUserId && ent != lastEntitlement
                 lastUserId = uid
@@ -214,7 +272,17 @@ public final class Onelo: ObservableObject {
 
                 if userChanged {
                     self.monitor.setUserId(uid)
-                    await self.features._load(userId: uid)
+                    // The launch's first `nil` while a stored session is still
+                    // being restored is not a signed-out identity: loading it
+                    // would put the anonymous snapshot in front of the user.
+                    let restorePending = uid == nil && self.auth.authObject.isRestoringSession
+                    if restorePending {
+                        // The restore watcher above loads the outcome.
+                    } else if isFirst && uid == nil {
+                        await self.features._loadInitialIdentityIfNeeded()
+                    } else {
+                        await self.features._load(userId: uid)
+                    }
                     if let session {
                         self.startHeartbeat(accessToken: session.accessToken)
                     } else {
@@ -225,6 +293,20 @@ public final class Onelo: ObservableObject {
                 }
                 // else: token refresh → no-op (preserves SSE stability).
             }
+        }
+
+        // #659: a purchase / plan switch handed back by any hosted container
+        // (auth view store, portal, browser deep link) reconciles features +
+        // entitlement at once, instead of waiting for the stream. One
+        // refresher, so the containers cannot drift.
+        let refresher = PlanChangeRefresher(
+            refreshFeatures: { [weak featuresModule] in await featuresModule?.refresh(force: true) },
+            revalidateEntitlement: { [weak oneloAuth] in _ = await oneloAuth?.revalidateEntitlement() },
+            snapshot: { [weak featuresModule] in featuresModule?.snapshotKey() ?? "" }
+        )
+        self.planChange = refresher
+        oneloAuth.planChangeHandler = { [weak refresher] change in
+            Task { @MainActor in await refresher?.handBack(change) }
         }
 
         if autoLifecycleRefresh {
@@ -290,17 +372,16 @@ public final class Onelo: ObservableObject {
         #endif
     }
 
-    /// Set user context for feature targeting. Call once after login.
-    /// Only needed when NOT using Onelo Auth — Onelo Auth sets this automatically.
+    /// Deprecated: the signed-in Onelo user is used automatically. Onelo Auth
+    /// is mandatory (#511), and every Features call proves that user with
+    /// their access token, so there is nothing to identify. `userIdHash` is
+    /// ignored (Secure Mode is retired). Kept so existing code compiles.
     ///
-    /// Also propagates the user id into ``monitor`` so captured events
-    /// carry ``user_id`` — without this, Pro/Business apps using their
-    /// own auth would emit monitor events as ``anonymous`` despite calling
-    /// ``identify(...)`` correctly. The Onelo-Auth path already does this
-    /// via the session watcher in ``init``; identity-mode has no watcher,
-    /// so we do the same propagation by hand here.
+    /// Without an Onelo session the id is still sent unverified until the
+    /// server stops trusting it (#521); with one, the token decides the user.
+    @available(*, deprecated, message: "The signed-in Onelo user is used automatically; Features calls prove them with their access token. userIdHash is ignored.")
     public func identify(_ userId: String, userIdHash: String? = nil) async {
-        await features._load(userId: userId, userIdHash: userIdHash)
+        await features._load(userId: userId)
         self.monitor.setUserId(userId)
     }
 
@@ -316,11 +397,13 @@ public final class Onelo: ObservableObject {
     // MARK: - Upgrade flow ("Available in <plan>" tap)
 
     /// Resolves the right upgrade destination for `plan` and opens it in the
-    /// system browser. The BACKEND decides the target (single source of truth
-    /// for billing state): active subscribers land on the hosted manage page
-    /// with the target plan highlighted ("Change plan", one explicit click to
-    /// confirm — the link never executes the change itself); users without a
-    /// subscription land on the hosted store.
+    /// SDK's own portal window (#606), returning when it closes. The BACKEND
+    /// decides the target (single source of truth for billing state): active
+    /// subscribers land on the plan switch with the target plan pinned (one
+    /// explicit click to confirm — the link never executes the change itself);
+    /// users without a paid plan land on the hosted store; with plan changes
+    /// off, the portal explains it. A purchase or switch made there closes the
+    /// window, and the new plan reaches `features` over the Event Stream.
     ///
     /// Requires a signed-in user. Wired automatically to upsell menu badges
     /// via ``OneloUpgradeRouter``; call directly from custom upsell UI.
@@ -361,13 +444,12 @@ public final class Onelo: ObservableObject {
                 print("[Onelo] openUpgrade: malformed upgrade-initiate response")
                 return
             }
-            #if canImport(AppKit) && !targetEnvironment(macCatalyst)
-            NSWorkspace.shared.open(url)
-            #elseif canImport(UIKit)
-            // Swift 6 / Xcode 26 resolves open(_:) to the async overload in this
-            // async context — must be awaited (matches openCustomerPortalInBrowser).
-            await UIApplication.shared.open(url)
-            #endif
+            await auth.authObject.adoptBrandTokens(fromJSON: resp) // #681
+            // #606 — the SDK's own portal container, not the system browser: a
+            // browser tab never hands a finished purchase or plan switch back.
+            // The container decodes every hand-back, closes itself, and the
+            // entitlement is re-read before this returns.
+            await auth.authObject.presentInPortalContainer(url)
         } catch {
             print("[Onelo] openUpgrade failed: \(error)")
         }

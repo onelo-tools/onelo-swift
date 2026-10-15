@@ -1,8 +1,8 @@
 import SwiftUI
 
 /// The unified close affordance for every Onelo SDK modal (feedback sheet,
-/// customer portal, …): an SF Symbol `xmark`, neutral (`.secondary`), no Onelo
-/// branding. It must LOOK IDENTICAL everywhere — the exact same gray glyph.
+/// customer portal, …): an SF Symbol `xmark` in the brand's muted text colour
+/// (#681), no Onelo branding. It must LOOK IDENTICAL everywhere — the exact same gray glyph.
 ///
 /// The only difference between the two `Style`s is INVISIBLE — it does not change
 /// how the glyph looks, only how the host supplies neutral colour + a tap target:
@@ -24,6 +24,9 @@ struct OneloCloseButton: View {
 
     let style: Style
     let action: () -> Void
+    /// #681 — the glyph is the brand's muted text colour, so it reads on a
+    /// light page as on a dark one and matches the hosted page's own ✕.
+    @Environment(\.oneloBrandTokens) private var tokens
 
     init(style: Style = .toolbar, action: @escaping () -> Void) {
         self.style = style
@@ -35,7 +38,7 @@ struct OneloCloseButton: View {
         case .toolbar:
             Button(action: action) {
                 Image(systemName: "xmark")
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(OneloBrandPalette(tokens).textMuted)
             }
             .accessibilityLabel("Close")
         case .overlay:
@@ -44,7 +47,7 @@ struct OneloCloseButton: View {
                 // size/weight — wrapped in an INVISIBLE 44×44 hit target so it's
                 // reliably tappable over the WKWebView without changing its look.
                 Image(systemName: "xmark")
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(OneloBrandPalette(tokens).textMuted)
                     .frame(width: 44, height: 44)
                     .contentShape(Rectangle())
             }

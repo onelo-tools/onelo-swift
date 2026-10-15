@@ -27,6 +27,10 @@ public final class OneloFeatures {
     /// call to `feature(_:)` from inside `body` mutates a tracked property and
     /// the view re-evaluates forever.
     private var cache: [String: FeatureState] = [:]
+    /// #606 — change subscribers (`subscribe(_:)`), fired after every snapshot
+    /// mutation. Ignored by Observation: registering a listener is not a state
+    /// change a view should re-render for.
+    @ObservationIgnored private var changeListeners: [UUID: @MainActor () -> Void] = [:]
     @ObservationIgnored private var discoveredNames: Set<String> = []
     @ObservationIgnored private var configVersion: Int = 0
     /// Shared SSE pipe. When OneloFeatures is constructed via the top-level
@@ -40,8 +44,8 @@ public final class OneloFeatures {
     @ObservationIgnored private let ownsEventStream: Bool
     @ObservationIgnored private var pendingPingTask: Task<Void, Never>?
 
-    /// Last time we observed activity on the SSE channel (any event, including
-    /// the server's `:` heartbeat comments which surface as empty events).
+    /// Last time we observed activity on the SSE channel: any event, or the
+    /// server's `: keepalive` comment (`OneloEventStream.onActivity`).
     /// Used by the healthcheck timer to detect zombie connections — sockets that
     /// stay TCP-`ESTABLISHED` but stop delivering data, typically because macOS
     /// App Nap suspended the URLSession or a NAT box dropped the flow.
@@ -68,13 +72,11 @@ public final class OneloFeatures {
     private let defaultStatus: FeatureStatus
     @ObservationIgnored private var anonymousWarningLogged: Bool = false
     @ObservationIgnored private var currentUserId: String?
-    /// HMAC-SHA256 of `userId` signed with the app's secret key, supplied by
-    /// the host app when running in secure mode (Features Entitlement
-    /// Enforcement). Threaded into `/resolve`, `/batch-ping`, and the SSE
-    /// query string so the backend can verify the caller's claim to `userId`.
-    /// Nil for callers not yet in secure mode (e.g. Turingo) — in that case
-    /// the field is omitted from outgoing payloads.
-    @ObservationIgnored private(set) var currentUserIdHash: String?
+    /// The signed-in Onelo user's access token, sent as `Authorization: Bearer`
+    /// on every Features call so the server knows who the user really is
+    /// (#519). Wired by `Onelo` to `OneloAuth`; nil (standalone use) sends no token.
+    @ObservationIgnored private let userToken: _OneloUserToken?
+    @ObservationIgnored private var userTokenRefusedWarned = false
     @ObservationIgnored private var destroyed: Bool = false
     @ObservationIgnored private let _appVersion: String?
     /// Explicit feature environment ("test"|"live"). Forwarded on `/resolve`,
@@ -83,11 +85,38 @@ public final class OneloFeatures {
     /// agree on env. Nil → omitted → backend uses the key prefix (old behavior).
     @ObservationIgnored private let _featureEnvironment: String?
 
-    /// Cold-start synchronization. Set to `true` the first time the SSE stream
-    /// delivers a `connected` or `up_to_date` event. Once flipped, it stays true
-    /// for the lifetime of this `OneloFeatures` instance — `ready()` then becomes
-    /// an instant return.
-    @ObservationIgnored private var firstEventReceived: Bool = false
+    /// True once the server has confirmed the snapshot in memory for the
+    /// CURRENT identity (onelo-swift-staging#1): a `connected` / `features_updated` frame on a
+    /// connection that proved this identity, an `up_to_date` answering a version
+    /// confirmed for it, or a `/resolve` sent for it. Reset on every identity
+    /// change — a persisted or previous identity's snapshot is never "ready".
+    /// Observable, so SwiftUI can gate on it; it never changes inside `feature(_:)`.
+    public private(set) var isSnapshotConfirmed: Bool = false
+    /// Bumped on every identity change. A result started under an older
+    /// generation (a `/resolve` in flight, a stream frame for another user) is
+    /// dropped instead of replacing the current identity's snapshot.
+    @ObservationIgnored private var identityGeneration: UInt64 = 0
+    /// False until the first `_load`; the first load is always an identity change.
+    @ObservationIgnored private var identityLoaded = false
+    /// The `config_version` the server confirmed for the current identity, 0
+    /// until it has. Only this is sent as `since_version`: the version is
+    /// app-wide, so sending a persisted (or another identity's) version would let
+    /// the stream answer `up_to_date` over a snapshot it never resolved for
+    /// this user.
+    @ObservationIgnored private var confirmedVersion: Int = 0
+    /// Wired by `Onelo` to "a stored session is still being restored". While it
+    /// holds, refreshes wait (bounded) so they resolve for the restored user
+    /// instead of anonymously.
+    @ObservationIgnored var _identityPending: (() -> Bool)? = nil
+    /// The signed-in Onelo user, as `Onelo` hears it the moment the session
+    /// changes (#731). The identity itself loads a turn later, from the session
+    /// watcher; until then the snapshot in memory belongs to someone else, so
+    /// it is not confirmed and `ready()` waits. Nil when nobody is signed in.
+    @ObservationIgnored private var signedInUserId: String?
+    /// Upper bound on that wait.
+    @ObservationIgnored var _identitySettleTimeout: TimeInterval = 10
+    /// The `/resolve` started by the last identity change (test seam).
+    @ObservationIgnored private(set) var _identityResolveTask: Task<Void, Never>?
     /// Pending `ready()` continuations keyed by a per-call UUID so that the signal
     /// and the timeout can each atomically claim a specific entry without risking a
     /// double-resume on `CheckedContinuation`. All access is serialized by the
@@ -101,9 +130,11 @@ public final class OneloFeatures {
         suppressIdentifyWarning: Bool = false,
         defaultStatus: FeatureStatus = .hidden,
         appVersion: String? = nil,
-        featureEnvironment: String? = nil
+        featureEnvironment: String? = nil,
+        userToken: _OneloUserToken? = nil
     ) {
         self.client = client
+        self.userToken = userToken
         self.monitor = monitor
         self.suppressIdentifyWarning = suppressIdentifyWarning
         self.defaultStatus = defaultStatus
@@ -123,6 +154,9 @@ public final class OneloFeatures {
         // /resolve returns. Safe to set even on an injected (shared) stream —
         // auth ignores it; only the features endpoint reads `environment`.
         self.eventStream.featureEnvironment = featureEnvironment
+        // A stream this instance owns proves the user the same way its calls
+        // do; an injected (auth-owned) stream already has auth's token source.
+        if ownsEventStream, let userToken { self.eventStream.userToken = userToken }
         _registerEventHandlers()
     }
 
@@ -130,8 +164,13 @@ public final class OneloFeatures {
     /// Called exactly once in `init` so duplicate registrations are
     /// impossible across `_load` / signin cycles.
     private func _registerEventHandlers() {
+        // Every frame — including the keepalive comment, which reaches no
+        // handler below — proves the connection is alive (#368).
+        eventStream.onActivity { [weak self] in
+            self?.lastEventReceived = Date()
+        }
         eventStream.on("connected") { [weak self] data in
-            guard let self,
+            guard let self, self._streamSpeaksForCurrentIdentity(),
                   let payload = OneloFeatures._decodeJSON(data) else { return }
             // Server has a newer version — apply the full snapshot.
             if let features = payload["features"] as? [String: [String: Any]] {
@@ -139,33 +178,40 @@ public final class OneloFeatures {
                     version: payload["config_version"] as? Int ?? self.configVersion,
                     features: features,
                 )
+                self._confirmSnapshot()
             }
             self._maybeWarnAnonymous(payload)
-            self._signalFirstEvent()
-            self.lastEventReceived = Date()
         }
         eventStream.on("up_to_date") { [weak self] data in
-            guard let self,
+            guard let self, self._streamSpeaksForCurrentIdentity(),
                   let payload = OneloFeatures._decodeJSON(data) else { return }
-            if let v = payload["config_version"] as? Int { self.configVersion = v }
-            self._signalFirstEvent()
-            self.lastEventReceived = Date()
+            // Confirms only a version the server already confirmed for THIS
+            // identity — never a persisted or another identity's one.
+            if let v = payload["config_version"] as? Int, self.confirmedVersion != 0, v == self.confirmedVersion {
+                self._confirmSnapshot()
+            }
         }
         eventStream.on("features_updated") { [weak self] data in
-            guard let self,
+            guard let self, self._streamSpeaksForCurrentIdentity(),
                   let payload = OneloFeatures._decodeJSON(data) else { return }
             if let features = payload["features"] as? [String: [String: Any]] {
                 self._applySnapshot(
                     version: payload["config_version"] as? Int ?? self.configVersion,
                     features: features,
                 )
+                self._confirmSnapshot()
             }
-            self.lastEventReceived = Date()
         }
         eventStream.on("discovery_requested") { [weak self] _ in
             self?._scheduleBatchPing()
-            self?.lastEventReceived = Date()
         }
+    }
+
+    /// Whether the frame being dispatched is about the current identity: the
+    /// connection names the same user, and it is not the anonymous fallback of a
+    /// refused token while a user is signed in (its snapshot is the no-user one).
+    private func _streamSpeaksForCurrentIdentity() -> Bool {
+        eventStream.connectionUserId == currentUserId
     }
 
     private static func _decodeJSON(_ data: String) -> [String: Any]? {
@@ -206,26 +252,25 @@ public final class OneloFeatures {
         return state
     }
 
-    /// Awaits the first SSE event (`connected` or `up_to_date`) so the host app
-    /// can render feature-dependent UI without a cold-start flicker. After a long
-    /// offline period the stale UserDefaults cache is shown immediately by `_load`,
-    /// then SSE arrives ~50–300ms later with the fresh snapshot — re-rendering the
-    /// view. Calling `await onelo.features.ready()` before the first render lets
-    /// the app wait briefly for that fresh state.
+    /// Awaits a snapshot the server has confirmed for the CURRENT identity, so
+    /// the host app can present gated UI complete on its first render — at
+    /// launch, and again after a sign-in or a user switch.
     ///
     /// Behavior:
-    /// - Returns immediately if the first SSE event has already arrived.
-    /// - Returns after `timeout` seconds (default 1.5s) if SSE is slow or offline —
-    ///   the host then renders from cache as before. SSE keeps reconnecting in the
-    ///   background regardless, so the view will still update once the snapshot
-    ///   arrives.
-    /// - Does **not** open a second SSE connection; piggy-backs on the stream
-    ///   started by `_load` (i.e. by SDK initialization).
-    /// - Safe to call from multiple call-sites concurrently; all callers resolve
-    ///   together on the first event (or each on its own timeout).
-    /// - Never throws.
+    /// - Returns immediately when ``isSnapshotConfirmed`` is true.
+    /// - Otherwise waits until the stream (`connected` / `features_updated`) or
+    ///   a `/resolve` confirms a snapshot for the current identity. A stored
+    ///   session still being restored at launch counts as "not settled": the
+    ///   wait ends with the restored user's snapshot, not an anonymous one.
+    /// - An identity change resets it: after sign-in or a user switch, `ready()`
+    ///   waits for the new user's snapshot even if it returned before.
+    /// - Returns after `timeout` seconds (default 1.5s) if the network is slow or
+    ///   offline; the persisted snapshot of that identity (if any) is then what
+    ///   ``feature(_:)`` returns, and the UI updates when the snapshot lands
+    ///   (``subscribe(_:)`` fires).
+    /// - Safe to call from multiple call-sites concurrently. Never throws.
     public func ready(timeout: TimeInterval = 1.5) async {
-        if firstEventReceived { return }
+        if isSnapshotConfirmed && !_awaitsSignedInUser { return }
 
         let id = UUID()
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
@@ -257,32 +302,35 @@ public final class OneloFeatures {
     ///
     /// Throws:
     /// - `.notAuthenticated` if `_load(userId:)` hasn't been called yet
-    ///   (no network call is made in this case).
+    ///   (no network call is made in this case), or the signed-in user's
+    ///   access token was refused even after a refresh.
     /// - `.notEntitled` (403) if the current user lacks access to `slug`.
-    /// - `.secureModeRequired` (401) if the app requires `userIdHash` but
-    ///   none was supplied.
-    /// - `.invalidUserHash` (401) if the supplied `userIdHash` failed HMAC
-    ///   verification on the backend.
     /// - `.networkError` for transport failures or malformed responses.
     public func moduleToken(for slug: String) async throws -> String {
         guard let uid = currentUserId else {
             throw OneloFeaturesError.notAuthenticated
         }
-        var body: [String: Any] = [
+        let body: [String: Any] = [
             "publishableKey": client.publishableKey,
             "userId": uid,
             "slug": slug,
         ]
-        if let hash = currentUserIdHash {
-            body["userIdHash"] = hash
-        }
         let status: Int
         let json: [String: Any]
         do {
-            (status, json) = try await client.postRaw(
-                path: "/api/sdk/features/module-token",
-                body: body
-            )
+            // A module token is always for a user, so a refused token ends
+            // here (`.notAuthenticated`) instead of retrying anonymously.
+            (status, json) = try await _sendWithUserToken(
+                userToken,
+                anonymousFallback: false,
+                onRefused: { _warnUserTokenRefused() }
+            ) { attempt in
+                try await client.postRaw(
+                    path: "/api/sdk/features/module-token",
+                    body: body,
+                    headers: _OneloUserTokenWire.headers(attempt.token)
+                )
+            }
         } catch {
             throw OneloFeaturesError.networkError
         }
@@ -293,12 +341,7 @@ public final class OneloFeatures {
             }
             return token
         case 401:
-            let errCode = (json["detail"] as? [String: Any])?["error"] as? String
-            switch errCode {
-            case "secure_mode_required": throw OneloFeaturesError.secureModeRequired
-            case "invalid_user_hash":    throw OneloFeaturesError.invalidUserHash
-            default:                     throw OneloFeaturesError.notAuthenticated
-            }
+            throw OneloFeaturesError.notAuthenticated
         case 403:
             throw OneloFeaturesError.notEntitled
         default:
@@ -332,18 +375,67 @@ public final class OneloFeatures {
             guard now.timeIntervalSince(lastRefreshAt) >= _refreshDebounce else { return }
         }
         lastRefreshAt = now
+        await _awaitIdentitySettled()
+        // Still restoring after the bounded wait (a slow config fetch / verify
+        // in an outage): resolving now would answer for no user and replace
+        // the restored user's snapshot. The identity's own load resolves once
+        // the restore ends, so skip this one.
+        if _identityPending?() == true { return }
         await _runRefresh(userId: currentUserId)
     }
 
+    /// While a stored session is being restored, wait (bounded) for it, so a
+    /// refresh fired at launch — the macOS activation, a host's menu — resolves
+    /// for the restored user, not anonymously ahead of it.
+    private func _awaitIdentitySettled() async {
+        guard let pending = _identityPending, pending() else { return }
+        let deadline = Date().addingTimeInterval(_identitySettleTimeout)
+        while pending(), Date() < deadline {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+    }
+
+    /// A comparable picture of the current snapshot — the plan-change
+    /// refresher (#659) re-checks until it differs.
+    func snapshotKey() -> String {
+        cache.keys.sorted().map { name -> String in
+            let s = cache[name]!
+            return "\(name)|\(s.status)|\(String(describing: s.reason))|\(s.requiredPlan ?? "")|\(s.upgradeCta)"
+        }.joined(separator: "\n")
+    }
+
     func _runRefresh(userId: String?) async {
-        var body: [String: Any] = ["publishableKey": client.publishableKey]
-        if let uid = userId { body["userId"] = uid }
-        if let hash = currentUserIdHash { body["userIdHash"] = hash }
-        if let env = _featureEnvironment { body["environment"] = env }
+        // The answer belongs to the identity that asked. A user switch (or the
+        // restored user loading) while it is in flight makes it stale.
+        let generation = identityGeneration
         do {
-            let response = try await client.post(path: "/api/sdk/features/resolve", body: body)
-            guard let features = response["features"] as? [String: [String: Any]] else { return }
+            // A request for no user carries no token: the answer must be the one
+            // for the identity this snapshot is kept under. A signed-in user whose
+            // token is refused even after a refresh gets NO anonymous retry here:
+            // the anonymous snapshot (open-to-everyone features only) must never
+            // stand in for theirs — their own snapshot stays until a call succeeds.
+            let (status, response) = try await _sendWithUserToken(
+                userId == nil ? nil : userToken,
+                anonymousFallback: userId == nil,
+                onRefused: { _warnUserTokenRefused() }
+            ) { attempt in
+                var body: [String: Any] = ["publishableKey": client.publishableKey]
+                // `userId` rides along with the token: the server ignores it
+                // when the token is valid, and a server without #517 still
+                // resolves by it. An anonymous fallback names no user.
+                if let uid = userId, !attempt.anonymous { body["userId"] = uid }
+                if let env = _featureEnvironment { body["environment"] = env }
+                return try await client.postRaw(
+                    path: "/api/sdk/features/resolve",
+                    body: body,
+                    headers: _OneloUserTokenWire.headers(attempt.token)
+                )
+            }
+            guard generation == identityGeneration, userId == currentUserId else { return }
+            guard (200..<300).contains(status),
+                  let features = response["features"] as? [String: [String: Any]] else { return }
             _applyResolveResult(features)
+            _confirmSnapshot()
             _maybeWarnAnonymous(response)
         } catch {
             // best-effort — SSE will catch up later
@@ -369,7 +461,33 @@ public final class OneloFeatures {
             )
         }
         cache = next
+        _emitChange()
         _writeCache()
+    }
+
+    // MARK: - Change callback
+
+    /// Subscribe to feature-state changes (#606). Fires on the main actor after
+    /// every snapshot change: a plan change or a dashboard deploy pushed over
+    /// the Event Stream, an identity swap, a `/resolve` refresh. Re-read
+    /// ``feature(_:)`` inside it. SwiftUI views need no subscription (this class
+    /// is `@Observable`); use it from AppKit / UIKit code such as a menu.
+    /// Parity with `onelo.features.subscribe` in the JS, Electron and React
+    /// Native SDKs.
+    ///
+    /// - Returns: A closure that removes the listener. Keep it, and call it when
+    ///   the owner goes away.
+    @discardableResult
+    public func subscribe(_ listener: @escaping @MainActor () -> Void) -> @MainActor () -> Void {
+        let id = UUID()
+        changeListeners[id] = listener
+        return { [weak self] in _ = self?.changeListeners.removeValue(forKey: id) }
+    }
+
+    private func _emitChange() {
+        // Snapshot first: a listener may unsubscribe (or subscribe) while we
+        // iterate.
+        for listener in Array(changeListeners.values) { listener() }
     }
 
     // MARK: - Internal
@@ -377,19 +495,25 @@ public final class OneloFeatures {
     /// Test helper — injects cache entries without a network call.
     func _setCache(_ entries: [String: FeatureStatus]) {
         for (k, v) in entries { cache[k] = FeatureState(name: k, status: v) }
+        _emitChange()
     }
 
-    /// Signals to all pending `ready()` callers that the first SSE event has
-    /// arrived. Idempotent — subsequent calls are no-ops. Exposed at module
-    /// (internal) scope so tests can drive it without spinning up a real SSE
-    /// stream; also called from `_handleSSEEvent` on the first `connected` /
-    /// `up_to_date` event.
-    func _signalFirstEvent() {
-        guard !firstEventReceived else { return }
-        firstEventReceived = true
+    /// Marks the snapshot confirmed for the current identity and releases every
+    /// pending `ready()` caller. Idempotent until the next identity change.
+    private func _confirmSnapshot() {
+        // A confirmation for the identity a sign-in is replacing releases nobody:
+        // the signed-in user's own load confirms next.
+        guard !_awaitsSignedInUser else { return }
+        if !isSnapshotConfirmed { isSnapshotConfirmed = true }
         let waiters = readyWaiters
         readyWaiters.removeAll()
         for (_, cont) in waiters { cont.resume() }
+    }
+
+    /// Test seam — confirms the current identity's snapshot without a network
+    /// call (the name predates identity-bound readiness).
+    func _signalFirstEvent() {
+        _confirmSnapshot()
     }
 
     /// Test helper — reports whether the SSE stream is in the "started" state.
@@ -418,6 +542,13 @@ public final class OneloFeatures {
         lastEventReceived = date
     }
 
+    /// Test seam — replaces the transport of the stream this instance owns.
+    func _setOpenStreamForTesting(
+        _ open: @escaping (_ queryItems: [URLQueryItem], _ headers: [String: String]) -> AsyncThrowingStream<_OneloHTTPClient.SSEEvent, Error>
+    ) {
+        eventStream._openStream = open
+    }
+
     /// Test helper — puts the underlying event stream into the "started"
     /// state (post-3.51 unification, `_checkSSEHealth` / `_resyncOnLifecycle`
     /// gate on `eventStream._isStartedForTesting`, not a private streamTask).
@@ -425,14 +556,26 @@ public final class OneloFeatures {
         eventStream.start(userId: userId)
     }
 
+    func _stopEventStreamForTesting() {
+        eventStream.stop()
+    }
+
     /// Bootstrap: restore cached snapshot, register discovered names, then open the
     /// SSE stream that delivers live deploys. Called by the Onelo orchestrator.
+    ///
+    /// `userIdHash` is ignored: Secure Mode is retired, and the signed-in Onelo
+    /// user is proven with their access token automatically.
     func _load(userId: String?, userIdHash: String? = nil) async {
-        currentUserId = userId
-        currentUserIdHash = userIdHash
-        _loadCache(userId: userId)
-        if _shouldBatchPingOnLoad() {
-            await _batchPing()
+        let identityChanged = !identityLoaded || userId != currentUserId
+        identityLoaded = true
+        if identityChanged {
+            // A new identity starts unconfirmed, from ITS persisted snapshot or
+            // from nothing — never from the previous identity's.
+            identityGeneration &+= 1
+            currentUserId = userId
+            isSnapshotConfirmed = false
+            confirmedVersion = 0
+            _replaceWithPersistedSnapshot(userId: userId)
         }
         // Stream lifecycle:
         //   • Injected stream (Onelo wrapper, ownsEventStream=false): OneloAuth
@@ -446,11 +589,57 @@ public final class OneloFeatures {
         //   • Standalone stream (ownsEventStream=true): no auth-side driver
         //     exists, so OneloFeatures must open the connection itself.
         if ownsEventStream {
-            eventStream.start(userId: userId, sinceVersion: configVersion, appVersion: _appVersion, userIdHash: userIdHash)
+            eventStream.start(userId: userId, sinceVersion: confirmedVersion, appVersion: _appVersion)
         } else {
-            eventStream.updateSinceVersion(configVersion)
+            eventStream.updateSinceVersion(confirmedVersion)
         }
         _startHealthcheck()
+        if identityChanged {
+            // Confirm the new identity's snapshot over REST in parallel to the
+            // stream: one round trip, also when the stream is slow, reconnecting
+            // (backoff after a server restart) or absent (no session → the
+            // auth-owned stream is closed).
+            lastRefreshAt = Date()
+            _identityResolveTask = Task { [weak self] in
+                await self?._runRefresh(userId: userId)
+            }
+        }
+        // Discovery last: its attest wait + round trip must not delay the
+        // identity's own snapshot (the session watcher awaits `_load`).
+        if _shouldBatchPingOnLoad() {
+            await _batchPing()
+        }
+    }
+
+    /// Loads the signed-out identity unless an identity was already loaded —
+    /// the end of a launch restore that produced no session.
+    func _loadInitialIdentityIfNeeded() async {
+        guard !identityLoaded else { return }
+        await _load(userId: nil)
+    }
+
+    /// A user is signed in whose identity has not loaded yet (#731).
+    private var _awaitsSignedInUser: Bool {
+        guard let signedInUserId else { return false }
+        return signedInUserId != currentUserId
+    }
+
+    /// Called by `Onelo` synchronously on every session change, before the host
+    /// app hears of it (`isAllowedIn`, `currentSession`) and before the session
+    /// watcher loads the new identity. A sign-in or a user switch un-confirms the
+    /// snapshot at once, so `isSnapshotConfirmed` and `ready()` never answer for
+    /// the previous identity in between.
+    func _signedInUserWillChange(to userId: String?) {
+        signedInUserId = userId
+        if _awaitsSignedInUser && isSnapshotConfirmed { isSnapshotConfirmed = false }
+    }
+
+    /// Fast first render at launch: while a stored session is being restored,
+    /// show THAT user's persisted snapshot (unconfirmed) instead of the
+    /// anonymous one. The identity itself loads when the session is restored.
+    func _seedPersistedSnapshot(userId: String) {
+        guard !identityLoaded else { return }
+        _replaceWithPersistedSnapshot(userId: userId)
     }
 
     /// Decide whether to send a batch-ping on startup.
@@ -506,7 +695,8 @@ public final class OneloFeatures {
         }
     }
 
-    private func _batchPing() async {
+    /// Internal (not private) so the user-token tests can drive one ping.
+    func _batchPing() async {
         let names = Array(discoveredNames)
         guard !names.isEmpty else { return }
         // #37 — wait (bounded) for the App Attest token; if it's STILL pending
@@ -519,25 +709,58 @@ public final class OneloFeatures {
             return
         }
         _pendingTokenPing = false
-        var body: [String: Any] = [
-            "publishableKey": client.publishableKey,
-            "features": names,
-        ]
-        if let uid = currentUserId { body["userId"] = uid }
-        if let hash = currentUserIdHash { body["userIdHash"] = hash }
-        if let env = _featureEnvironment { body["environment"] = env }
+        let userId = currentUserId
         do {
-            _ = try await client.post(
-                path: "/api/sdk/features/batch-ping",
-                body: body
-            )
+            // batch-ping answers a throttled 204 BEFORE it looks at the token,
+            // so its 2xx proves nothing about the token and must not end a
+            // refusal episode (`provesAcceptance: false`).
+            let (status, json) = try await _sendWithUserToken(
+                userToken,
+                provesAcceptance: false,
+                onRefused: { _warnUserTokenRefused() }
+            ) { attempt in
+                var body: [String: Any] = [
+                    "publishableKey": client.publishableKey,
+                    "features": names,
+                ]
+                if let uid = userId, !attempt.anonymous { body["userId"] = uid }
+                if let env = _featureEnvironment { body["environment"] = env }
+                return try await client.postRaw(
+                    path: "/api/sdk/features/batch-ping",
+                    body: body,
+                    headers: _OneloUserTokenWire.headers(attempt.token)
+                )
+            }
+            if !(200..<300).contains(status) {
+                let detail = (json["detail"] as? String)
+                    ?? ((json["detail"] as? [String: Any])?["message"] as? String)
+                    ?? "HTTP \(status)"
+                _logBatchPingRejected(detail)
+            }
         } catch {
-            // Best-effort, but loud enough to explain "discovery never
-            // happens": a rejection here is almost always a test key bound
-            // to a different device/app — the fix is dashboard → Features →
-            // Deploy access → Unbind.
-            print("[Onelo] features batch-ping rejected: \(error)")
+            _logBatchPingRejected("\(error)")
         }
+    }
+
+    /// Best-effort, but loud enough to explain "discovery never happens": a
+    /// rejection here is almost always a test key bound to a different
+    /// device/app — the fix is dashboard → Features → Deploy access → Unbind.
+    private func _logBatchPingRejected(_ detail: String) {
+        print("[Onelo] features batch-ping rejected: \(detail)")
+    }
+
+    /// The server refused the signed-in user's access token even after a
+    /// refresh, so the call went out anonymous. Features has no error
+    /// callback; this one-time log is its error channel (like the
+    /// anonymous-mode warning).
+    private func _warnUserTokenRefused() {
+        guard !userTokenRefusedWarned else { return }
+        userTokenRefusedWarned = true
+        print("""
+            [Onelo] The signed-in user's access token was refused by Features (invalid_user_token) \
+            even after a refresh, so the request was made without a user. \
+            Check that the publishableKey belongs to the app the user signed in to.
+            """)
     }
 
     /// #37 — re-fire a discovery batch-ping that was SKIPPED because the attest
@@ -593,6 +816,7 @@ public final class OneloFeatures {
 
     private func _applySnapshot(version: Int, features: [String: [String: Any]]) {
         configVersion = version
+        confirmedVersion = version
         var next: [String: FeatureState] = [:]
         for (name, dict) in features {
             guard let data = try? JSONSerialization.data(withJSONObject: dict),
@@ -608,6 +832,7 @@ public final class OneloFeatures {
             )
         }
         cache = next
+        _emitChange()
         _writeCache()
         // Mirror the new version into the shared SSE stream so the NEXT
         // reconnect carries the right `since_version` query param — the
@@ -628,12 +853,23 @@ public final class OneloFeatures {
         return "io.onelo.features.\(client.publishableKey).\(userId ?? "anon")"
     }
 
-    private func _loadCache(userId: String?) {
+    /// Replaces the in-memory snapshot with the one persisted for `userId`, or
+    /// with an empty one when there is none.
+    private func _replaceWithPersistedSnapshot(userId: String?) {
+        if !_loadCache(userId: userId) {
+            configVersion = 0
+            cache = [:]
+            _emitChange()
+        }
+    }
+
+    @discardableResult
+    private func _loadCache(userId: String?) -> Bool {
         let key = _cacheKey(userId: userId)
         guard let data = UserDefaults.standard.data(forKey: key),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { return }
-        if let v = json["config_version"] as? Int { configVersion = v }
+        else { return false }
+        configVersion = json["config_version"] as? Int ?? 0
         // v2 shape: features = [name: {status, reason?, required_plan?, upgrade_cta?}].
         // Persisting reason/required_plan matters: after a cold start the SSE
         // handshake often answers `up_to_date` (no fresh snapshot), so whatever
@@ -655,6 +891,8 @@ public final class OneloFeatures {
                 )
             }
             cache = next
+            _emitChange()
+            return true
         } else if let features = json["features"] as? [String: String] {
             // v1 (status-only) cache written by SDK ≤ 3.55 — accept once; the
             // next _writeCache persists the v2 shape.
@@ -665,7 +903,10 @@ public final class OneloFeatures {
                 }
             }
             cache = next
+            _emitChange()
+            return true
         }
+        return false
     }
 
     // MARK: - Healthcheck (zombie SSE detector)
@@ -708,7 +949,7 @@ public final class OneloFeatures {
         // in-flight `session.revoked` delivery.
         if ownsEventStream {
             eventStream.stop()
-            eventStream.start(userId: currentUserId, sinceVersion: configVersion, appVersion: _appVersion, userIdHash: currentUserIdHash)
+            eventStream.start(userId: currentUserId, sinceVersion: confirmedVersion, appVersion: _appVersion)
         }
     }
 
@@ -741,7 +982,7 @@ public final class OneloFeatures {
             print("[Onelo] Lifecycle resync — SSE stale (\(Int(elapsed))s), forcing reconnect")
             lastEventReceived = Date()
             eventStream.stop()
-            eventStream.start(userId: currentUserId, sinceVersion: configVersion, appVersion: _appVersion, userIdHash: currentUserIdHash)
+            eventStream.start(userId: currentUserId, sinceVersion: confirmedVersion, appVersion: _appVersion)
         }
         Task { [weak self] in
             await self?.refresh(force: true)
