@@ -34,6 +34,8 @@ public final class Onelo: ObservableObject {
     public let paywall: OneloPaywall
     public let forms: OneloForms
     public let waitlist: OneloWaitlist
+    /// Affiliate referral capture (#929): `affiliates.capture(url:consent:)`.
+    public let affiliates: OneloAffiliates
     public let auth: OneloAuthModule
     public let monitor: OneloMonitor
     public let feedback: OneloFeedback
@@ -176,6 +178,12 @@ public final class Onelo: ObservableObject {
         self.paywall = OneloPaywall(client: client)
         self.forms = OneloForms(client: client)
         self.waitlist = OneloWaitlist(client: client)
+        self.affiliates = OneloAffiliates(client: client) { [weak oneloAuth] in
+            await MainActor.run {
+                guard let s = oneloAuth?.currentSession else { return nil }
+                return (accessToken: s.accessToken, userId: s.user.id)
+            }
+        }
         self.feedback = OneloFeedback(client: client, features: featuresModule, userToken: oneloAuth.userToken)
         // #681 — the feedback chrome follows the one brand-token model.
         Task { @MainActor [weak feedback = self.feedback, weak oneloAuth] in
@@ -284,6 +292,8 @@ public final class Onelo: ObservableObject {
                         await self.features._load(userId: uid)
                     }
                     if let session {
+                        // #929: a referral kept on this device goes to the user who signs in.
+                        Task { [affiliates = self.affiliates] in await affiliates.claimForSession() }
                         self.startHeartbeat(accessToken: session.accessToken)
                     } else {
                         self.stopHeartbeat()

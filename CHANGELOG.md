@@ -5,7 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [3.104.0] — 2026-10-03
+## [3.105.0] — 2026-10-23
+
+### Added
+
+- `onelo.affiliates.capture(url:consent:)` captures an Affiliate referral from the link that opened your app
+  (#929). It reads `?ref=<code>` or `?onelo_click=<id>`. Without consent nothing
+  is stored on the device. With consent the click is kept and tied to the user
+  who signs in, so their purchase is attributed whichever checkout opens.
+
+## [3.104.0-staging] — 2026-10-03
 
 ### Added
 

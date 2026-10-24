@@ -82,8 +82,12 @@ final class BrandTokensTests: XCTestCase {
         let t = try config(",\"brand_tokens\":\(tokensJSON)").brandTokens
         let html = oneloPortalSkeletonHTML(t)
         XCTAssertTrue(html.contains("background:#f5f5f4"))
-        XCTAssertTrue(html.contains("background-color:#ffffff"))
+        // #948: light page → soft blocks take the border colour (card = ground).
+        XCTAssertTrue(html.contains(".sk{background-color:#e4e4e7"))
         XCTAssertTrue(html.contains("border-radius:21px"))
         XCTAssertFalse(html.contains("rgba(255,255,255,0.04)"))
+        var dark = t
+        dark.lightBg = false
+        XCTAssertTrue(dark.skeletonCSS.contains(".sk{background-color:\(t.cardBg)"))
     }
 }

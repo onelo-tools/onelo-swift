@@ -1,7 +1,5 @@
 # OneloSwift
 
-![Tests](https://github.com/onelo-tools/onelo-swift/actions/workflows/tests.yml/badge.svg)
-
 The Onelo SDK for iOS and macOS, written in Swift.
 
 Part of [Onelo](https://onelo.tools): hosted sign-in, a paywall on **your own Stripe** account, plan-gated feature flags, uptime monitoring, in-app feedback, a public roadmap and a waitlist — one SDK, wired together.
