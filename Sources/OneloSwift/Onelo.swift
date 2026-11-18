@@ -71,6 +71,11 @@ public final class Onelo: ObservableObject {
     ///     the `ONELO_FEATURE_ENVIRONMENT` process env var; if still unset the
     ///     backend falls back to the key prefix (old behavior). See
     ///     docs/architecture/feature-environment-explicit.md.
+    ///   - language: The App's language for its App User (`"de"`, `"pt-PT"`…),
+    ///     or `nil` (the default) for the device language. The Hosted Pages and
+    ///     this SDK's own texts ("Close", "Sign In", error messages) use it when
+    ///     it is one of your App Languages; otherwise the device language when
+    ///     it is one, otherwise your App's default (#1074).
     public convenience init(
         publishableKey: String,
         callbackScheme: String = "",
@@ -80,7 +85,8 @@ public final class Onelo: ObservableObject {
         autoLifecycleRefresh: Bool = true,
         appVersion: String? = nil,
         environment: String? = nil,
-        featureEnvironment: String? = nil
+        featureEnvironment: String? = nil,
+        language: String? = nil
     ) {
         self.init(
             publishableKey: publishableKey,
@@ -92,6 +98,7 @@ public final class Onelo: ObservableObject {
             appVersion: appVersion,
             environment: environment,
             featureEnvironment: featureEnvironment,
+            language: language,
             makeAuth: { OneloAuth(config: $0) }
         )
     }
@@ -110,6 +117,7 @@ public final class Onelo: ObservableObject {
         appVersion: String? = nil,
         environment: String? = nil,
         featureEnvironment: String? = nil,
+        language: String? = nil,
         makeAuth: (OneloConfig) -> OneloAuth
     ) {
         // Resolve the feature environment: explicit arg → Info.plist
@@ -134,7 +142,8 @@ public final class Onelo: ObservableObject {
             publishableKey: publishableKey,
             apiUrl: baseURL,
             callbackScheme: callbackScheme,
-            suppressIdentifyWarning: suppressIdentifyWarning
+            suppressIdentifyWarning: suppressIdentifyWarning,
+            language: language
         ))
         let securityContext = oneloAuth.securityContext
         let client = _OneloHTTPClient(publishableKey: publishableKey, baseURL: baseURL, securityContext: securityContext)
@@ -177,7 +186,7 @@ public final class Onelo: ObservableObject {
         }
         self.paywall = OneloPaywall(client: client)
         self.forms = OneloForms(client: client)
-        self.waitlist = OneloWaitlist(client: client)
+        self.waitlist = OneloWaitlist(client: client, language: language)
         self.affiliates = OneloAffiliates(client: client) { [weak oneloAuth] in
             await MainActor.run {
                 guard let s = oneloAuth?.currentSession else { return nil }
@@ -440,6 +449,9 @@ public final class Onelo: ObservableObject {
         var query: [URLQueryItem] = [
             URLQueryItem(name: "key", value: httpClient.publishableKey),
             URLQueryItem(name: "plan", value: plan),
+            // #1039: the App's language, else the device language (#1074); the
+            // backend picks the Page Language.
+            URLQueryItem(name: "lang", value: auth.authObject.config.requestLanguage()),
         ]
         if !callbackScheme.isEmpty {
             query.append(URLQueryItem(name: "callback_scheme", value: callbackScheme))

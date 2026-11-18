@@ -168,7 +168,7 @@ public final class OneloFeedback: NSObject, ObservableObject {
             backing: .buffered,
             defer: false
         )
-        win.title = "Send Feedback"
+        win.title = OneloText.sendFeedback.text
         win.minSize = NSSize(width: 480, height: 680)
         win.isReleasedWhenClosed = false
         win.appearance = nil
@@ -232,9 +232,9 @@ public final class OneloFeedback: NSObject, ObservableObject {
                     win?.makeKeyAndOrderFront(nil)
                 }
             } catch {
-                let message = error.localizedDescription
+                let message = oneloAppUserMessage(for: error, context: "feedback")
                 await MainActor.run {
-                    webView?.loadHTMLString(oneloErrorPageHTML(self.brandTokens, title: "Couldn't load feedback", message: message, retryHref: "onelo://feedback_retry"), baseURL: nil)
+                    webView?.loadHTMLString(oneloErrorPageHTML(self.brandTokens, title: OneloText.couldNotLoadFeedback.text, message: message, retryHref: "onelo://feedback_retry"), baseURL: nil)
                     win?.makeKeyAndOrderFront(nil)
                 }
             }

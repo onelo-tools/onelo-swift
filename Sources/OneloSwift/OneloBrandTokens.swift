@@ -357,10 +357,11 @@ func oneloEscapeHTML(_ s: String) -> String {
 /// An error screen with a "Try again" button that navigates `retryHref` (an SDK
 /// sentinel the web view's navigation delegate intercepts). Painted from the
 /// brand tokens (#681): page ground, text / muted text, the button pair + radius.
-func oneloErrorPageHTML(_ t: OneloBrandTokens, title: String, message: String, retryHref: String, buttonLabel: String = "Try again") -> String {
+/// Declares the Page Language its texts are in (#1074).
+func oneloErrorPageHTML(_ t: OneloBrandTokens, title: String, message: String, retryHref: String, buttonLabel: String = OneloText.tryAgain.text) -> String {
     """
     <!DOCTYPE html>
-    <html>
+    <html lang="\(oneloEscapeHTML(OneloPageLanguage.current))">
     <head>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>

@@ -1,7 +1,7 @@
 import Foundation
 
 public enum OneloSDK {
-    public static let sdkVersion = "3.105.0"
+    public static let sdkVersion = "3.109.0"
 }
 
 public enum UserRole: String, Codable, Sendable {
@@ -153,17 +153,31 @@ public struct OneloConfig: Sendable {
     /// features resolve in anonymous mode while targeted features exist. Set to true
     /// if your app is intentionally anonymous. Default: false.
     public let suppressIdentifyWarning: Bool
+    /// #1074 — the App's language for its App User (a BCP 47 tag such as
+    /// `"de"`), or `nil` for the device language. Sent wherever the SDK asks
+    /// for a Page Language: the Hosted Pages and this SDK's own texts ("Close",
+    /// "Sign In", error messages). The backend uses it when it is one of the
+    /// App Languages, else the device language, else the App's default.
+    public let language: String?
 
     public init(
         publishableKey: String,
         apiUrl: URL,
         callbackScheme: String = "",
-        suppressIdentifyWarning: Bool = false
+        suppressIdentifyWarning: Bool = false,
+        language: String? = nil
     ) {
         self.publishableKey = publishableKey
         self.apiUrl = apiUrl
         self.callbackScheme = callbackScheme
         self.suppressIdentifyWarning = suppressIdentifyWarning
+        self.language = language
+    }
+
+    /// The language a Page Language request sends: the one passed for this
+    /// call, else the App's (`language`), else the device language (#1039).
+    func requestLanguage(_ passed: String? = nil) -> String {
+        passed ?? language ?? OneloSignupMarketingConsent.deviceLanguage
     }
 }
 
@@ -260,6 +274,9 @@ struct ResolvedConfig: Decodable {
     let brandTokens: OneloBrandTokens
     /// #818 — the sign-up Marketing Consent question; not asked on an older backend.
     let signupMarketingConsent: OneloSignupMarketingConsent
+    /// #1074 — the Page Language this SDK draws its own texts in, chosen by the
+    /// backend; nil on an older backend or when it could not tell.
+    let pageLanguage: String?
 
     enum CodingKeys: String, CodingKey {
         case supabaseUrl = "supabase_url"
@@ -280,6 +297,7 @@ struct ResolvedConfig: Decodable {
         case primaryColor = "primary_color"
         case brandTokens = "brand_tokens"
         case signupMarketingConsent = "signup_marketing_consent"
+        case pageLanguage = "page_language"
     }
 
     init(from decoder: Decoder) throws {
@@ -311,6 +329,7 @@ struct ResolvedConfig: Decodable {
         }
         signupMarketingConsent = (try? c.decode(OneloSignupMarketingConsent.self, forKey: .signupMarketingConsent))
             ?? .notAsked
+        pageLanguage = try? c.decode(String.self, forKey: .pageLanguage)
     }
 }
 
@@ -400,27 +419,28 @@ public enum OneloError: LocalizedError, Sendable {
     /// allowed web origins nor `<registered-scheme>://…`.
     case invalidVerifyRedirect
 
+    /// What an App User may be shown is in the Page Language (#1074). Messages
+    /// that address the developer — a bad key, the Keychain, a missing setting,
+    /// a server's own message — stay as written.
     public var errorDescription: String? {
         switch self {
-        case .notAuthenticated: return "User is not authenticated"
-        case .invalidResponse: return "Invalid response from server"
+        case .notAuthenticated: return OneloText.errorNotAuthenticated.text
+        case .invalidResponse: return OneloText.errorInvalidResponse.text
         case .invalidPublishableKey(let msg): return "Invalid publishable key: \(msg)"
         case .keychainError(let msg): return "Keychain error: \(msg)"
-        case .networkError(let msg): return "Network error: \(msg)"
+        case .networkError(let msg): return OneloText.errorNetwork.text(detail: msg)
         case .serverError(let msg): return msg
-        case .cancelled: return "Sign in was cancelled"
+        case .cancelled: return OneloText.errorCancelled.text
         case .requiresHostedFlow: return "This app requires the hosted sign-in flow. Use presentHostedSignIn()."
-        case .timeout(let msg): return "Timed out: \(msg)"
-        case .storeNotConfigured: return "The store hasn't been configured for this app yet."
-        case .inAppStoreNotAllowed:
-            return "Plans can't be purchased inside this app. Buyers purchase on the web and sign in here."
-        case .sessionEnded: return "Your session ended — please sign in again"
-        case .userRevoked: return "This user account has been suspended"
-        case .noActivePlan: return "No active subscription — the plan has expired or was cancelled."
-        case .verificationRateLimited: return "At most 3 verification emails an hour — try again later"
+        case .timeout(let msg): return OneloText.errorTimeout.text(detail: msg)
+        case .storeNotConfigured: return OneloText.errorStoreNotConfigured.text
+        case .inAppStoreNotAllowed: return OneloText.errorInAppStoreNotAllowed.text
+        case .sessionEnded: return OneloText.errorSessionEnded.text
+        case .userRevoked: return OneloText.errorUserRevoked.text
+        case .noActivePlan: return OneloText.errorNoActivePlan.text
+        case .verificationRateLimited: return OneloText.errorVerificationRateLimited.text
         case .emailVerificationOff: return "Email verification is off for this app — turn it on in Auth → Sign-up"
-        case .invalidVerificationToken:
-            return "This verification link is invalid, already used, replaced by a newer one, or expired"
+        case .invalidVerificationToken: return OneloText.errorInvalidVerificationToken.text
         case .invalidVerifyRedirect:
             return "redirectTo must be one of this app's allowed web origins or <your-scheme>://…"
         }

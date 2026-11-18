@@ -40,7 +40,7 @@ struct OneloCloseButton: View {
                 Image(systemName: "xmark")
                     .foregroundStyle(OneloBrandPalette(tokens).textMuted)
             }
-            .accessibilityLabel("Close")
+            .accessibilityLabel(OneloText.close.text)
         case .overlay:
             Button(action: action) {
                 // Identical glyph to `.toolbar` — no circle, no material, default
@@ -52,7 +52,7 @@ struct OneloCloseButton: View {
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("Close")
+            .accessibilityLabel(OneloText.close.text)
         }
     }
 }

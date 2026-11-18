@@ -61,11 +61,12 @@ public struct FeatureState: Sendable {
     /// For `upsell` the label carries the unlocking plan when the backend
     /// provided one ("Available in pro") — that's the per-plan gating fallback
     /// ("users on other plans see: upsell") surfacing in the UI.
+    /// In the App User's Page Language (#1074); the plan name as written.
     public var badgeLabel: String? {
         switch status {
-        case .new: return "New"
-        case .beta: return "Beta"
-        case .coming_soon: return "Coming Soon"
+        case .new: return OneloText.badgeNew.text
+        case .beta: return OneloText.badgeBeta.text
+        case .coming_soon: return OneloText.badgeComingSoon.text
         case .greyed:
             // Greyed = locked. Always render a padlock so the user sees the
             // feature exists but is unavailable — apps must not hide it.
@@ -73,9 +74,9 @@ public struct FeatureState: Sendable {
         case .upsell:
             // Prefer the human product name; the bare key only as a stopgap
             // for older backends that don't send the label yet.
-            if let label = requiredPlanLabel, !label.isEmpty { return "Available in \(label)" }
-            if let plan = requiredPlan, !plan.isEmpty { return "Available in \(plan)" }
-            return "Upgrade"
+            if let label = requiredPlanLabel, !label.isEmpty { return OneloText.badgeAvailableIn.text(detail: label) }
+            if let plan = requiredPlan, !plan.isEmpty { return OneloText.badgeAvailableIn.text(detail: plan) }
+            return OneloText.badgeUpgrade.text
         default: return nil
         }
     }

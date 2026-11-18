@@ -103,7 +103,7 @@ private final class PortalPresentation {
             backing: .buffered,
             defer: false
         )
-        win.title = "Manage Account"
+        win.title = OneloText.manageAccount.text
         win.minSize = NSSize(width: 560, height: 680)
         win.isReleasedWhenClosed = false
         // #681 — the brand page_bg, so the window matches the skeleton + page.

@@ -257,6 +257,22 @@ public final class OneloAuth: ObservableObject {
     /// #818 — should your own sign-up screen ask for Marketing Consent, and
     /// with what text (in the device language). From `/api/sdk/config`.
     @Published public private(set) var signupMarketingConsent: OneloSignupMarketingConsent = .notAsked
+    /// #1074 — the App User's Page Language (ADR-0043): the language this SDK
+    /// draws its own texts in, the same one the Hosted Pages use. The App's
+    /// language (`OneloConfig.language`) when it is one of the App Languages,
+    /// else the device language when it is, else the App's default — chosen by
+    /// the backend in `/api/sdk/config`, kept for the next launch. `"en"` until
+    /// the first answer.
+    @Published public private(set) var pageLanguage: String = OneloPageLanguage.current
+
+    /// Adopt the Page Language `/api/sdk/config` answered (#1074). Nil (an
+    /// older backend, or one that could not read the App Languages) keeps the
+    /// current one.
+    func adoptPageLanguage(_ answer: String?) {
+        guard let lang = OneloPageLanguage.adopt(answer) else { return }
+        if pageLanguage != lang { pageLanguage = lang }
+        try? keychain.set(lang, forKey: KeychainKeys.pageLanguage)
+    }
 
     private var client: AuthClient?
     private let keychain: any OneloSessionStorage
@@ -364,6 +380,8 @@ public final class OneloAuth: ObservableObject {
         /// so a relaunch can still tell whether the outstanding verifier is
         /// inside its reuse window — see `_beginFlowPKCE`.
         static let flowVerifierIssuedAt = "flow_code_verifier_issued_at"
+        /// #1074 — the last Page Language, for the next launch's first paint.
+        static let pageLanguage = "page_language"
     }
 
     public convenience init(config: OneloConfig) {
@@ -426,6 +444,12 @@ public final class OneloAuth: ObservableObject {
         if let cached = try? keychain.get(forKey: KeychainKeys.brandTokens),
            let t = try? JSONDecoder().decode(OneloBrandTokens.self, from: Data(cached.utf8)) {
             brandTokens = t
+        }
+        // #1074 — the last Page Language, so the SDK's own texts are in it from
+        // the first paint, before resolveConfig lands.
+        if let cached = try? keychain.get(forKey: KeychainKeys.pageLanguage),
+           let lang = OneloPageLanguage.adopt(cached) {
+            pageLanguage = lang
         }
         // #36 — seed `isRestoringSession` SYNCHRONOUSLY here, BEFORE the async
         // `initialize()`/`restoreSession()` Task starts and BEFORE `isReady=true`.
@@ -709,8 +733,17 @@ public final class OneloAuth: ObservableObject {
     /// the happy path, so UI code can call it defensively.
     public func requiredConsents() async -> [OneloConsentRequirement] {
         guard let session = currentSession else { return [] }
-        let url = config.apiUrl.appendingPathComponent("/v1/sdk/consent/required")
-        var request = URLRequest(url: url)
+        // #1073: the App's language, else the device language (#1074); the
+        // backend picks the Page Language (within the App Languages) and links
+        // each document in it.
+        var components = URLComponents(
+            url: config.apiUrl.appendingPathComponent("/v1/sdk/consent/required"),
+            resolvingAgainstBaseURL: false
+        )!
+        components.queryItems = [
+            URLQueryItem(name: "lang", value: config.requestLanguage()),
+        ]
+        var request = URLRequest(url: components.url!)
         request.httpMethod = "GET"
         request.setValue("Bearer \(session.accessToken)", forHTTPHeaderField: "Authorization")
         addStandardHeaders(&request)
@@ -965,7 +998,10 @@ public final class OneloAuth: ObservableObject {
     /// Calls /api/sdk/paywall/store-initiate and returns a tokenized store URL for the WKWebView.
     /// The store page handles plan selection + payment + registration in one flow.
     /// After completion, it redirects to callbackScheme://callback?code=... — same as auth.
-    public func initiateStoreFlow(lang: String = "en") async throws -> URL {
+    /// `lang`: the App's language for the store. `nil` sends `OneloConfig.language`,
+    /// else the device language (#1039, #1074); the backend picks the Page
+    /// Language within the App Languages.
+    public func initiateStoreFlow(lang: String? = nil) async throws -> URL {
         // Fail here rather than at the server: the developer calling this from
         // their own UI on iOS gets the answer while building, not from an App
         // Review rejection weeks later. The backend 409 is still the real
@@ -985,7 +1021,7 @@ public final class OneloAuth: ObservableObject {
         components.queryItems = [
             URLQueryItem(name: "key", value: config.publishableKey),
             URLQueryItem(name: "callback_scheme", value: scheme),
-            URLQueryItem(name: "lang", value: lang),
+            URLQueryItem(name: "lang", value: config.requestLanguage(lang)),
         ]
         var request = URLRequest(url: components.url!)
         addStandardHeaders(&request)
@@ -1167,13 +1203,16 @@ public final class OneloAuth: ObservableObject {
     /// whatever URL it is told (or shows content when already authorized).
     /// `OneloAuthView` uses this internally; accessory apps that present their
     /// own WebView can call it directly to get the same decision.
-    public func resolveFlow(lang: String = "en") async throws -> FlowDecision {
+    /// `lang`: the App's language for the sign-in page. `nil` sends
+    /// `OneloConfig.language`, else the device language (#1039, #1074); the
+    /// backend picks the Page Language.
+    public func resolveFlow(lang: String? = nil) async throws -> FlowDecision {
         await _awaitAttestReady()  // #25: don't race the gated flow/init ahead of the attest token
         var components = URLComponents(url: config.apiUrl.appendingPathComponent("/api/sdk/flow/init"), resolvingAgainstBaseURL: false)!
         components.queryItems = [
             URLQueryItem(name: "key", value: config.publishableKey),
             URLQueryItem(name: "callback_scheme", value: config.callbackScheme),
-            URLQueryItem(name: "lang", value: lang),
+            URLQueryItem(name: "lang", value: config.requestLanguage(lang)),
             // Same binding as /auth/initiate — this endpoint mints the sign-in
             // token on the `present sign_in` branch, so it needs the challenge too.
             URLQueryItem(name: "code_challenge", value: _beginFlowPKCE()),
@@ -1709,7 +1748,7 @@ public final class OneloAuth: ObservableObject {
         if marketingConsent {
             // #818: in the language of the text the screen showed.
             body["marketing_consent"] = true
-            body["lang"] = signupMarketingConsent.language ?? OneloSignupMarketingConsent.deviceLanguage
+            body["lang"] = signupMarketingConsent.language ?? config.requestLanguage()
         }
 
         let json: [String: Any]
@@ -2035,6 +2074,7 @@ public final class OneloAuth: ObservableObject {
         let resolved = try await resolveConfig()
         // #818: the same fetch answers the sign-up question; keep it current.
         signupMarketingConsent = resolved.signupMarketingConsent
+        adoptPageLanguage(resolved.pageLanguage)
         let authURL = URL(string: resolved.supabaseUrl)!.appendingPathComponent("/auth/v1")
         client = AuthClient(
             url: authURL,
@@ -2098,6 +2138,7 @@ public final class OneloAuth: ObservableObject {
             if let urlStr = resolved.manageUrl { manageUrl = URL(string: urlStr) }
             oauthProviders = resolved.oauthProviders
             signupMarketingConsent = resolved.signupMarketingConsent
+            adoptPageLanguage(resolved.pageLanguage)
             // Cache so the loading skeleton can draw the right social-pill count on
             // the NEXT launch's first paint, before this resolveConfig completes.
             try? keychain.set(oauthProviders.joined(separator: ","), forKey: KeychainKeys.oauthProviders)
@@ -2187,12 +2228,18 @@ public final class OneloAuth: ObservableObject {
         components.queryItems = [
             URLQueryItem(name: "key", value: config.publishableKey),
             URLQueryItem(name: "code_challenge", value: challenge),
-            // #818: the sign-up Marketing Consent text in the device language.
-            URLQueryItem(name: "lang", value: OneloSignupMarketingConsent.deviceLanguage),
+            // #818: the sign-up Marketing Consent text in this language, and
+            // #1074: the Page Language of this SDK's own texts, chosen for it.
+            URLQueryItem(name: "lang", value: config.requestLanguage()),
         ]
 
         var configRequest = URLRequest(url: components.url!)
         addStandardHeaders(&configRequest)
+        // #1074: when `lang` is not one of the App Languages, the backend tries
+        // the device's preferred languages next (ADR-0043), then the default.
+        if let accept = OneloPageLanguage.deviceAcceptLanguage() {
+            configRequest.setValue(accept, forHTTPHeaderField: "Accept-Language")
+        }
         let (data, response) = try await URLSession.shared.data(for: configRequest)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             // #45 — only a DEFINITIVE key rejection means the key is actually bad

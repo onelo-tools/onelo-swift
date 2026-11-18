@@ -24,8 +24,8 @@ public extension FeatureState {
 
     /// Creates a fully configured NSMenuItem that handles all feature statuses automatically:
     /// - hidden    → returns nil (don't add to menu)
-    /// - greyed / coming_soon / upsell → visible + badged (🔒 / "Coming Soon" /
-    ///               "Available in <plan>"). When the developer enabled tap-to-upgrade
+    /// - greyed / coming_soon / upsell → visible + badged (🔒 / "Coming soon" /
+    ///               "Available in <plan>", in the Page Language). When the developer enabled tap-to-upgrade
     ///               (upgradeCta) AND the backend named the unlocking plan (requiredPlan),
     ///               the item is CLICKABLE and opens the upgrade flow
     ///               (`Onelo.openUpgrade(forPlan:)` via OneloUpgradeRouter: subscribers →

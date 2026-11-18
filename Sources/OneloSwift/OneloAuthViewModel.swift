@@ -71,7 +71,7 @@ public final class OneloAuthViewModel: ObservableObject {
     public func submitSignIn() async {
         clearErrors()
         guard !email.isEmpty, !password.isEmpty else {
-            errorMessage = "Please enter your email and password."
+            errorMessage = OneloText.enterEmailAndPassword.text
             return
         }
         isLoading = true
@@ -80,18 +80,18 @@ public final class OneloAuthViewModel: ObservableObject {
             let session = try await auth.signIn(email: email, password: password)
             onSuccess?(session)
         } catch {
-            errorMessage = error.localizedDescription
+            errorMessage = oneloAppUserMessage(for: error, context: "auth view model")
         }
     }
 
     public func submitSignUp() async {
         clearErrors()
         guard password == confirmPassword else {
-            errorMessage = "Passwords do not match."
+            errorMessage = OneloText.passwordsDoNotMatch.text
             return
         }
         guard password.count >= 8 else {
-            errorMessage = "Password must be at least 8 characters."
+            errorMessage = OneloText.passwordTooShort.text
             return
         }
         isLoading = true
@@ -106,14 +106,14 @@ public final class OneloAuthViewModel: ObservableObject {
                 onSuccess?(session)
             }
         } catch {
-            errorMessage = error.localizedDescription
+            errorMessage = oneloAppUserMessage(for: error, context: "auth view model")
         }
     }
 
     public func submitForgotPassword() async {
         clearErrors()
         guard !email.isEmpty else {
-            errorMessage = "Please enter your email address."
+            errorMessage = OneloText.enterEmail.text
             return
         }
         isLoading = true
@@ -122,7 +122,7 @@ public final class OneloAuthViewModel: ObservableObject {
             try await auth.resetPassword(email: email, redirectTo: nil)
             forgotPasswordSent = true
         } catch {
-            errorMessage = error.localizedDescription
+            errorMessage = oneloAppUserMessage(for: error, context: "auth view model")
         }
     }
 

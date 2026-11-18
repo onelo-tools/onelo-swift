@@ -83,6 +83,10 @@ Two surfaces are SwiftUI views rather than accessors:
 - **`OneloCustomerPortalView(auth:onDismiss:)`** — cancel, change plan, refunds and invoices.
 - **Consent** — the versioned terms / privacy gate is presented automatically by `OneloAuthView`. To drive it yourself, use `auth.requiredConsents()`.
 
+### Language
+
+The SDK's own texts ("Close", "Sign In", the feedback window, error messages) and the hosted pages it opens use the App User's Page Language. That is the language you pass with `Onelo(..., language: "de")` when it is one of your App Languages, otherwise the device language when it is one, otherwise your App's default. Onelo chooses it and translates its own texts into English, Polish, German, French, Spanish, Italian, Portuguese and Dutch. Your own content (app name, plan names, your texts) is shown as written. `onelo.auth.authObject.pageLanguage` tells you the language chosen.
+
 ### Feature status
 
 A flag is more than on/off — `FeatureStatus` carries the state your UI should render: `.enabled`, `.disabled`, `.greyed`, `.hidden`, `.upsell`, `.new`, `.beta`, `.coming_soon`.

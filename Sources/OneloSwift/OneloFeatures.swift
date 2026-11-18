@@ -875,7 +875,7 @@ public final class OneloFeatures {
         // handshake often answers `up_to_date` (no fresh snapshot), so whatever
         // the cache restored IS the state the UI renders. A status-only cache
         // (v1) made `upgradeHint`/"Available in <plan>" badges silently
-        // degrade to a bare "Upgrade" until the next deploy.
+        // degrade to a bare "Change plan" until the next deploy.
         if let features = json["features"] as? [String: [String: Any]] {
             var next: [String: FeatureState] = [:]
             for (name, entry) in features {

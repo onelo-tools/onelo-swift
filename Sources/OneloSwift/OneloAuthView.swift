@@ -490,7 +490,7 @@ public struct OneloAuthView<Content: View>: View {
                             isOnExternalPage = false
                             reloadWebView = true
                         }) {
-                            Label("Use a different method", systemImage: "chevron.left")
+                            Label(OneloText.useDifferentMethod.text, systemImage: "chevron.left")
                                 .font(.subheadline.weight(.medium))
                                 .padding(.horizontal, 12)
                                 .padding(.vertical, 7)
@@ -526,7 +526,7 @@ public struct OneloAuthView<Content: View>: View {
                                     .foregroundStyle(oneloStatusDanger(brandTokens))
                                     .multilineTextAlignment(.center)
                             }
-                            Button("Sign In") {
+                            Button(OneloText.signIn.text) {
                                 showRetry = false
                                 errorMessage = nil
                                 Task { await loadHostedUrl() }
@@ -902,11 +902,11 @@ public struct OneloAuthView<Content: View>: View {
                 if oneloAuth.paywallEnabled {
                     let ent = await oneloAuth.revalidateEntitlement()
                     if ent != .active {
-                        errorMessage = "Couldn't confirm your access. Please try again."
+                        errorMessage = OneloText.couldNotConfirmAccess.text
                         showRetry = true
                     }
                 } else if oneloAuth.currentSession == nil {
-                    errorMessage = "Couldn't confirm your access. Please try again."
+                    errorMessage = OneloText.couldNotConfirmAccess.text
                     showRetry = true
                 }
             case let .present(_, url, _, _):
@@ -934,13 +934,13 @@ public struct OneloAuthView<Content: View>: View {
         } catch OneloError.storeNotConfigured {
             // Dev has paywall_enabled=true but no visible store options. Surface a
             // clear message instead of opening a blank WebView.
-            errorMessage = "The store hasn't been configured yet. Please contact support."
+            errorMessage = OneloText.storeNotConfiguredContactSupport.text
             showRetry = true
         } catch {
             #if DEBUG
             _viewLog.debug("loadHostedUrl error: \(error.localizedDescription)")
             #endif
-            errorMessage = error.localizedDescription
+            errorMessage = oneloAppUserMessage(for: error, context: "sign-in")
             showRetry = true
         }
     }
@@ -966,7 +966,7 @@ public struct OneloAuthView<Content: View>: View {
             hostedUrl = nil
         } catch {
             hostedUrl = nil
-            errorMessage = error.localizedDescription
+            errorMessage = oneloAppUserMessage(for: error, context: "sign-in")
             showRetry = true
         }
     }
@@ -1071,7 +1071,7 @@ func nativeOAuthReturn(callbackURL: URL?, error: Error?) -> NativeOAuthReturn {
         return isUserCancel ? .cancelled : .failed(error.localizedDescription)
     }
     guard let callbackURL else {
-        return .failed("Sign in with Apple did not complete. Please try again.")
+        return .failed("no_callback_url")
     }
     let items = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false)?.queryItems
     if let code = items?.first(where: { $0.name == "code" })?.value { return .code(code) }
@@ -1265,7 +1265,10 @@ private final class WebAuthCoordinator: NSObject, WKNavigationDelegate, WKUIDele
                     }
                 }
             case .failed(let message):
-                DispatchQueue.main.async { self.onError(message) }
+                // The raw reason (a provider code, a system error) is for the
+                // developer's log; the App User reads the Page Language (#1074).
+                _viewLog.error("[native sign-in] failed: \(message, privacy: .public)")
+                DispatchQueue.main.async { self.onError(OneloText.signInIncomplete.text) }
             case .cancelled, .unrecognised:
                 // Cancel: keep the gate up, let the user retry (matches the
                 // pattern used elsewhere in this file).
@@ -1314,7 +1317,7 @@ private final class WebAuthCoordinator: NSObject, WKNavigationDelegate, WKUIDele
         if url.scheme?.lowercased() == callbackScheme.lowercased() {
             guard url.host?.lowercased() == "callback" else {
                 DispatchQueue.main.async {
-                    self.onError("Auth callback URL has unexpected host")
+                    self.onError(OneloText.callbackUnexpectedHost.text)
                 }
                 decisionHandler(.cancel)
                 return
@@ -1330,7 +1333,7 @@ private final class WebAuthCoordinator: NSObject, WKNavigationDelegate, WKUIDele
                 // Token expired while user was idle — reload hosted page silently
                 DispatchQueue.main.async { self.onSessionExpired(error) }
             default:
-                DispatchQueue.main.async { self.onError("Auth callback missing code parameter") }
+                DispatchQueue.main.async { self.onError(OneloText.callbackMissingCode.text) }
             }
             _viewLog.notice("[nav] decidePolicy: CANCEL (callback scheme handled)")
             decisionHandler(.cancel)
@@ -1501,7 +1504,8 @@ private final class WebAuthCoordinator: NSObject, WKNavigationDelegate, WKUIDele
         // before HTML finished). Otherwise the overlay would freeze on.
         DispatchQueue.main.async { self.onNavigationLoading?(false, .auth) }
         guard nsError.domain != "WebKitErrorDomain" else { return }
-        DispatchQueue.main.async { self.onError(error.localizedDescription) }
+        let message = oneloAppUserMessage(for: error, context: "sign-in page")
+        DispatchQueue.main.async { self.onError(message) }
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
@@ -1509,7 +1513,8 @@ private final class WebAuthCoordinator: NSObject, WKNavigationDelegate, WKUIDele
         _viewLog.notice("[nav] didFailProvisional: url=\(webView.url?.absoluteString ?? "nil", privacy: .public) domain=\(nsError.domain, privacy: .public) code=\(nsError.code) desc=\(error.localizedDescription, privacy: .public)")
         DispatchQueue.main.async { self.onNavigationLoading?(false, .auth) }
         guard nsError.domain != "WebKitErrorDomain" else { return }
-        DispatchQueue.main.async { self.onError(error.localizedDescription) }
+        let message = oneloAppUserMessage(for: error, context: "sign-in page")
+        DispatchQueue.main.async { self.onError(message) }
     }
 
     /// Recover from a WebContent process crash. WKWebView silently goes blank
@@ -1522,7 +1527,7 @@ private final class WebAuthCoordinator: NSObject, WKNavigationDelegate, WKUIDele
         _viewLog.notice("[nav] WebContent PROCESS TERMINATED: url=\(webView.url?.absoluteString ?? "nil", privacy: .public) alreadyReloaded=\(self._hasReloadedAfterCrash)")
         if _hasReloadedAfterCrash {
             DispatchQueue.main.async {
-                self.onError("The sign-in window lost its connection. Please try again.")
+                self.onError(OneloText.signInWindowLostConnection.text)
             }
             return
         }
@@ -2819,7 +2824,7 @@ private struct SigningInOverlay: View {
             background.ignoresSafeArea()
             VStack(spacing: 14) {
                 ProgressView().tint(foreground)
-                Text("Signing you in…")
+                Text(OneloText.signingYouIn.text)
                     .font(.subheadline)
                     .foregroundStyle(foreground)
             }

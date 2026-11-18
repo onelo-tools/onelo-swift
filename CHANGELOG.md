@@ -5,7 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [3.105.0] — 2026-10-23
+## [3.109.0] — 2026-11-18
+
+### Added
+
+- The SDK's own texts follow the App User's Page Language (#1074): "Close", "Sign In", "Use a different method", "Signing you in…", the feature badges (`FeatureState.badgeLabel`: New, Beta, and the hosted page's own words: "Coming soon", "Available in <plan>" with the plan name as written, and "Change plan" where the badge said "Upgrade"), the feedback and account window titles, the retry screens and the error messages an App User may see, in English, Polish, German, French, Spanish, Italian, Portuguese (European) and Dutch. `/api/sdk/config` answers the Page Language (`page_language`); the SDK keeps it for the next launch's first paint and exposes it as `OneloAuth.pageLanguage`. English until the first answer.
+- `Onelo(..., language:)` and `OneloConfig(language:)`: the App's language. The SDK sends it instead of the device language for its own texts and every hosted page and waitlist join that passes no language of its own. The backend uses it when it is one of the App Languages.
+- Messages that address the developer (an invalid key, the Keychain, a missing setting, a server's own message) stay English in `errorDescription`. The SDK's own screens (the sign-in/store retry screen, the portal, the feedback window) never show them: they show "Something went wrong. Please try again." or, for a failed connection, a connection message, in the Page Language, and log the raw error under the `com.onelo.sdk` subsystem.
+
+## [3.108.0-staging] — 2026-11-18
+
+### Added
+
+- `waitlist.join(_:email:slug:consent:language:)` sends the device language, or the `language` the App passes (sent unchanged). The backend stores the Page Language of the sign-up (one of the App Languages) on the waitlist entry for the waitlist emails (#1038).
+
+## [3.107.0-staging] — 2026-11-18
+
+### Changed
+
+- `initiateStoreFlow(lang:)` and `resolveFlow(lang:)` send the device language when the App passes none, instead of `en`; `lang` is now `String?` defaulting to `nil`. `openUpgrade(forPlan:)` sends the device language too. A language the App passes is sent unchanged (#1039). The backend picks the Page Language within the App Languages; the SDK only sends the language.
+
+## [3.106.0-staging] — 2026-11-18
+
+### Changed
+
+- `requiredConsents()` sends the device language. Each item's `url` and `consentUrl` open the document in the App User's language when the App offers it and a version in that language exists, else in the document's main language (#1073). The backend chooses; the SDK only sends the language.
+
+## [3.105.0-staging] — 2026-10-23
 
 ### Added
 

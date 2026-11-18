@@ -76,6 +76,7 @@ extension Onelo {
         callbackScheme: String = "",
         autoLifecycleRefresh: Bool = false,
         featureEnvironment: String? = nil,
+        language: String? = nil,
         storage: InMemorySessionStorage = InMemorySessionStorage(),
         skipAuthInitialize: Bool = false
     ) {
@@ -85,6 +86,7 @@ extension Onelo {
             baseURL: baseURL,
             autoLifecycleRefresh: autoLifecycleRefresh,
             featureEnvironment: featureEnvironment,
+            language: language,
             makeAuth: { config in
                 skipAuthInitialize
                     ? OneloAuth(_testingConfig: config, storage: storage)

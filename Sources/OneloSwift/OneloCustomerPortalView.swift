@@ -160,7 +160,7 @@ public struct OneloCustomerPortalView: View {
                     Text(msg)
                         .foregroundStyle(palette.text)
                         .multilineTextAlignment(.center)
-                    Button("Close") { onDismiss() }
+                    Button(OneloText.close.text) { onDismiss() }
                         .buttonStyle(.plain)
                         .foregroundStyle(palette.buttonText)
                         .padding(.horizontal, 24)
@@ -211,7 +211,7 @@ public struct OneloCustomerPortalView: View {
             tokens = brandTokens() // portal-initiate may have refreshed them (#681)
             hostedUrl = url
         } catch {
-            errorMessage = error.localizedDescription
+            errorMessage = oneloAppUserMessage(for: error, context: "portal")
         }
     }
 }
@@ -560,12 +560,12 @@ private final class PortalWebCoordinator: NSObject, WKNavigationDelegate, WKUIDe
     }
 
     nonisolated func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-        let msg = error.localizedDescription
+        let msg = oneloAppUserMessage(for: error, context: "portal page")
         Task { @MainActor in self.onError(msg) }
     }
 
     nonisolated func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-        let msg = error.localizedDescription
+        let msg = oneloAppUserMessage(for: error, context: "portal page")
         Task { @MainActor in self.onError(msg) }
     }
 
